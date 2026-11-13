@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>快速决策</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="top">
+      <div>
+        <h1 id="heading">快速决策</h1>
+        <p class="sub" id="subtitle">编辑判断模型的自定义上下文和判断问题，并查看最近决策日志。表情包请在「表情包管理器」插件中管理。</p>
+      </div>
+      <div class="actions">
+        <span id="status-pill" class="pill">—</span>
+        <button id="refresh" type="button">刷新</button>
+      </div>
+    </header>
+
+    <nav class="tabs" aria-label="插件页面分段">
+      <button id="tab-btn-decision" type="button" class="tab active" data-tab="decision">判断配置</button>
+      <button id="tab-btn-logs" type="button" class="tab" data-tab="logs">决策日志</button>
+    </nav>
+
+    <div id="panel-decision">
+      <section class="panel">
+        <h2>表情包依赖</h2>
+        <p id="adapter-msg" class="hint">正在检查表情包管理器…</p>
+      </section>
+
+      <section class="panel">
+        <h2>判断模型自定义上下文</h2>
+        <p class="hint">这段文字只会注入判断模型的 state（字段名 custom_context），不会传给会话模型。可填写机器人名字、群内身份或其他背景。留空则不附加。</p>
+        <textarea id="custom-context" rows="6" placeholder="例如：机器人在群里的名字是「小狼」。有人只喊这个名字、没有点 @ 时，也可以视为在叫自己。"></textarea>
+      </section>
+
+      <section class="panel">
+        <h2>自定义判断问题</h2>
+        <p class="hint">
+          是否发言、回复哪一条、是否配表情以及选哪张图仍由插件内置，不能在此覆盖或改用保留 id（action、target_message_id、use_meme、meme_id）。
+          默认的长短问题可以编辑、停用或删除，也可以再增加语气、是否追问等问题。
+          选项里「告诉会话模型的内容」会在生成回复时写入临时的 &lt;quick_decision&gt; 提示；留空则该结果不告知会话模型。
+        </p>
+        <div id="questions" class="questions"></div>
+        <div class="row actions-row">
+          <button id="add-question" type="button">添加问题</button>
+          <button id="restore-default" type="button" class="secondary">恢复默认长短问题</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="row actions-row">
+          <button id="save-config" type="button">保存判断配置</button>
+        </div>
+        <p id="config-msg" class="msg" hidden></p>
+      </section>
+    </div>
+
+    <div id="panel-logs" hidden>
+      <section class="panel">
+        <h2>最近决策</h2>
+        <pre id="logs" class="logs">（暂无日志）</pre>
+      </section>
+    </div>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

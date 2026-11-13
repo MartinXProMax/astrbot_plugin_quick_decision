@@ -1,0 +1,503 @@
+"""v1.1 配置、判断问题和会话提示的本地测试。不访问网络，不连接 QQ。"""
+
+# ruff: noqa: E402, I001
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import types
+import unittest
+from dataclasses import dataclass
+from pathlib import Path
+from collections.abc import Mapping
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+
+def _install_astrbot_stubs() -> None:
+    """用轻量桩模块代替完整 AstrBot，避免测试依赖网络和可选依赖。"""
+    if "astrbot.api.provider" in sys.modules and hasattr(
+        sys.modules["astrbot.api.provider"], "DecisionChoiceAnswer"
+    ):
+        return
+
+    def ensure(name: str) -> types.ModuleType:
+        if name in sys.modules:
+            return sys.modules[name]
+        module = types.ModuleType(name)
+        module.__path__ = []  # type: ignore[attr-defined]
+        sys.modules[name] = module
+        if "." in name:
+            parent_name, child = name.rsplit(".", 1)
+            setattr(ensure(parent_name), child, module)
+        return module
+
+    for name in (
+        "astrbot",
+        "astrbot.api",
+        "astrbot.api.event",
+        "astrbot.api.message_components",
+        "astrbot.api.provider",
+        "astrbot.core",
+        "astrbot.core.agent",
+        "astrbot.core.agent.message",
+    ):
+        ensure(name)
+
+    api = sys.modules["astrbot.api"]
+    api.logger = types.SimpleNamespace(
+        warning=lambda *args, **kwargs: None,
+        info=lambda *args, **kwargs: None,
+        exception=lambda *args, **kwargs: None,
+        debug=lambda *args, **kwargs: None,
+    )
+
+    @dataclass(frozen=True)
+    class DecisionChoiceQuestion:
+        instructions: str
+        criteria: Mapping[str, str]
+
+    @dataclass(frozen=True)
+    class DecisionBooleanQuestion:
+        instructions: str
+
+    @dataclass(frozen=True)
+    class DecisionChoiceAnswer:
+        choice: str
+        probability: float
+        probabilities: Mapping[str, float]
+        confidence: float
+
+    @dataclass(frozen=True)
+    class DecisionBooleanAnswer:
+        probability: float
+
+    class DecisionError(Exception):
+        pass
+
+    provider = sys.modules["astrbot.api.provider"]
+    provider.DecisionChoiceQuestion = DecisionChoiceQuestion
+    provider.DecisionBooleanQuestion = DecisionBooleanQuestion
+    provider.DecisionChoiceAnswer = DecisionChoiceAnswer
+    provider.DecisionBooleanAnswer = DecisionBooleanAnswer
+    provider.DecisionError = DecisionError
+    provider.ProviderRequest = type("ProviderRequest", (), {})
+
+    class TextPart:
+        def __init__(self, text: str = "") -> None:
+            self.text = text
+            self._no_save = False
+            self.type = "text"
+
+        def mark_as_temp(self) -> TextPart:
+            self._no_save = True
+            return self
+
+    sys.modules["astrbot.core.agent.message"].TextPart = TextPart
+    sys.modules["astrbot.api.event"].MessageChain = type("MessageChain", (), {})
+    components = sys.modules["astrbot.api.message_components"]
+    components.Image = type("Image", (), {})
+    components.Reply = type("Reply", (), {})
+
+
+_install_astrbot_stubs()
+
+from astrbot.api.provider import DecisionBooleanAnswer, DecisionChoiceAnswer
+from astrbot.core.agent.message import TextPart
+from astrbot_plugin_quick_decision.config_util import (
+    DEFAULT_DECISION_QUESTIONS_JSON,
+    DEFAULT_LENGTH_INSTRUCTIONS,
+    DEFAULT_LONG_CRITERIA,
+    DEFAULT_LONG_SESSION_HINT,
+    DEFAULT_SHORT_CRITERIA,
+    DEFAULT_SHORT_SESSION_HINT,
+    PluginSettings,
+    default_decision_questions,
+    dump_decision_questions,
+    parse_decision_questions,
+)
+from astrbot_plugin_quick_decision.decision_engine import (
+    _build_questions,
+    _parse_answers,
+    build_state,
+)
+from astrbot_plugin_quick_decision.models import (
+    RESERVED_QUESTION_IDS,
+    BufferedMessage,
+    CustomDecisionQuestion,
+    DecisionQuestionOption,
+    DecisionResult,
+)
+from astrbot_plugin_quick_decision.reply_generator import (
+    apply_session_hints,
+    session_hint_text,
+)
+
+
+def _choice(choice: str, probability: float = 0.4) -> DecisionChoiceAnswer:
+    others = {"short": 0.3, "long": 0.3}
+    others[choice] = probability
+    return DecisionChoiceAnswer(
+        choice=choice,
+        probability=probability,
+        probabilities=others,
+        confidence=probability,
+    )
+
+
+class DecisionConfigTests(unittest.TestCase):
+    def test_schema_default_matches_builtin_length_question(self) -> None:
+        schema = json.loads(
+            (Path(__file__).resolve().parents[1] / "_conf_schema.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIn("decision_custom_context", schema)
+        self.assertEqual(schema["decision_custom_context"]["type"], "text")
+        self.assertEqual(schema["decision_custom_context"]["default"], "")
+        self.assertEqual(schema["decision_questions"]["type"], "text")
+        self.assertTrue(schema["decision_questions"]["editor_mode"])
+        parsed_schema, warning = parse_decision_questions(
+            schema["decision_questions"]["default"]
+        )
+        self.assertIsNone(warning)
+        parsed_default, default_warning = parse_decision_questions(
+            DEFAULT_DECISION_QUESTIONS_JSON
+        )
+        self.assertIsNone(default_warning)
+        self.assertEqual(
+            [item.to_dict() for item in parsed_schema],
+            [item.to_dict() for item in parsed_default],
+        )
+        question = parsed_default[0]
+        self.assertEqual(question.id, "length")
+        self.assertEqual(question.instructions, DEFAULT_LENGTH_INSTRUCTIONS)
+        by_id = {option.id: option for option in question.options}
+        self.assertEqual(by_id["short"].criteria, DEFAULT_SHORT_CRITERIA)
+        self.assertEqual(by_id["short"].session_hint, DEFAULT_SHORT_SESSION_HINT)
+        self.assertEqual(by_id["long"].criteria, DEFAULT_LONG_CRITERIA)
+        self.assertEqual(by_id["long"].session_hint, DEFAULT_LONG_SESSION_HINT)
+
+    def test_missing_or_blank_questions_use_default(self) -> None:
+        for value in (None, "", "  ", "\n"):
+            questions, warning = parse_decision_questions(value)
+            self.assertIsNone(warning, value)
+            self.assertEqual(questions[0].id, "length")
+            self.assertEqual(len(questions), 1)
+
+    def test_invalid_json_falls_back_to_default(self) -> None:
+        questions, warning = parse_decision_questions("{not json")
+        self.assertIsNotNone(warning)
+        self.assertIn("回退到默认长短问题", warning or "")
+        self.assertEqual([item.id for item in questions], ["length"])
+        settings = PluginSettings({"decision_questions": "[[[invalid"})
+        self.assertEqual([item.id for item in settings.decision_questions], ["length"])
+        self.assertIsNotNone(settings.decision_questions_warning)
+
+    def test_empty_array_is_valid(self) -> None:
+        questions, warning = parse_decision_questions("[]")
+        self.assertIsNone(warning)
+        self.assertEqual(questions, [])
+        questions, error = parse_decision_questions([], strict=True)
+        self.assertIsNone(error)
+        self.assertEqual(questions, [])
+
+    def test_reserved_ids_skipped_or_rejected(self) -> None:
+        payload = [
+            {
+                "id": "action",
+                "type": "choice",
+                "instructions": "不该出现",
+                "options": [
+                    {"id": "a", "criteria": "A"},
+                    {"id": "b", "criteria": "B"},
+                ],
+            },
+            {
+                "id": "tone",
+                "type": "choice",
+                "instructions": "语气如何？",
+                "options": [
+                    {
+                        "id": "soft",
+                        "criteria": "柔和",
+                        "session_hint": "语气柔和一点。",
+                    },
+                    {"id": "direct", "criteria": "直接", "session_hint": ""},
+                ],
+            },
+        ]
+        questions, warning = parse_decision_questions(payload)
+        self.assertIsNotNone(warning)
+        self.assertEqual([item.id for item in questions], ["tone"])
+        questions, error = parse_decision_questions(payload, strict=True)
+        self.assertEqual(questions, [])
+        self.assertIn("保留", error or "")
+
+    def test_choice_needs_two_options(self) -> None:
+        payload = [
+            {
+                "id": "tone",
+                "type": "choice",
+                "instructions": "语气如何？",
+                "options": [{"id": "soft", "criteria": "柔和"}],
+            }
+        ]
+        questions, warning = parse_decision_questions(payload)
+        self.assertEqual([item.id for item in questions], ["length"])
+        self.assertIsNotNone(warning)
+        _, error = parse_decision_questions(payload, strict=True)
+        self.assertIn("两个", error or "")
+
+    def test_plugin_settings_custom_context_stripped(self) -> None:
+        settings = PluginSettings({"decision_custom_context": "  机器人叫小狼  "})
+        self.assertEqual(settings.decision_custom_context, "机器人叫小狼")
+        empty = PluginSettings({"decision_custom_context": "   "})
+        self.assertEqual(empty.decision_custom_context, "")
+
+    def test_build_state_custom_context_only_when_nonempty(self) -> None:
+        messages = [
+            BufferedMessage(
+                message_id="m1",
+                sender_id="u1",
+                sender_name="用户",
+                role="user",
+                text="你好",
+                timestamp=1,
+            )
+        ]
+        empty = build_state(
+            scene="group_passive",
+            is_private=False,
+            messages=messages,
+            at_or_quoted=True,
+            memes=[],
+            custom_context="   ",
+        )
+        self.assertNotIn("custom_context", empty)
+        self.assertEqual(
+            set(empty),
+            {
+                "scene",
+                "chat_type",
+                "current_message_at_or_quoted_bot",
+                "recent_messages",
+                "meme_catalog",
+            },
+        )
+        filled = build_state(
+            scene="group_passive",
+            is_private=False,
+            messages=messages,
+            at_or_quoted=False,
+            memes=[{"id": "cat", "description": "微笑的猫"}],
+            custom_context=" 机器人在群里叫小狼 ",
+        )
+        self.assertEqual(filled["custom_context"], "机器人在群里叫小狼")
+        for forbidden in ("persona", "skills", "system_prompt", "history"):
+            self.assertNotIn(forbidden, filled)
+
+    def test_build_questions_includes_custom_and_keeps_builtin(self) -> None:
+        configured = default_decision_questions() + [
+            CustomDecisionQuestion(
+                id="ask_followup",
+                type="boolean",
+                instructions="要不要追问一句？",
+                true_session_hint="可以自然追问一句。",
+            ),
+            CustomDecisionQuestion(
+                id="use_meme",
+                type="boolean",
+                instructions="这不该覆盖内置表情问题",
+            ),
+            CustomDecisionQuestion(
+                id="disabled_tone",
+                type="choice",
+                instructions="已停用",
+                enabled=False,
+                options=[
+                    DecisionQuestionOption(id="a", criteria="A"),
+                    DecisionQuestionOption(id="b", criteria="B"),
+                ],
+            ),
+        ]
+        questions = _build_questions(
+            "group_passive",
+            [
+                BufferedMessage(
+                    message_id="m1",
+                    sender_id="u1",
+                    sender_name="用户",
+                    role="user",
+                    text="在吗",
+                )
+            ],
+            [{"id": "cat", "description": "微笑的猫"}],
+            configured,
+        )
+        self.assertIn("action", questions)
+        self.assertIn("target_message_id", questions)
+        self.assertIn("length", questions)
+        self.assertIn("ask_followup", questions)
+        self.assertIn("use_meme", questions)
+        self.assertIn("meme_id", questions)
+        self.assertNotIn("disabled_tone", questions)
+        self.assertEqual(
+            questions["use_meme"].instructions,
+            "这次回复是否适合配上一张表情包？没有合适的表情时应为否。",
+        )
+
+    def test_parse_answers_collects_hints_and_length_compat(self) -> None:
+        settings = PluginSettings(
+            {
+                "choice_threshold": 0.9,
+                "decision_questions": dump_decision_questions(
+                    default_decision_questions()
+                    + [
+                        CustomDecisionQuestion(
+                            id="tone",
+                            type="choice",
+                            instructions="语气？",
+                            options=[
+                                DecisionQuestionOption(
+                                    id="soft",
+                                    criteria="柔和",
+                                    session_hint="请用柔和的语气。",
+                                ),
+                                DecisionQuestionOption(
+                                    id="direct",
+                                    criteria="直接",
+                                    session_hint="",
+                                ),
+                            ],
+                        ),
+                        CustomDecisionQuestion(
+                            id="ask_followup",
+                            type="boolean",
+                            instructions="要不要追问？",
+                            true_session_hint="可以自然追问一句。",
+                            false_session_hint="",
+                        ),
+                    ]
+                ),
+            }
+        )
+        result = _parse_answers(
+            {
+                "action": _choice("reply", 0.95),
+                "length": _choice("long", 0.2),  # 低于 choice_threshold 仍应采纳
+                "tone": _choice("soft", 0.15),
+                "ask_followup": DecisionBooleanAnswer(probability=0.7),
+                "use_meme": DecisionBooleanAnswer(probability=0.1),
+            },
+            scene="group_passive",
+            settings=settings,
+            memes=[],
+        )
+        self.assertEqual(result.action, "reply")
+        self.assertEqual(result.length, "long")
+        self.assertEqual(result.custom_answers["length"], "long")
+        self.assertEqual(result.custom_answers["tone"], "soft")
+        self.assertTrue(result.custom_answers["ask_followup"])
+        self.assertEqual(
+            result.session_hints,
+            [
+                DEFAULT_LONG_SESSION_HINT,
+                "请用柔和的语气。",
+                "可以自然追问一句。",
+            ],
+        )
+        self.assertFalse(result.use_meme)
+
+    def test_missing_answer_skips_hint_and_does_not_invent_length(self) -> None:
+        settings = PluginSettings({"decision_questions": "[]"})
+        result = _parse_answers(
+            {"action": _choice("join", 0.9)},
+            scene="group_passive",
+            settings=settings,
+            memes=[],
+        )
+        self.assertEqual(result.action, "reply")  # 历史 join 规范为 reply
+        self.assertIsNone(result.length)
+        self.assertEqual(result.custom_answers, {})
+        self.assertEqual(result.session_hints, [])
+        self.assertIsNone(session_hint_text(result))
+
+        settings_with_length = PluginSettings({})
+        skipped = _parse_answers(
+            {"action": _choice("reply", 0.9), "length": object()},
+            scene="group_passive",
+            settings=settings_with_length,
+            memes=[],
+        )
+        self.assertIsNone(skipped.length)
+        self.assertEqual(skipped.session_hints, [])
+
+    def test_session_hints_injection_and_empty_skip(self) -> None:
+        class DummyReq:
+            def __init__(self) -> None:
+                self.extra_user_content_parts: list[TextPart] = []
+
+        filled = DecisionResult(
+            session_hints=[
+                "本轮回复策略：请给出简短、自然的回复，一两句即可。",
+                "请用柔和的语气。",
+                "  ",
+            ]
+        )
+        req = DummyReq()
+        apply_session_hints(req, filled)  # type: ignore[arg-type]
+        self.assertEqual(len(req.extra_user_content_parts), 1)
+        part = req.extra_user_content_parts[0]
+        self.assertTrue(getattr(part, "_no_save", False))
+        text = part.text
+        self.assertTrue(text.startswith("<quick_decision>\n"))
+        self.assertIn("请给出简短、自然的回复，一两句即可。", text)
+        self.assertIn("请用柔和的语气。", text)
+        self.assertTrue(text.endswith("</quick_decision>"))
+
+        empty_req = DummyReq()
+        apply_session_hints(empty_req, DecisionResult())  # type: ignore[arg-type]
+        self.assertEqual(empty_req.extra_user_content_parts, [])
+
+    def test_custom_context_is_not_a_session_hint(self) -> None:
+        settings = PluginSettings(
+            {"decision_custom_context": "这段只能给判断模型看，不能出现在会话提示里。"}
+        )
+        result = _parse_answers(
+            {"length": _choice("short", 0.9)},
+            scene="private_passive",
+            settings=settings,
+            memes=[],
+        )
+        hint = session_hint_text(result)
+        self.assertIsNotNone(hint)
+        self.assertNotIn("只能给判断模型看", hint or "")
+        self.assertNotIn(settings.decision_custom_context, hint or "")
+
+    def test_dump_roundtrip_and_temp_dir_config_file(self) -> None:
+        original = default_decision_questions()
+        dumped = dump_decision_questions(original)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "decision_questions.json"
+            path.write_text(dumped, encoding="utf-8")
+            loaded, warning = parse_decision_questions(path.read_text(encoding="utf-8"))
+        self.assertIsNone(warning)
+        self.assertEqual(
+            [item.to_dict() for item in loaded],
+            [item.to_dict() for item in original],
+        )
+
+    def test_reserved_ids_constant(self) -> None:
+        self.assertEqual(
+            RESERVED_QUESTION_IDS,
+            {"action", "target_message_id", "use_meme", "meme_id"},
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

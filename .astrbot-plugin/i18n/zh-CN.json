@@ -1,0 +1,12 @@
+{
+  "views": {
+    "meme_manager": {
+      "title": "快速决策",
+      "description": "编辑仅供判断模型使用的自定义上下文和判断问题。表情包请在「表情包管理器」中管理。",
+      "heading": "快速决策",
+      "tab_decision": "判断配置",
+      "tab_logs": "决策日志",
+      "refresh": "刷新"
+    }
+  }
+}
