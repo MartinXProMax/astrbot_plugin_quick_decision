@@ -757,6 +757,31 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ev.is_stopped())
         self.assertIsNone(ev.get_extra("quick_decision"))
 
+    async def test_on_llm_request_strips_orphan_without_decision(self) -> None:
+        ev = FakeEvent(text="hi", at_or_wake=False, message_id="orphan", timestamp=4)
+        req = ProviderRequest(
+            contexts=[
+                {"role": "user", "content": "q"},
+                {
+                    "role": "assistant",
+                    "content": [{"type": "think", "think": "", "encrypted": "opaque"}],
+                    "tool_calls": [
+                        {
+                            "id": "call-g",
+                            "type": "function",
+                            "function": {"name": "astrbot_file_read_tool", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "kept"}]},
+            ]
+        )
+        await self.plugin.on_llm_request(ev, req)
+        self.assertNotIn("tool_calls", req.contexts[1])
+        self.assertEqual(req.contexts[1]["content"][0]["encrypted"], "opaque")
+        self.assertEqual(req.contexts[2]["content"][0]["text"], "kept")
+        self.assertEqual(req.extra_user_content_parts, [])
+
     async def test_on_llm_request_attaches_temp_hints(self) -> None:
         ev = FakeEvent(text="hi", at_or_wake=False, message_id="h1", timestamp=4)
         req = await self.plugin.on_chat_message(ev)
@@ -793,6 +818,13 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(generate_calls), 1)
         self.assertEqual(len(send_calls), 1)
         self.assertIsNone(send_calls[0].get("event"))
+
+        generate_calls.clear()
+        send_calls.clear()
+        self.plugin.config["dry_run"] = True
+        await self.plugin._run_proactive(runtime)
+        self.assertEqual(generate_calls, [])
+        self.assertEqual(send_calls, [])
         self.main_mod.send_decision_message = self._orig_send
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+from contextlib import asynccontextmanager
 
 from astrbot.api import logger
 from astrbot.api.event import MessageChain
@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Protocol
 
 from .models import DecisionResult, normalize_action
+from .tool_history import (
+    append_generated_turn,
+    load_history_records,
+    repair_tool_history,
+)
 
 
 class ImageResolver(Protocol):
@@ -245,25 +250,21 @@ async def after_official_text_sent(
     )
 
 
-def _history_as_contexts(history_raw: str | list | None) -> list[dict]:
-    if not history_raw:
-        return []
-    if isinstance(history_raw, str):
-        try:
-            records = json.loads(history_raw)
-        except json.JSONDecodeError:
-            return []
-    else:
-        records = history_raw
-    contexts: list[dict] = []
-    for item in records:
-        if not isinstance(item, dict):
-            continue
-        role = item.get("role")
-        if role not in {"system", "user", "assistant"}:
-            continue
-        contexts.append(item)
-    return contexts
+@asynccontextmanager
+async def acquire_official_session_lock(umo: str):
+    """与官方流水线共用 AstrBot 4.29.4 的会话锁。
+
+    ``session_lock_manager.acquire_lock(unified_msg_origin)`` 包住官方读历史和
+    写历史。冷场生成在流水线外，写回前必须拿到同一把锁并重新读取，避免用旧快照
+    覆盖刚写入的工具链。导入失败时仍会在调用方重新读取后再写。
+    """
+    try:
+        from astrbot.core.utils.session_lock import session_lock_manager
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    async with session_lock_manager.acquire_lock(umo):
+        yield
 
 
 async def resolve_persona_prompt(context, umo: str, conversation) -> str:
@@ -309,9 +310,15 @@ async def generate_text(
         except Exception:  # noqa: BLE001
             conversation = None
     system_prompt = await resolve_persona_prompt(context, umo, conversation)
-    contexts = _history_as_contexts(
+    stored_history = load_history_records(
         getattr(conversation, "history", None) if conversation else None
     )
+    contexts, request_stats = repair_tool_history(stored_history)
+    if request_stats.changed:
+        logger.info(
+            "冷场请求跳过未配对工具调用 %s 个，本次不把删除写回会话",
+            request_stats.removed_calls,
+        )
     prompt = user_prompt.strip() or "请根据当前对话自然地回复。"
     if decision.scene in {"group_proactive", "private_proactive"}:
         prompt = "会话已经沉默一段时间，请结合上下文主动开一个自然的话题或打个招呼。"
@@ -333,13 +340,20 @@ async def generate_text(
     text = (getattr(response, "completion_text", None) or "").strip()
     if text and curr_cid:
         try:
-            history = list(contexts)
-            if decision.scene in {"group_proactive", "private_proactive"}:
-                history.append({"role": "assistant", "content": text})
-            else:
-                history.append({"role": "user", "content": prompt})
-                history.append({"role": "assistant", "content": text})
-            await conv_mgr.update_conversation(umo, curr_cid, history=history)
+            proactive = decision.scene in {"group_proactive", "private_proactive"}
+            async with acquire_official_session_lock(umo):
+                fresh = await conv_mgr.get_conversation(umo, curr_cid)
+                if fresh is None:
+                    logger.warning("冷场回复生成后会话已不存在，不新建会话：%s", umo)
+                    return text
+                base = load_history_records(getattr(fresh, "history", None))
+                history = append_generated_turn(
+                    base,
+                    proactive=proactive,
+                    user_prompt=prompt,
+                    assistant_text=text,
+                )
+                await conv_mgr.update_conversation(umo, curr_cid, history=history)
         except Exception:  # noqa: BLE001
             logger.exception("写入官方会话历史失败")
     return text

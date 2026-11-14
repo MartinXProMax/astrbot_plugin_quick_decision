@@ -46,6 +46,7 @@ from .reply_generator import (
     send_decision_message,
 )
 from .session_store import SessionStore
+from .tool_history import sanitize_provider_request
 from .web_api import WebApiMixin
 
 PLUGIN_NAME = "astrbot_plugin_quick_decision"
@@ -463,6 +464,18 @@ class QuickDecisionPlugin(Star, WebApiMixin):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        # 官方 4.29.4 在 reset 代理之前调用本钩子，且工具循环中途不会再次进入。
+        # 因此这里整理的是已落盘历史；正在执行、结果尚未写回的调用不会出现在这份列表里。
+        try:
+            stats = sanitize_provider_request(req)
+        except Exception:  # noqa: BLE001
+            logger.exception("整理请求中的工具历史失败，本次仍按原历史发送")
+        else:
+            if stats.changed:
+                logger.info(
+                    "发送前去掉未配对工具调用 %s 个，未改会话库",
+                    stats.removed_calls,
+                )
         decision = self._pipeline_decision(event)
         if decision is None:
             return
