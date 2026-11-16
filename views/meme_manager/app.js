@@ -28,6 +28,98 @@ const RESERVED_IDS = new Set([
   "meme_id",
 ]);
 
+const SCENE_LABELS = {
+  group_passive: "群聊",
+  private_passive: "私聊",
+  group_proactive: "群聊冷场",
+  private_proactive: "私聊冷场",
+};
+
+const ACTION_LABELS = {
+  none: "不发言",
+  reply: "回复",
+  proactive: "主动开口",
+};
+
+const SAVE_MESSAGES = {
+  clean: "已与插件配置一致",
+  dirty: "有未保存的更改",
+  saving: "正在保存…",
+  saved: "已保存到插件配置，重载插件后同样生效",
+  error: "保存失败",
+  notice: "",
+};
+
+const ICONS = {
+  up: '<path d="m6 15 6-6 6 6"/>',
+  down: '<path d="m6 9 6 6 6-6"/>',
+  trash:
+    '<path d="M4 7h16"/><path d="M10 11v6M14 11v6"/><path d="M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12"/><path d="M9 7V4h6v3"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  arrow: '<path d="M4 12h15"/><path d="m13 6 6 6-6 6"/>',
+  image:
+    '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-9 8"/>',
+};
+
+// ---------- 小工具 ----------
+
+function $(id) {
+  return document.getElementById(id);
+}
+
+const PROPERTY_KEYS = new Set(["value", "checked", "disabled", "hidden", "rows"]);
+
+function h(tag, props, ...children) {
+  const el = document.createElement(tag);
+  for (const [key, value] of Object.entries(props || {})) {
+    if (value === null || value === undefined || value === false) continue;
+    if (key === "class") el.className = value;
+    else if (key === "dataset") Object.assign(el.dataset, value);
+    else if (key.startsWith("on") && typeof value === "function") {
+      el.addEventListener(key.slice(2), value);
+    } else if (PROPERTY_KEYS.has(key)) el[key] = value;
+    else el.setAttribute(key, value === true ? "" : String(value));
+  }
+  for (const child of children.flat()) {
+    if (child === null || child === undefined || child === false) continue;
+    el.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return el;
+}
+
+function icon(name) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("class", "icon");
+  svg.setAttribute("aria-hidden", "true");
+  svg.innerHTML = ICONS[name] || "";
+  return svg;
+}
+
+function iconButton(name, label, onClick, { disabled = false, danger = false, act } = {}) {
+  return h(
+    "button",
+    {
+      type: "button",
+      class: `icon-btn${danger ? " is-danger" : ""}`,
+      title: label,
+      "aria-label": label,
+      disabled,
+      dataset: act ? { act } : undefined,
+      onclick: onClick,
+    },
+    icon(name),
+  );
+}
+
+const NEEDS_AUTOSIZE = !globalThis.CSS?.supports?.("field-sizing", "content");
+
+function autosize(el) {
+  if (!NEEDS_AUTOSIZE || !el?.matches?.("textarea.autosize")) return;
+  el.style.height = "auto";
+  el.style.height = `${el.scrollHeight + 2}px`;
+}
+
 function cloneDefaultQuestions() {
   return JSON.parse(JSON.stringify(DEFAULT_QUESTIONS));
 }
@@ -37,6 +129,30 @@ function nextId(prefix, used) {
   while (used.has(`${prefix}${index}`)) index += 1;
   return `${prefix}${index}`;
 }
+
+function moveItem(list, index, delta) {
+  const next = index + delta;
+  if (next < 0 || next >= list.length) return false;
+  const [item] = list.splice(index, 1);
+  list.splice(next, 0, item);
+  return true;
+}
+
+function normalizeAction(action) {
+  return action === "join" ? "reply" : action;
+}
+
+// ---------- 状态 ----------
+
+const state = {
+  questions: [],
+  reservedIds: new Set(RESERVED_IDS),
+  saved: { context: "", questions: cloneDefaultQuestions() },
+  savedSnapshot: "",
+  saving: false,
+  freshIndex: -1,
+  loaded: false,
+};
 
 function normalizeQuestion(raw) {
   const type = raw?.type === "boolean" ? "boolean" : "choice";
@@ -56,18 +172,23 @@ function normalizeQuestion(raw) {
       criteria: String(option?.criteria || ""),
       session_hint: String(option?.session_hint || ""),
     }));
-    if (question.options.length < 2) {
-      question.options.push(
-        { id: "option_1", criteria: "", session_hint: "" },
-        { id: "option_2", criteria: "", session_hint: "" },
-      );
-    }
+    ensureTwoOptions(question);
   }
   return question;
 }
 
+function ensureTwoOptions(question) {
+  question.options = question.options || [];
+  const used = new Set(question.options.map((item) => item.id));
+  while (question.options.length < 2) {
+    const id = nextId("option_", used);
+    used.add(id);
+    question.options.push({ id, criteria: "", session_hint: "" });
+  }
+}
+
 function collectQuestionsFromForm() {
-  return questionsState.map((question) => {
+  return state.questions.map((question) => {
     if (question.type === "boolean") {
       return {
         id: question.id.trim(),
@@ -92,250 +213,429 @@ function collectQuestionsFromForm() {
   });
 }
 
-function moveItem(list, index, delta) {
-  const next = index + delta;
-  if (next < 0 || next >= list.length) return;
-  const [item] = list.splice(index, 1);
-  list.splice(next, 0, item);
+function snapshot() {
+  return JSON.stringify({
+    context: $("custom-context").value.trim(),
+    questions: collectQuestionsFromForm(),
+  });
 }
 
-function renderQuestions() {
+function isDirty() {
+  return state.loaded && snapshot() !== state.savedSnapshot;
+}
+
+// ---------- 保存栏 ----------
+
+function setSaveState(kind, text) {
+  $("savebar").dataset.state = kind;
+  $("config-msg").textContent = text || SAVE_MESSAGES[kind] || "";
+  $("discard").hidden = !(kind === "dirty" || kind === "notice" || kind === "error") || !isDirty();
+  // 判断配置没读到时禁止保存，避免用空表单覆盖已有配置。
+  $("save-config").disabled = kind === "saving" || !state.loaded;
+}
+
+function updateDirty() {
+  if (state.saving) return;
+  const current = $("savebar").dataset.state;
+  if (isDirty()) {
+    if (current !== "dirty") setSaveState("dirty");
+  } else if (current === "dirty" || current === "error") {
+    setSaveState("clean");
+  }
+}
+
+// ---------- 判断问题 ----------
+
+function renderQuestions(focus) {
   const root = $("questions");
-  root.innerHTML = "";
-  if (!questionsState.length) {
-    const empty = document.createElement("p");
-    empty.className = "hint";
-    empty.textContent = "当前没有自定义判断问题。判断模型将只决定是否发言、回哪一条以及是否配图。";
-    root.append(empty);
-    return;
-  }
-  questionsState.forEach((question, qIndex) => {
-    root.append(renderQuestionCard(question, qIndex));
-  });
-}
-
-function renderQuestionCard(question, qIndex) {
-  const card = document.createElement("article");
-  card.className = "question-card";
-
-  const toolbar = document.createElement("div");
-  toolbar.className = "question-toolbar";
-  const enabledLabel = document.createElement("label");
-  enabledLabel.className = "enabled-flag";
-  const enabled = document.createElement("input");
-  enabled.type = "checkbox";
-  enabled.checked = question.enabled !== false;
-  enabled.addEventListener("change", () => {
-    question.enabled = enabled.checked;
-  });
-  enabledLabel.append(enabled, document.createTextNode("启用此问题"));
-  const up = document.createElement("button");
-  up.type = "button";
-  up.className = "secondary small";
-  up.textContent = "上移";
-  up.addEventListener("click", () => {
-    moveItem(questionsState, qIndex, -1);
-    renderQuestions();
-  });
-  const down = document.createElement("button");
-  down.type = "button";
-  down.className = "secondary small";
-  down.textContent = "下移";
-  down.addEventListener("click", () => {
-    moveItem(questionsState, qIndex, 1);
-    renderQuestions();
-  });
-  const remove = document.createElement("button");
-  remove.type = "button";
-  remove.className = "danger small";
-  remove.textContent = "删除问题";
-  remove.addEventListener("click", () => {
-    questionsState.splice(qIndex, 1);
-    renderQuestions();
-  });
-  toolbar.append(enabledLabel, up, down, remove);
-
-  const grid = document.createElement("div");
-  grid.className = "field-grid";
-
-  const idInput = document.createElement("input");
-  idInput.type = "text";
-  idInput.value = question.id;
-  idInput.placeholder = "例如 length 或 tone";
-  idInput.addEventListener("input", () => {
-    question.id = idInput.value;
-  });
-  const idLabel = document.createElement("label");
-  idLabel.textContent = "问题 ID";
-  grid.append(idLabel, idInput);
-
-  const typeSelect = document.createElement("select");
-  const choiceOpt = document.createElement("option");
-  choiceOpt.value = "choice";
-  choiceOpt.textContent = "选择题";
-  const boolOpt = document.createElement("option");
-  boolOpt.value = "boolean";
-  boolOpt.textContent = "是否题";
-  typeSelect.append(choiceOpt, boolOpt);
-  typeSelect.value = question.type;
-  typeSelect.addEventListener("change", () => {
-    question.type = typeSelect.value;
-    if (question.type === "choice" && (!question.options || question.options.length < 2)) {
-      question.options = [
-        { id: "option_1", criteria: "", session_hint: "" },
-        { id: "option_2", criteria: "", session_hint: "" },
-      ];
-    }
-    renderQuestions();
-  });
-  const typeLabel = document.createElement("label");
-  typeLabel.textContent = "问题类型";
-  grid.append(typeLabel, typeSelect);
-
-  const instructions = document.createElement("textarea");
-  instructions.rows = 2;
-  instructions.value = question.instructions;
-  instructions.placeholder = "写给判断模型看的问题说明";
-  instructions.addEventListener("input", () => {
-    question.instructions = instructions.value;
-  });
-  const instLabel = document.createElement("label");
-  instLabel.textContent = "判断标准";
-  grid.append(instLabel, instructions);
-
-  card.append(toolbar, grid);
-
-  if (question.type === "boolean") {
-    const boolGrid = document.createElement("div");
-    boolGrid.className = "bool-grid";
-    const trueHint = document.createElement("textarea");
-    trueHint.rows = 2;
-    trueHint.value = question.true_session_hint || "";
-    trueHint.placeholder = "判断为「是」时告诉会话模型的内容，可留空";
-    trueHint.addEventListener("input", () => {
-      question.true_session_hint = trueHint.value;
-    });
-    const trueLabel = document.createElement("label");
-    trueLabel.textContent = "为是时的会话提示";
-    const falseHint = document.createElement("textarea");
-    falseHint.rows = 2;
-    falseHint.value = question.false_session_hint || "";
-    falseHint.placeholder = "判断为「否」时告诉会话模型的内容，可留空";
-    falseHint.addEventListener("input", () => {
-      question.false_session_hint = falseHint.value;
-    });
-    const falseLabel = document.createElement("label");
-    falseLabel.textContent = "为否时的会话提示";
-    boolGrid.append(trueLabel, trueHint, falseLabel, falseHint);
-    card.append(boolGrid);
+  root.replaceChildren();
+  if (!state.questions.length) {
+    root.append(
+      h(
+        "li",
+        { class: "questions-empty" },
+        "现在没有自定义问题，判断模型只回答上面的内置问题。可以点「添加问题」，比如加一个语气或要不要追问。",
+      ),
+    );
   } else {
-    const optionsWrap = document.createElement("div");
-    optionsWrap.className = "questions";
-    (question.options || []).forEach((option, oIndex) => {
-      optionsWrap.append(renderOptionCard(question, oIndex));
+    state.questions.forEach((question, index) => {
+      root.append(renderQuestion(question, index));
     });
-    const addOption = document.createElement("button");
-    addOption.type = "button";
-    addOption.className = "secondary small";
-    addOption.textContent = "添加选项";
-    addOption.addEventListener("click", () => {
-      const used = new Set((question.options || []).map((item) => item.id));
-      question.options = question.options || [];
-      question.options.push({
-        id: nextId("option_", used),
-        criteria: "",
-        session_hint: "",
-      });
-      renderQuestions();
-    });
-    card.append(optionsWrap, addOption);
   }
+  state.freshIndex = -1;
+  if (NEEDS_AUTOSIZE) root.querySelectorAll("textarea.autosize").forEach(autosize);
+  if (focus) root.querySelector(focus)?.focus();
+}
+
+function renderQuestion(question, qIndex) {
+  const total = state.questions.length;
+  const card = h("li", {
+    class: [
+      "question",
+      question.enabled ? "" : "is-disabled",
+      state.freshIndex === qIndex ? "is-new" : "",
+    ]
+      .filter(Boolean)
+      .join(" "),
+    dataset: { q: qIndex },
+  });
+
+  const enabledText = h("span", null, question.enabled ? "启用" : "已停用");
+  const enabledToggle = h(
+    "label",
+    { class: "switch", title: "停用后判断模型不会回答这个问题" },
+    h("input", {
+      type: "checkbox",
+      checked: question.enabled,
+      "aria-label": "启用此问题",
+      onchange: (event) => {
+        question.enabled = event.target.checked;
+        enabledText.textContent = question.enabled ? "启用" : "已停用";
+        card.classList.toggle("is-disabled", !question.enabled);
+      },
+    }),
+    enabledText,
+  );
+
+  const typeSwitch = h(
+    "div",
+    { class: "seg", role: "group", "aria-label": "问题类型" },
+    ["choice", "boolean"].map((type) =>
+      h(
+        "button",
+        {
+          type: "button",
+          "aria-pressed": String(question.type === type),
+          onclick: () => {
+            if (question.type === type) return;
+            question.type = type;
+            if (type === "choice") ensureTwoOptions(question);
+            renderQuestions(`[data-q="${qIndex}"] .seg [aria-pressed="true"]`);
+            updateDirty();
+          },
+        },
+        type === "choice" ? "选择题" : "是否题",
+      ),
+    ),
+  );
+
+  const head = h(
+    "div",
+    { class: "q-head" },
+    h("span", { class: "q-index", title: "会话提示按这个顺序拼接" }, String(qIndex + 1)),
+    h(
+      "label",
+      { class: "q-id" },
+      h("span", { class: "sr-only" }, "问题 ID"),
+      h("input", {
+        type: "text",
+        class: "mono",
+        value: question.id,
+        placeholder: "问题 ID，如 tone",
+        spellcheck: "false",
+        autocomplete: "off",
+        dataset: { field: "id" },
+        oninput: (event) => {
+          question.id = event.target.value;
+        },
+      }),
+    ),
+    typeSwitch,
+    h("span", { class: "q-spacer" }),
+    enabledToggle,
+    h(
+      "div",
+      { class: "q-tools" },
+      iconButton("up", "上移问题", () => moveQuestion(qIndex, -1, "up"), {
+        disabled: qIndex === 0,
+        act: "up",
+      }),
+      iconButton("down", "下移问题", () => moveQuestion(qIndex, 1, "down"), {
+        disabled: qIndex === total - 1,
+        act: "down",
+      }),
+      iconButton(
+        "trash",
+        "删除问题",
+        () => {
+          state.questions.splice(qIndex, 1);
+          renderQuestions();
+          updateDirty();
+        },
+        { danger: true },
+      ),
+    ),
+  );
+
+  const instructions = h(
+    "label",
+    { class: "q-instr" },
+    h("span", { class: "field-label" }, "判断标准"),
+    h("textarea", {
+      class: "autosize",
+      rows: 2,
+      value: question.instructions,
+      placeholder: "写给判断模型的问题，例如：这轮回复应该用什么语气？",
+      dataset: { field: "instructions" },
+      oninput: (event) => {
+        question.instructions = event.target.value;
+      },
+    }),
+  );
+
+  const body = h("div", { class: "q-body" }, instructions);
+  if (question.type === "boolean") {
+    body.append(renderBooleanLanes(question));
+  } else {
+    body.append(renderChoiceLanes(question, qIndex));
+  }
+  card.append(head, body);
   return card;
 }
 
-function renderOptionCard(question, oIndex) {
-  const option = question.options[oIndex];
-  const card = document.createElement("div");
-  card.className = "option-card";
-  const toolbar = document.createElement("div");
-  toolbar.className = "option-toolbar";
-  const title = document.createElement("strong");
-  title.textContent = `选项 ${oIndex + 1}`;
-  const up = document.createElement("button");
-  up.type = "button";
-  up.className = "secondary small";
-  up.textContent = "上移";
-  up.addEventListener("click", () => {
-    moveItem(question.options, oIndex, -1);
-    renderQuestions();
-  });
-  const down = document.createElement("button");
-  down.type = "button";
-  down.className = "secondary small";
-  down.textContent = "下移";
-  down.addEventListener("click", () => {
-    moveItem(question.options, oIndex, 1);
-    renderQuestions();
-  });
-  const remove = document.createElement("button");
-  remove.type = "button";
-  remove.className = "danger small";
-  remove.textContent = "删除选项";
-  remove.disabled = question.options.length <= 2;
-  remove.addEventListener("click", () => {
-    if (question.options.length <= 2) return;
-    question.options.splice(oIndex, 1);
-    renderQuestions();
-  });
-  toolbar.append(title, up, down, remove);
+function moveQuestion(qIndex, delta, act) {
+  if (!moveItem(state.questions, qIndex, delta)) return;
+  const target = qIndex + delta;
+  const edge = target === 0 || target === state.questions.length - 1;
+  const fallback = act === "up" ? "down" : "up";
+  renderQuestions(`[data-q="${target}"] .q-tools [data-act="${edge ? fallback : act}"]`);
+  updateDirty();
+}
 
-  const grid = document.createElement("div");
-  grid.className = "option-grid";
-  const idInput = document.createElement("input");
-  idInput.type = "text";
-  idInput.value = option.id;
-  idInput.placeholder = "例如 short";
-  idInput.addEventListener("input", () => {
-    option.id = idInput.value;
+function laneHead(judgeText) {
+  return h(
+    "div",
+    { class: "lane-row lanes-head", "aria-hidden": "true" },
+    h("span", { class: "lane-title is-judge" }, judgeText),
+    h("span", { class: "lane-title is-chat" }, "会话模型收到"),
+  );
+}
+
+function chatHint(value, label, onInput) {
+  return h("textarea", {
+    class: "opt-chat autosize",
+    rows: 1,
+    value,
+    "aria-label": label,
+    placeholder: "留空则不告诉会话模型",
+    oninput: (event) => onInput(event.target.value),
   });
-  const idLabel = document.createElement("label");
-  idLabel.textContent = "选项 ID";
-  const criteria = document.createElement("input");
-  criteria.type = "text";
-  criteria.value = option.criteria;
-  criteria.placeholder = "写给判断模型看的选项说明";
-  criteria.addEventListener("input", () => {
-    option.criteria = criteria.value;
+}
+
+function arrow() {
+  return h("span", { class: "opt-arrow", "aria-hidden": "true" }, icon("arrow"));
+}
+
+function renderBooleanLanes(question) {
+  const row = (fixed, text, key) =>
+    h(
+      "div",
+      { class: "lane-row opt" },
+      h(
+        "div",
+        { class: "opt-judge" },
+        h("span", { class: "opt-fixed" }, fixed),
+        h("span", { class: "opt-fixed-text" }, text),
+      ),
+      arrow(),
+      chatHint(question[key] || "", `判断为「${fixed}」时告诉会话模型`, (value) => {
+        question[key] = value;
+      }),
+      h("div", { class: "opt-tools" }),
+    );
+  return h(
+    "div",
+    { class: "lanes" },
+    laneHead("判断模型的回答"),
+    row("是", "判断为「是」时", "true_session_hint"),
+    row("否", "判断为「否」时", "false_session_hint"),
+  );
+}
+
+function renderChoiceLanes(question, qIndex) {
+  const options = question.options || [];
+  const lanes = h("div", { class: "lanes" }, laneHead("判断模型看到：选项 ID 和判断标准"));
+  options.forEach((option, oIndex) => {
+    const n = oIndex + 1;
+    lanes.append(
+      h(
+        "div",
+        { class: "lane-row opt", dataset: { o: oIndex } },
+        h(
+          "div",
+          { class: "opt-judge" },
+          h("input", {
+            type: "text",
+            class: "opt-id mono",
+            value: option.id,
+            placeholder: "选项 ID",
+            spellcheck: "false",
+            autocomplete: "off",
+            "aria-label": `选项 ${n} 的 ID`,
+            dataset: { field: "opt-id" },
+            oninput: (event) => {
+              option.id = event.target.value;
+            },
+          }),
+          h("textarea", {
+            class: "opt-criteria autosize",
+            rows: 1,
+            value: option.criteria,
+            placeholder: "什么情况下选它",
+            "aria-label": `选项 ${n} 的判断标准`,
+            dataset: { field: "opt-criteria" },
+            oninput: (event) => {
+              option.criteria = event.target.value;
+            },
+          }),
+        ),
+        arrow(),
+        chatHint(option.session_hint || "", `选中选项 ${n} 时告诉会话模型`, (value) => {
+          option.session_hint = value;
+        }),
+        h(
+          "div",
+          { class: "opt-tools" },
+          iconButton("up", `上移选项 ${n}`, () => moveOption(question, qIndex, oIndex, -1), {
+            disabled: oIndex === 0,
+          }),
+          iconButton("down", `下移选项 ${n}`, () => moveOption(question, qIndex, oIndex, 1), {
+            disabled: oIndex === options.length - 1,
+          }),
+          iconButton(
+            "trash",
+            options.length <= 2 ? "至少保留两个选项" : `删除选项 ${n}`,
+            () => {
+              if (question.options.length <= 2) return;
+              question.options.splice(oIndex, 1);
+              renderQuestions();
+              updateDirty();
+            },
+            { disabled: options.length <= 2, danger: true },
+          ),
+        ),
+      ),
+    );
   });
-  const criteriaLabel = document.createElement("label");
-  criteriaLabel.textContent = "判断标准";
-  const hint = document.createElement("textarea");
-  hint.rows = 2;
-  hint.value = option.session_hint || "";
-  hint.placeholder = "选中后告诉会话模型的内容，可留空";
-  hint.addEventListener("input", () => {
-    option.session_hint = hint.value;
-  });
-  const hintLabel = document.createElement("label");
-  hintLabel.textContent = "告诉会话模型";
-  grid.append(idLabel, idInput, criteriaLabel, criteria, hintLabel, hint);
-  card.append(toolbar, grid);
-  return card;
+
+  const addOption = h(
+    "button",
+    {
+      type: "button",
+      class: "btn btn-add-opt",
+      onclick: () => {
+        const used = new Set(question.options.map((item) => item.id));
+        question.options.push({ id: nextId("option_", used), criteria: "", session_hint: "" });
+        const last = question.options.length - 1;
+        renderQuestions(`[data-q="${qIndex}"] [data-o="${last}"] [data-field="opt-criteria"]`);
+        updateDirty();
+      },
+    },
+    icon("plus"),
+    "添加选项",
+  );
+  return h("div", null, lanes, h("div", { class: "q-foot" }, addOption));
+}
+
+function moveOption(question, qIndex, oIndex, delta) {
+  if (!moveItem(question.options, oIndex, delta)) return;
+  renderQuestions(`[data-q="${qIndex}"] [data-o="${oIndex + delta}"] [data-field="opt-criteria"]`);
+  updateDirty();
+}
+
+// ---------- 校验（与后端 strict 规则一致） ----------
+
+function validate(questions) {
+  const used = new Set();
+  for (const [q, question] of questions.entries()) {
+    const label = question.id || `第 ${q + 1} 个问题`;
+    if (!question.id) {
+      return { q, field: "id", message: `第 ${q + 1} 个问题还没有填写 ID` };
+    }
+    if (state.reservedIds.has(question.id) || RESERVED_IDS.has(question.id)) {
+      return { q, field: "id", message: `「${question.id}」是内置问题的 ID，请换一个` };
+    }
+    if (used.has(question.id)) {
+      return { q, field: "id", message: `问题 ID「${question.id}」重复了` };
+    }
+    used.add(question.id);
+    if (!question.instructions.trim()) {
+      return { q, field: "instructions", message: `问题「${label}」还没有填写判断标准` };
+    }
+    if (question.type !== "choice") continue;
+    const optionIds = new Set();
+    for (const [o, option] of question.options.entries()) {
+      if (!option.id) {
+        return { q, o, field: "opt-id", message: `问题「${label}」的选项 ${o + 1} 还没有填写 ID` };
+      }
+      if (optionIds.has(option.id)) {
+        return { q, o, field: "opt-id", message: `问题「${label}」的选项 ID「${option.id}」重复了` };
+      }
+      optionIds.add(option.id);
+      if (!option.criteria.trim()) {
+        return {
+          q,
+          o,
+          field: "opt-criteria",
+          message: `问题「${label}」的选项「${option.id}」还没有填写判断标准`,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+function markInvalid(error) {
+  const card = $("questions").querySelector(`[data-q="${error.q}"]`);
+  const scope = error.o === undefined ? card : card?.querySelector(`[data-o="${error.o}"]`);
+  const field = scope?.querySelector(`[data-field="${error.field}"]`);
+  if (!field) return;
+  field.classList.add("is-invalid");
+  field.scrollIntoView({ block: "center", behavior: "smooth" });
+  field.focus({ preventScroll: true });
+}
+
+// ---------- 读取与保存 ----------
+
+function updateContextCount() {
+  const length = $("custom-context").value.trim().length;
+  $("context-count").textContent = length ? `${length} 字` : "未填写";
+}
+
+function fillForm(saved) {
+  $("custom-context").value = saved.context;
+  updateContextCount();
+  state.questions = saved.questions.map(normalizeQuestion);
+  renderQuestions();
+}
+
+function applyConfig(data, fallbackQuestions) {
+  if (Array.isArray(data.reserved_question_ids)) {
+    state.reservedIds = new Set(data.reserved_question_ids);
+  }
+  const questions = Array.isArray(data.decision_questions)
+    ? data.decision_questions
+    : fallbackQuestions || cloneDefaultQuestions();
+  state.saved = {
+    context: data.decision_custom_context || "",
+    questions: JSON.parse(JSON.stringify(questions)),
+  };
+  fillForm(state.saved);
+  state.loaded = true;
+  state.savedSnapshot = snapshot();
+}
+
+function showConfigWarning(text) {
+  const box = $("config-warning");
+  box.hidden = !text;
+  box.textContent = text ? `当前配置有问题：${text}。修改后保存即可覆盖。` : "";
 }
 
 async function loadDecisionConfig() {
   const data = await bridge.apiGet("decision-config");
-  $("custom-context").value = data.decision_custom_context || "";
-  reservedIds = new Set(data.reserved_question_ids || [...RESERVED_IDS]);
-  questionsState = Array.isArray(data.decision_questions)
-    ? data.decision_questions.map(normalizeQuestion)
-    : cloneDefaultQuestions();
-  renderQuestions();
-  if (data.warning) {
-    showMessage($("config-msg"), data.warning, false);
-  } else {
-    showMessage($("config-msg"), "", true);
-  }
+  applyConfig(data);
+  showConfigWarning(data.warning);
+  setSaveState("clean");
 }
 
 async function saveDecisionConfig() {
@@ -343,181 +643,341 @@ async function saveDecisionConfig() {
     decision_custom_context: $("custom-context").value,
     decision_questions: collectQuestionsFromForm(),
   };
-  const used = new Set();
-  for (const question of payload.decision_questions) {
-    if (!question.id) {
-      showMessage($("config-msg"), "每个问题都需要填写 ID", false);
-      return;
-    }
-    if (reservedIds.has(question.id) || RESERVED_IDS.has(question.id)) {
-      showMessage(
-        $("config-msg"),
-        `问题 id「${question.id}」为内置保留项，请更换`,
-        false,
-      );
-      return;
-    }
-    if (used.has(question.id)) {
-      showMessage($("config-msg"), `问题 id 重复：${question.id}`, false);
-      return;
-    }
-    used.add(question.id);
+  const error = validate(payload.decision_questions);
+  if (error) {
+    setSaveState("error", error.message);
+    markInvalid(error);
+    return;
   }
-  $("save-config").disabled = true;
+  state.saving = true;
+  setSaveState("saving");
   try {
     const data = await bridge.apiPost("decision-config", payload);
-    $("custom-context").value = data.decision_custom_context || "";
-    questionsState = Array.isArray(data.decision_questions)
-      ? data.decision_questions.map(normalizeQuestion)
-      : payload.decision_questions.map(normalizeQuestion);
-    renderQuestions();
-    showMessage($("config-msg"), "已保存到官方插件配置。重载插件后也会继续生效。", true);
-  } catch (error) {
-    showMessage($("config-msg"), error.message, false);
-  } finally {
-    $("save-config").disabled = false;
+    applyConfig(data, payload.decision_questions);
+    showConfigWarning("");
+    state.saving = false;
+    setSaveState("saved");
+  } catch (err) {
+    state.saving = false;
+    setSaveState("error", `保存失败：${err.message}`);
   }
 }
 
+// ---------- 状态与表情包管理器 ----------
 
-let questionsState = [];
-let reservedIds = new Set(RESERVED_IDS);
-let currentTab = "decision";
-
-function $(id) {
-  return document.getElementById(id);
+function renderStatusChips(status) {
+  const adapter = status.meme_adapter || {};
+  const count = adapter.candidate_count ?? status.meme_count ?? 0;
+  const chips = [
+    status.enabled
+      ? h("span", { class: "chip is-ok" }, "已启用")
+      : h("span", { class: "chip is-off", title: "插件配置中已关闭快速决策" }, "已关闭"),
+  ];
+  if (status.dry_run) {
+    chips.push(
+      h("span", { class: "chip is-dry", title: "只记录决策，不向 QQ 发送消息" }, "试运行中"),
+    );
+  }
+  chips.push(
+    h(
+      "span",
+      { class: "chip is-plain" },
+      icon("image"),
+      adapter.available ? `${count} 张表情可用` : "只发文字",
+    ),
+  );
+  $("status-chips").replaceChildren(...chips);
 }
 
-function showMessage(el, text, ok) {
-  el.hidden = !text;
-  el.textContent = text || "";
-  el.className = `msg ${ok ? "ok" : "error"}`;
-}
-
-function setTab(name) {
-  currentTab = name;
-  $("panel-decision").hidden = name !== "decision";
-  $("panel-logs").hidden = name !== "logs";
-  $("tab-btn-decision").classList.toggle("active", name === "decision");
-  $("tab-btn-logs").classList.toggle("active", name === "logs");
+function renderAdapter(adapter) {
+  const section = $("adapter");
+  const count = adapter.candidate_count ?? 0;
+  const packs = Array.isArray(adapter.packs) ? adapter.packs : [];
+  const msg = $("adapter-msg");
+  msg.replaceChildren();
+  if (!adapter.available) {
+    section.dataset.state = "error";
+    $("adapter-title").textContent = "没有对接到表情包管理器，机器人只会发文字";
+    msg.append(
+      adapter.message ? `${adapter.message} ` : "",
+      "在插件市场安装并启用「表情包管理器」（",
+      h("code", null, "anka-afk/astrbot_plugin_meme_manager"),
+      "）后点刷新。",
+    );
+    $("adapter-tips").hidden = true;
+    return;
+  }
+  section.dataset.state = "ok";
+  const version = adapter.plugin_version ? `（${adapter.plugin_version}）` : "";
+  $("adapter-title").textContent = `已对接表情包管理器${version}`;
+  if (count) {
+    msg.append(`${packs.length || adapter.pack_count || 0} 个图包，共 ${count} 张带描述的表情供判断模型挑选。`);
+  } else {
+    msg.append("已对接，但还没有可用的表情。请在表情包管理器中添加图片并填写描述。");
+  }
+  if (packs.length) {
+    msg.append(
+      h("br"),
+      "图包：",
+      ...packs.flatMap((pack, index) => [
+        index ? "、" : "",
+        pack.name || pack.id,
+        pack.enabled === false ? "（已停用）" : "",
+        pack.present === false ? "（文件缺失）" : "",
+      ]),
+    );
+  }
+  $("adapter-tips").hidden = false;
 }
 
 async function loadStatus() {
   try {
     const status = await bridge.apiGet("status");
-    const dry = status.dry_run ? "试运行" : "正常";
-    const enabled = status.enabled ? "已启用" : "已关闭";
-    const adapter = status.meme_adapter || {};
-    const count = adapter.candidate_count ?? status.meme_count ?? 0;
-    const source = adapter.available
-      ? `meme_manager ${count} 张`
-      : "仅文字";
-    $("status-pill").textContent = `${enabled} · ${dry} · ${source}`;
-    const box = $("adapter-msg");
-    if (!adapter.available) {
-      box.className = "msg error";
-      box.textContent = adapter.message || "未检测到表情包管理器，将只发送文字，不会使用旧自制图库。";
-    } else {
-      box.className = "hint";
-      const ver = adapter.plugin_version ? `（${adapter.plugin_version}）` : "";
-      box.textContent =
-        `已对接市场插件「表情包管理器」${ver}。请在该插件页面管理图库和逐图描述；本插件只按描述选图，不会再提供自制图库上传或删除。` +
-        ` 当前可用 ${count} 张。请在表情包管理器中关闭主动发送表情工具，并把表情发送概率设为 0，避免与本插件各发一张。`;
-    }
+    renderStatusChips(status);
+    renderAdapter(status.meme_adapter || {});
   } catch (error) {
-    $("status-pill").textContent = "状态读取失败";
-    $("adapter-msg").className = "msg error";
-    $("adapter-msg").textContent = `无法读取状态：${error.message}`;
+    $("status-chips").replaceChildren(h("span", { class: "chip is-off" }, "状态读取失败"));
+    $("adapter").dataset.state = "error";
+    $("adapter-title").textContent = "读取插件状态失败";
+    $("adapter-msg").textContent = `${error.message}。可以稍后点刷新重试。`;
+    $("adapter-tips").hidden = true;
   }
+}
+
+// ---------- 决策日志 ----------
+
+function splitTime(value) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2}:\d{2})/.exec(String(value || ""));
+  if (!match) return { day: "", clock: String(value || "—") };
+  const [, year, month, date, clock] = match;
+  const now = new Date();
+  const today =
+    Number(year) === now.getFullYear() &&
+    Number(month) === now.getMonth() + 1 &&
+    Number(date) === now.getDate();
+  return { day: today ? "今天" : `${month}-${date}`, clock };
+}
+
+function formatAnswer(value) {
+  if (value === true) return "是";
+  if (value === false) return "否";
+  if (value === null || value === undefined) return "—";
+  return typeof value === "object" ? JSON.stringify(value) : String(value);
+}
+
+function renderLog(item) {
+  const action = normalizeAction(item.action);
+  const time = splitTime(item.time);
+  const answers = item.custom_answers && typeof item.custom_answers === "object"
+    ? Object.entries(item.custom_answers)
+    : [];
+  if (!answers.length && item.length) answers.push(["length", item.length]);
+  const hints = Array.isArray(item.session_hints) ? item.session_hints.filter(Boolean) : [];
+
+  const main = h(
+    "div",
+    { class: "log-main" },
+    h("span", { class: "log-action" }, ACTION_LABELS[action] || item.action || "未知"),
+    h("span", { class: "tag" }, SCENE_LABELS[item.scene] || item.scene || "未知场景"),
+    item.use_meme
+      ? h("span", { class: "tag", title: "配图" }, icon("image"), item.meme_id || "配图")
+      : null,
+    item.dry_run ? h("span", { class: "tag tag-flag", title: "只记录，未发送" }, "试运行") : null,
+    item.degraded ? h("span", { class: "tag tag-flag", title: "判断失败后按降级规则处理" }, "已降级") : null,
+    item.official_llm ? h("span", { class: "tag", title: "文字由官方主 Agent 生成" }, "官方主 Agent") : null,
+    h("span", { class: "log-dur" }, `${item.duration_ms ?? "—"} ms`),
+  );
+
+  const sub = answers.length || hints.length
+    ? h(
+        "div",
+        { class: "log-sub" },
+        answers.map(([key, value]) =>
+          h("span", { class: "tag tag-judge" }, h("b", null, key), formatAnswer(value)),
+        ),
+        hints.length ? h("span", { class: "tag tag-chat" }, `会话提示 ${hints.length} 条`) : null,
+      )
+    : null;
+
+  const raw = item.raw && typeof item.raw === "object" && Object.keys(item.raw).length
+    ? item.raw
+    : null;
+  const detail = hints.length || raw || item.target_message_id
+    ? h(
+        "details",
+        { class: "log-detail" },
+        h("summary", null, "查看详情"),
+        item.target_message_id
+          ? h("p", { class: "log-meta" }, "回复的消息：", h("code", null, item.target_message_id))
+          : null,
+        hints.length ? h("ul", { class: "log-hints" }, hints.map((text) => h("li", null, text))) : null,
+        raw ? h("pre", { class: "log-raw" }, JSON.stringify(raw, null, 2)) : null,
+      )
+    : null;
+
+  return h(
+    "li",
+    { class: "log", dataset: { action } },
+    h("div", { class: "log-time" }, h("strong", null, time.clock), time.day),
+    h(
+      "div",
+      { class: "log-body" },
+      main,
+      sub,
+      item.error ? h("p", { class: "log-error" }, item.error) : null,
+      item.umo ? h("p", { class: "log-umo", title: item.umo }, item.umo) : null,
+      detail,
+    ),
+  );
 }
 
 async function loadLogs() {
+  const limit = Number($("log-limit").value) || 20;
+  const list = $("logs");
+  const empty = $("logs-empty");
   try {
-    const data = await bridge.apiGet("logs", { limit: 8 });
+    const data = await bridge.apiGet("logs", { limit });
     const logs = data.logs || [];
-    if (!logs.length) {
-      $("logs").textContent = "（暂无日志）";
-      return;
-    }
-    $("logs").textContent = logs
-      .map((item) => {
-        const meme = item.use_meme ? item.meme_id : "无图";
-        const err = item.error ? ` 错误=${item.error}` : "";
-        const answers = item.custom_answers
-          ? ` 判断=${JSON.stringify(item.custom_answers)}`
-          : "";
-        const hints = Array.isArray(item.session_hints) && item.session_hints.length
-          ? ` 提示=${item.session_hints.length}`
-          : "";
-        const length = item.length || "-";
-        return `${item.time}  ${item.scene}  ${item.action}  ${length}  ${meme}  ${item.duration_ms}ms${answers}${hints}${err}`;
-      })
-      .join("\n");
+    list.replaceChildren(...logs.map(renderLog));
+    empty.hidden = logs.length > 0;
+    empty.textContent = "还没有决策记录。机器人收到消息并完成一次判断后，结果会出现在这里。";
   } catch (error) {
-    $("logs").textContent = `读取日志失败：${error.message}`;
+    list.replaceChildren();
+    empty.hidden = false;
+    empty.textContent = `读取日志失败：${error.message}`;
   }
 }
 
+// ---------- 页面 ----------
+
+let currentTab = "decision";
+
+function setTab(name, { focus = false } = {}) {
+  currentTab = name;
+  for (const tab of ["decision", "logs"]) {
+    const active = tab === name;
+    const button = $(`tab-btn-${tab}`);
+    $(`panel-${tab}`).hidden = !active;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+    if (active && focus) button.focus();
+  }
+  if (name === "logs") loadLogs();
+}
+
 async function reload() {
-  await loadStatus();
-  await loadLogs();
+  const button = $("refresh");
+  button.disabled = true;
   try {
-    await loadDecisionConfig();
-  } catch (error) {
-    showMessage($("config-msg"), `加载判断配置失败：${error.message}`, false);
+    await loadStatus();
+    if (currentTab === "logs") await loadLogs();
+    if (isDirty()) {
+      setSaveState("dirty", "有未保存的更改，刷新时保留了你的编辑");
+      return;
+    }
+    try {
+      await loadDecisionConfig();
+    } catch (error) {
+      setSaveState("error", `读取判断配置失败：${error.message}`);
+    }
+  } finally {
+    button.disabled = false;
   }
 }
 
 function renderContext(context) {
   $("heading").textContent = bridge.t("views.meme_manager.heading", "快速决策");
   document.title = bridge.t("views.meme_manager.title", "快速决策");
-  $("tab-btn-decision").textContent = bridge.t(
-    "views.meme_manager.tab_decision",
-    "判断配置",
-  );
+  $("tab-btn-decision").textContent = bridge.t("views.meme_manager.tab_decision", "判断配置");
   $("tab-btn-logs").textContent = bridge.t("views.meme_manager.tab_logs", "决策日志");
+  $("refresh-label").textContent = bridge.t("views.meme_manager.refresh", "刷新");
   document.documentElement.dataset.theme = context?.isDark ? "dark" : "light";
 }
 
+let restoreTimer = 0;
 
-const context = await bridge.ready();
-renderContext(context);
-bridge.onContext(renderContext);
-$("refresh").addEventListener("click", reload);
-$("tab-btn-decision").addEventListener("click", () => setTab("decision"));
-$("tab-btn-logs").addEventListener("click", () => setTab("logs"));
-$("add-question").addEventListener("click", () => {
-  const used = new Set(questionsState.map((item) => item.id));
-  questionsState.push(
+function resetRestoreButton() {
+  window.clearTimeout(restoreTimer);
+  const button = $("restore-default");
+  button.classList.remove("is-confirm");
+  button.textContent = "恢复默认长短问题";
+}
+
+function onRestoreDefault() {
+  const button = $("restore-default");
+  if (!button.classList.contains("is-confirm")) {
+    button.classList.add("is-confirm");
+    button.textContent = "再点一次确认恢复";
+    setSaveState("notice", "确认后问题列表会换成默认长短问题，背景信息不受影响");
+    restoreTimer = window.setTimeout(() => {
+      resetRestoreButton();
+      setSaveState(isDirty() ? "dirty" : "clean");
+    }, 4000);
+    return;
+  }
+  resetRestoreButton();
+  state.questions = cloneDefaultQuestions().map(normalizeQuestion);
+  renderQuestions();
+  if (isDirty()) setSaveState("dirty", "已换成默认长短问题，保存后生效");
+  else setSaveState("clean");
+}
+
+function onAddQuestion() {
+  const used = new Set(state.questions.map((item) => item.id));
+  state.questions.push(
     normalizeQuestion({
       id: nextId("custom_", used),
       enabled: true,
       type: "choice",
       instructions: "",
-      options: [
-        { id: "option_1", criteria: "", session_hint: "" },
-        { id: "option_2", criteria: "", session_hint: "" },
-      ],
+      options: [],
     }),
   );
-  renderQuestions();
-});
-let restorePending = false;
-let restoreTimer = 0;
-$("restore-default").addEventListener("click", () => {
-  if (!restorePending) {
-    restorePending = true;
-    showMessage($("config-msg"), "再点一次以确认恢复默认长短问题（自定义上下文不会被清除）", true);
-    restoreTimer = window.setTimeout(() => {
-      restorePending = false;
-    }, 4000);
-    return;
-  }
-  restorePending = false;
-  window.clearTimeout(restoreTimer);
-  questionsState = cloneDefaultQuestions().map(normalizeQuestion);
-  renderQuestions();
-  showMessage($("config-msg"), "已在表单中恢复默认长短问题，请点击保存后生效。", true);
-});
+  state.freshIndex = state.questions.length - 1;
+  renderQuestions(`[data-q="${state.freshIndex}"] [data-field="instructions"]`);
+  $("questions").lastElementChild?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  updateDirty();
+}
+
+function onDiscard() {
+  fillForm(state.saved);
+  setSaveState("clean");
+}
+
+function onTabKey(event) {
+  if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+  event.preventDefault();
+  setTab(currentTab === "decision" ? "logs" : "decision", { focus: true });
+}
+
+const context = await bridge.ready();
+renderContext(context);
+bridge.onContext(renderContext);
+
+$("refresh").addEventListener("click", reload);
+$("tab-btn-decision").addEventListener("click", () => setTab("decision"));
+$("tab-btn-logs").addEventListener("click", () => setTab("logs"));
+$("tab-btn-decision").addEventListener("keydown", onTabKey);
+$("tab-btn-logs").addEventListener("keydown", onTabKey);
+$("log-limit").addEventListener("change", loadLogs);
+$("add-question").addEventListener("click", onAddQuestion);
+$("restore-default").addEventListener("click", onRestoreDefault);
 $("save-config").addEventListener("click", saveDecisionConfig);
+$("discard").addEventListener("click", onDiscard);
+$("custom-context").addEventListener("input", updateContextCount);
+
+// 表单里任何输入都会刷新「未保存」状态，并清掉对应输入框的错误标记。
+for (const type of ["input", "change"]) {
+  $("panel-decision").addEventListener(type, (event) => {
+    event.target.classList?.remove("is-invalid");
+    autosize(event.target);
+    updateDirty();
+  });
+}
+
+window.addEventListener("beforeunload", (event) => {
+  if (isDirty()) event.preventDefault();
+});
+
 await reload();

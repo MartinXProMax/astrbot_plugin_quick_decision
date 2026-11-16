@@ -7,61 +7,129 @@
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
-    <header class="top">
-      <div>
-        <h1 id="heading">快速决策</h1>
-        <p class="sub" id="subtitle">编辑判断模型的自定义上下文和判断问题，并查看最近决策日志。表情包请在「表情包管理器」插件中管理。</p>
-      </div>
-      <div class="actions">
-        <span id="status-pill" class="pill">—</span>
-        <button id="refresh" type="button">刷新</button>
-      </div>
-    </header>
-
-    <nav class="tabs" aria-label="插件页面分段">
-      <button id="tab-btn-decision" type="button" class="tab active" data-tab="decision">判断配置</button>
-      <button id="tab-btn-logs" type="button" class="tab" data-tab="logs">决策日志</button>
-    </nav>
-
-    <div id="panel-decision">
-      <section class="panel">
-        <h2>表情包依赖</h2>
-        <p id="adapter-msg" class="hint">正在检查表情包管理器…</p>
-      </section>
-
-      <section class="panel">
-        <h2>判断模型自定义上下文</h2>
-        <p class="hint">这段文字只会注入判断模型的 state（字段名 custom_context），不会传给会话模型。可填写机器人名字、群内身份或其他背景。留空则不附加。</p>
-        <textarea id="custom-context" rows="6" placeholder="例如：机器人在群里的名字是「小狼」。有人只喊这个名字、没有点 @ 时，也可以视为在叫自己。"></textarea>
-      </section>
-
-      <section class="panel">
-        <h2>自定义判断问题</h2>
-        <p class="hint">
-          是否发言、回复哪一条、是否配表情以及选哪张图仍由插件内置，不能在此覆盖或改用保留 id（action、target_message_id、use_meme、meme_id）。
-          默认的长短问题可以编辑、停用或删除，也可以再增加语气、是否追问等问题。
-          选项里「告诉会话模型的内容」会在生成回复时写入临时的 &lt;quick_decision&gt; 提示；留空则该结果不告知会话模型。
-        </p>
-        <div id="questions" class="questions"></div>
-        <div class="row actions-row">
-          <button id="add-question" type="button">添加问题</button>
-          <button id="restore-default" type="button" class="secondary">恢复默认长短问题</button>
+    <div class="shell">
+      <header class="masthead">
+        <div class="masthead-text">
+          <h1 id="heading">快速决策</h1>
+          <p class="lede" id="subtitle">
+            每条消息都先交给判断模型，由它决定要不要说话、回哪一条、配不配表情。这里设置判断模型额外参考的背景和问题。
+          </p>
         </div>
-      </section>
-
-      <section class="panel">
-        <div class="row actions-row">
-          <button id="save-config" type="button">保存判断配置</button>
+        <div class="masthead-side">
+          <div id="status-chips" class="chips" aria-live="polite">
+            <span class="chip">正在读取状态…</span>
+          </div>
+          <button id="refresh" type="button" class="btn btn-ghost">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7" /><path d="M20 4v7h-7" /></svg>
+            <span id="refresh-label">刷新</span>
+          </button>
         </div>
-        <p id="config-msg" class="msg" hidden></p>
-      </section>
-    </div>
+      </header>
 
-    <div id="panel-logs" hidden>
-      <section class="panel">
-        <h2>最近决策</h2>
-        <pre id="logs" class="logs">（暂无日志）</pre>
-      </section>
+      <nav class="tabs" role="tablist" aria-label="插件页面分段">
+        <button id="tab-btn-decision" type="button" role="tab" class="tab active" data-tab="decision" aria-selected="true" aria-controls="panel-decision">判断配置</button>
+        <button id="tab-btn-logs" type="button" role="tab" class="tab" data-tab="logs" aria-selected="false" aria-controls="panel-logs" tabindex="-1">决策日志</button>
+      </nav>
+
+      <main>
+        <div id="panel-decision" role="tabpanel" aria-labelledby="tab-btn-decision">
+          <section id="adapter" class="block adapter" data-state="loading" aria-live="polite">
+            <div class="adapter-head">
+              <span class="state-dot" aria-hidden="true"></span>
+              <div class="adapter-text">
+                <h2 id="adapter-title">正在检查表情包管理器…</h2>
+                <p id="adapter-msg" class="hint"></p>
+              </div>
+            </div>
+            <details id="adapter-tips" class="tips" hidden>
+              <summary>避免两个插件各发一张图</summary>
+              <p class="hint">图库和逐图描述在「表情包管理器」页面里管理，这里只按描述选图。请在表情包管理器的设置里改两处：</p>
+              <ul class="checklist">
+                <li>关闭「启用主动发送表情工具」</li>
+                <li>把「表情发送概率」设为 0</li>
+              </ul>
+            </details>
+          </section>
+
+          <section class="block">
+            <div class="block-head">
+              <h2><label for="custom-context">判断模型的背景信息</label></h2>
+              <span class="route route-judge">只给判断模型</span>
+            </div>
+            <p class="hint">
+              比如机器人在群里的名字、身份。它会作为 <code>custom_context</code> 交给判断模型，不会传给会话模型；留空就不附加。
+            </p>
+            <textarea id="custom-context" rows="5" placeholder="例如：机器人在群里的名字是「小狼」。有人只喊这个名字、没有点 @ 时，也可以视为在叫自己。"></textarea>
+            <div class="field-foot"><span id="context-count">0 字</span></div>
+          </section>
+
+          <section class="block">
+            <div class="block-head">
+              <h2>判断问题</h2>
+              <div class="legend" aria-label="颜色说明">
+                <span class="route route-judge">判断模型看到</span>
+                <span class="route route-chat">会话模型收到</span>
+              </div>
+            </div>
+            <p class="hint">
+              判断模型每次都会回答下面这些问题。选中结果的「会话模型收到」会按问题顺序拼进本轮临时的
+              <code>&lt;quick_decision&gt;</code> 提示，不写入聊天记录；留空就不告诉会话模型。
+            </p>
+
+            <div id="config-warning" class="banner banner-danger" role="alert" hidden></div>
+
+            <div class="builtin" aria-label="内置问题">
+              <p class="builtin-label">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2" /><path d="M8 11V8a4 4 0 0 1 8 0v3" /></svg>
+                内置问题，始终由插件提问，ID 不能被自定义问题占用
+              </p>
+              <ul class="builtin-list">
+                <li><code>action</code><span>要不要发言</span></li>
+                <li><code>target_message_id</code><span>回复哪一条</span></li>
+                <li><code>use_meme</code><span>配不配表情</span></li>
+                <li><code>meme_id</code><span>选哪张图</span></li>
+              </ul>
+            </div>
+
+            <ol id="questions" class="questions"></ol>
+
+            <div class="questions-foot">
+              <button id="add-question" type="button" class="btn btn-outline">
+                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+                添加问题
+              </button>
+              <button id="restore-default" type="button" class="btn btn-text">恢复默认长短问题</button>
+            </div>
+          </section>
+
+          <div id="savebar" class="savebar" data-state="clean">
+            <p id="config-msg" class="savebar-msg" role="status">已与插件配置一致</p>
+            <div class="savebar-actions">
+              <button id="discard" type="button" class="btn btn-ghost" hidden>撤销更改</button>
+              <button id="save-config" type="button" class="btn btn-primary">保存判断配置</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="panel-logs" role="tabpanel" aria-labelledby="tab-btn-logs" hidden>
+          <section class="block">
+            <div class="block-head">
+              <h2>最近决策</h2>
+              <label class="inline-select">
+                显示最近
+                <select id="log-limit">
+                  <option value="20">20</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                </select>
+                条
+              </label>
+            </div>
+            <ol id="logs" class="log-list" aria-live="polite"></ol>
+            <p id="logs-empty" class="empty" hidden>还没有决策记录。机器人收到消息并完成一次判断后，结果会出现在这里。</p>
+          </section>
+        </div>
+      </main>
     </div>
 
     <script type="module" src="./app.js"></script>
