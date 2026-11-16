@@ -15,13 +15,13 @@
 - 当前 `_load_plugin_metadata()` 没有读取 `help`、`dependencies` 或 `plugin_dependencies`，添加这些字段不能提供安装帮助或自动安装其他 AstrBot 插件。[4]
 - 官方依赖机制是插件根目录的 `requirements.txt`，用于安装 Python 第三方库；加载器的 `_ensure_plugin_requirements()` 同样仅处理该文件。[2][4]
 - 插件安装完成后，安装器会读取根目录 `README.md`（不存在则尝试 `readme.md`），并在安装结果中返回其内容。[4]
-- 因此，安装说明应放在 `desc` 和 README；`meme_manager` 的安装与配置需要明确告知用户手动完成，不能写成 Python 包依赖。
+- 安装说明可放在 `desc` 或 README；本项目将完整步骤保留在 README，市场描述只展示功能概要。`meme_manager` 的安装与配置需要明确告知用户手动完成，不能写成 Python 包依赖。
 
 ## 本项目采用方式
 
 1. 补充 `repo: https://github.com/MartinXProMax/astrbot_plugin_quick_decision`。
-2. 在 `desc` 中说明仓库链接和 ZIP 两种安装方式、版本与平台要求、System One 判断提供商、可选表情包管理器及避免重复配图的设置，并链接 README。
-3. 保留精简 `short_desc`，添加少量市场标签；README 同步提供安装、重载和配置步骤。仓库链接安装需要 GitHub 仓库可被 AstrBot 直接访问；公开前可通过有权限的机器下载 ZIP 后从文件安装。
+2. `desc` 简要说明发言时机、回复策略、表情包、主动回复和自定义判断功能；安装前提与配置步骤保留在 README。
+3. 保留精简 `short_desc`，市场标签包含「主动回复」；README 提供安装、重载和配置步骤。仓库链接安装需要 GitHub 仓库可被 AstrBot 直接访问。
 4. 本项目无需额外 Python 包，不为安装另一 AstrBot 插件新增 `requirements.txt`，也不添加未被支持的安装字段。
 
 ## 官方来源
