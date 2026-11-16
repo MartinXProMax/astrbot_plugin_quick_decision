@@ -55,6 +55,26 @@ class SessionStore:
     def all_sessions(self) -> list[SessionRuntime]:
         return list(self._sessions.values())
 
+    def prune_idle(self, max_idle_seconds: int = 86400) -> int:
+        """丢弃一天没有活动且没有进行中任务的会话，限制长期运行时的内存。"""
+        cutoff = time.time() - max(max_idle_seconds, 1)
+        removed = 0
+        for umo, runtime in list(self._sessions.items()):
+            lock = self._session_locks.get(umo)
+            if (
+                runtime.deciding
+                or runtime.pending_pipeline is not None
+                or runtime.pending
+                or (lock is not None and lock.locked())
+            ):
+                continue
+            last_activity = max(runtime.last_user_ts, runtime.last_bot_ts)
+            if last_activity and last_activity < cutoff:
+                self._sessions.pop(umo, None)
+                self._session_locks.pop(umo, None)
+                removed += 1
+        return removed
+
     def session_lock(self, umo: str) -> asyncio.Lock:
         return self._session_locks[umo]
 

@@ -357,6 +357,7 @@ async def send_decision_message(
     platform_name: str = "",
     segmenter=None,
     sleeper=None,
+    sent_texts: list[str] | None = None,
 ) -> bool:
     """按官方分段配置发送文字段，全部成功后再发独立表情。
 
@@ -395,6 +396,8 @@ async def send_decision_message(
             continue
         if await _send_chain(context, umo, text_chain):
             any_text_sent = True
+            if sent_texts is not None:
+                sent_texts.append(seg)
         else:
             all_text_ok = False
     if not any_text_sent or not all_text_ok:

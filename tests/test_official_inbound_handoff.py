@@ -764,6 +764,9 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.on_llm_request(ev, req)
         self.assertEqual(len(req.extra_user_content_parts), 1)
         self.assertTrue(req.extra_user_content_parts[0]._no_save)
+        second = ProviderRequest()
+        await self.plugin.on_llm_request(ev, second)
+        self.assertEqual(second.extra_user_content_parts, [])
 
     async def test_proactive_still_uses_self_generate(self) -> None:
         generate_calls = []

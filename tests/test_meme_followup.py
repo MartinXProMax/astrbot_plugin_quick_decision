@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -188,6 +189,7 @@ class MemeFollowupTests(unittest.TestCase):
         )
         self.assertTrue(sent)
         self.assertEqual(len(context.calls), 2)
+
         self.assertEqual(self._chain_kinds(context.calls[0]), ["text"])
         self.assertEqual(self._chain_kinds(context.calls[1]), ["image"])
         self.assertTrue(all(getattr(item, "text", None) == "hello" for item in context.calls[0]))
@@ -197,6 +199,48 @@ class MemeFollowupTests(unittest.TestCase):
         self.assertFalse(
             any("text" in self._chain_kinds(call) and "image" in self._chain_kinds(call) for call in context.calls)
         )
+
+    def test_partial_send_reports_only_successful_text(self) -> None:
+        class Seg:
+            def split_text(self, text, **_kwargs):
+                return ["一段", "二段", "三段"]
+
+            def should_delay(self, **_kwargs):
+                return False
+
+            async def interval_for_image(self):
+                return 0
+
+            async def sleep(self, _seconds):
+                return None
+
+        context = _RecordingContext(return_false_on={1})
+        sent_texts: list[str] = []
+        sent = _run(
+            send_decision_message(
+                context,
+                umo="group:1",
+                text="一段。二段。三段",
+                resolver=self.store,
+                decision=_decision(use_meme=False, meme_id=None),
+                dry_run=False,
+                quote_target=False,
+                segmenter=Seg(),
+                sent_texts=sent_texts,
+            )
+        )
+        self.assertTrue(sent)
+        self.assertEqual(sent_texts, ["一段", "三段"])
+
+    def test_idle_sessions_and_locks_are_pruned(self) -> None:
+        store = SessionStore(Path(self.temp.name))
+        profile = SessionProfile(umo="old", is_private=False)
+        runtime = store.ensure(profile)
+        runtime.last_user_ts = time.time() - 90000
+        store.session_lock("old")
+        self.assertEqual(store.prune_idle(), 1)
+        self.assertIsNone(store.get("old"))
+        self.assertNotIn("old", store._session_locks)
 
     def test_no_image_sends_text_only(self) -> None:
         context = _RecordingContext()

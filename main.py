@@ -334,6 +334,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             return
         from .official_segment import platform_name_from_event
 
+        sent_texts: list[str] = []
         sent = await send_decision_message(
             self.context,
             umo=profile.umo,
@@ -343,9 +344,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             dry_run=False,
             quote_target=self.settings.should_quote_target(profile.is_private),
             platform_name=platform_name_from_event(event),
+            sent_texts=sent_texts,
         )
-        if sent:
-            self._record_bot_text(profile, text)
+        if sent and sent_texts:
+            self._record_bot_text(profile, "\n".join(sent_texts))
             if result.action == "proactive":
                 self.sessions.mark_proactive(profile.umo)
 
@@ -404,6 +406,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         settings = self.settings
         if not settings.enabled:
             return
+        self.sessions.prune_idle()
         now = time.time()
         for runtime in self.sessions.all_sessions():
             profile = runtime.profile
@@ -470,7 +473,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             event.stop_event()
             release_official_pipeline(self.sessions.get(event.unified_msg_origin))
             return
+        if event.get_extra("_qd_hints_applied"):
+            return
         apply_session_hints(req, decision)
+        event.set_extra("_qd_hints_applied", True)
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):

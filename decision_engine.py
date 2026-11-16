@@ -223,6 +223,7 @@ def _parse_answers(
     scene: SceneType,
     settings: PluginSettings,
     memes: list[dict[str, str]],
+    target_message_ids: set[str] | None = None,
 ) -> DecisionResult:
     threshold = settings.choice_threshold
     raw: dict[str, Any] = {}
@@ -272,7 +273,11 @@ def _parse_answers(
             "probability": target_answer.probability,
             "probabilities": dict(target_answer.probabilities),
         }
-        if target_answer.choice and target_answer.choice != "latest":
+        if (
+            target_answer.choice
+            and target_answer.choice != "latest"
+            and (target_message_ids is None or target_answer.choice in target_message_ids)
+        ):
             target = target_answer.choice
     return DecisionResult(
         action=action,  # type: ignore[arg-type]
@@ -321,6 +326,11 @@ async def ask_decision(
             scene=scene,
             settings=settings,
             memes=memes,
+            target_message_ids={
+                item.message_id
+                for item in messages[-8:]
+                if item.role == "user" and item.message_id
+            },
         )
     except DecisionError as exc:
         logger.warning("判断提供商调用失败：%s", exc)

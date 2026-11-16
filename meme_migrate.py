@@ -32,6 +32,20 @@ SAFE_FILENAME = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 JOURNAL_NAME = "meme_manager_migration.json"
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """替换单个 JSON 文件，避免中断时留下半个文件。"""
+    temp = path.with_name(f".{path.name}.tmp")
+    try:
+        temp.write_text(text, encoding="utf-8")
+        temp.replace(path)
+    except Exception:
+        try:
+            temp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def journal_path(plugin_data_dir: Path) -> Path:
     return plugin_data_dir / JOURNAL_NAME
 
@@ -49,8 +63,9 @@ def load_journal(plugin_data_dir: Path) -> dict[str, Any] | None:
 
 def save_journal(plugin_data_dir: Path, data: dict[str, Any]) -> None:
     path = journal_path(plugin_data_dir)
-    path.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    _atomic_write_text(
+        path,
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n"
     )
 
 
@@ -239,7 +254,9 @@ def _append_registry(data_dir: Path, pack_id: str, pack_name: str, version: str)
         }
     )
     registry["schema_version"] = 1
-    path.write_text(json.dumps(registry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_text(
+        path, json.dumps(registry, ensure_ascii=False, indent=2) + "\n"
+    )
 
 
 def _remove_registry_entry(data_dir: Path, pack_id: str) -> None:
@@ -255,7 +272,9 @@ def _remove_registry_entry(data_dir: Path, pack_id: str) -> None:
         for item in packs
         if not (isinstance(item, dict) and item.get("id") == pack_id)
     ]
-    path.write_text(json.dumps(registry, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_text(
+        path, json.dumps(registry, ensure_ascii=False, indent=2) + "\n"
+    )
 
 
 def migrate_legacy_library(
@@ -438,8 +457,8 @@ def migrate_legacy_library(
         rec["caption"] = item["source_description"]
         rec["caption_status"] = "done"
         rec.setdefault("provenance", "quick_decision")
-        semantic_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        _atomic_write_text(
+            semantic_path, json.dumps(data, ensure_ascii=False, indent=2) + "\n"
         )
         item["caption_preserved"] = True
         item["status"] = "filled_existing_caption"

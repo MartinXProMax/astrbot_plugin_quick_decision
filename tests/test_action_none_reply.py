@@ -147,6 +147,19 @@ class ActionNoneReplyTests(unittest.TestCase):
         self.assertEqual(result.raw["action"]["choice"], "reply")
         self.assertEqual(result.raw["action"]["probability"], 0.75)
 
+    def test_unknown_target_message_id_is_ignored(self) -> None:
+        result = _parse_answers(
+            {
+                "action": _action("reply", 0.9, none=0.1),
+                "target_message_id": _action("not-in-window", 0.9),
+            },
+            scene="group_passive",
+            settings=_settings(0.7),
+            memes=[],
+            target_message_ids={"m1", "m2"},
+        )
+        self.assertIsNone(result.target_message_id)
+
     def test_reply_below_threshold_is_none_without_adding_join(self) -> None:
         # 与真实日志类似：reply 0.602、join 0.387，不得把两者相加后过阈值。
         result = _parse_answers(
