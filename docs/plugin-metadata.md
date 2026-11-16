@@ -20,8 +20,8 @@
 ## 本项目采用方式
 
 1. 补充 `repo: https://github.com/MartinXProMax/astrbot_plugin_quick_decision`。
-2. 在 `desc` 中说明私有仓库的 ZIP 安装方式、版本与平台要求、System One 判断提供商、可选表情包管理器及避免重复配图的设置，并链接 README。
-3. 保留精简 `short_desc`，添加少量市场标签；README 同步说明私有仓库不能使用 WebUI 的远程链接安装。
+2. 在 `desc` 中说明仓库链接和 ZIP 两种安装方式、版本与平台要求、System One 判断提供商、可选表情包管理器及避免重复配图的设置，并链接 README。
+3. 保留精简 `short_desc`，添加少量市场标签；README 同步提供安装、重载和配置步骤。仓库链接安装需要 GitHub 仓库可被 AstrBot 直接访问；公开前可通过有权限的机器下载 ZIP 后从文件安装。
 4. 本项目无需额外 Python 包，不为安装另一 AstrBot 插件新增 `requirements.txt`，也不添加未被支持的安装字段。
 
 ## 官方来源

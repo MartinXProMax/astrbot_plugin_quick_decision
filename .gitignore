@@ -14,6 +14,10 @@ venv/
 .env
 .env.*
 
+# local agent settings
+/.claude/
+/.codex/
+
 # logs, local db, OS
 *.log
 *.db
@@ -24,4 +28,7 @@ Thumbs.db
 
 # do not commit live runtime data if a data tree is copied by mistake
 plugin_data/
+/data/
+/logs/
+/*.zip
 *.bak

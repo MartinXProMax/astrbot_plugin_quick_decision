@@ -449,6 +449,7 @@ h2 label {
 /* ---------- 表单控件 ---------- */
 
 input[type="text"],
+input[type="number"],
 textarea,
 select {
   width: 100%;
@@ -462,12 +463,14 @@ select {
 }
 
 input[type="text"]:hover,
+input[type="number"]:hover,
 textarea:hover,
 select:hover {
   border-color: var(--line-strong);
 }
 
 input[type="text"]:focus,
+input[type="number"]:focus,
 textarea:focus,
 select:focus {
   background: var(--surface);
@@ -841,7 +844,9 @@ textarea.is-invalid {
 .lane-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 22px minmax(0, 1fr) 92px;
-  grid-template-areas: "judge arrow chat tools";
+  grid-template-areas:
+    "judge arrow chat tools"
+    "weight . . .";
   column-gap: 8px;
   align-items: start;
 }
@@ -962,6 +967,22 @@ textarea.opt-chat,
   display: flex;
   height: 38px;
   align-items: center;
+}
+
+.opt-weight {
+  grid-area: weight;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.opt-weight input {
+  width: 80px;
+  min-width: 0;
+  padding: 4px 8px;
 }
 
 .q-foot {
@@ -1299,6 +1320,7 @@ textarea.opt-chat,
     grid-template-columns: minmax(0, 1fr) auto;
     grid-template-areas:
       "judge tools"
+      "weight tools"
       "chat tools";
     row-gap: 4px;
   }

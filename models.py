@@ -107,12 +107,14 @@ class DecisionQuestionOption:
     id: str
     criteria: str
     session_hint: str = ""
+    weight: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "criteria": self.criteria,
             "session_hint": self.session_hint,
+            "weight": self.weight,
         }
 
 
@@ -127,6 +129,8 @@ class CustomDecisionQuestion:
     options: list[DecisionQuestionOption] = field(default_factory=list)
     true_session_hint: str = ""
     false_session_hint: str = ""
+    true_weight: float = 1.0
+    false_weight: float = 1.0
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -140,6 +144,8 @@ class CustomDecisionQuestion:
         else:
             data["true_session_hint"] = self.true_session_hint
             data["false_session_hint"] = self.false_session_hint
+            data["true_weight"] = self.true_weight
+            data["false_weight"] = self.false_weight
         return data
 
 

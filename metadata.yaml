@@ -2,12 +2,12 @@ name: astrbot_plugin_quick_decision
 display_name: 快速决策
 desc: |-
   使用 AstrBot 官方判断提供商统一决定是否发言、回复策略以及是否配表情包。
-  支持自定义判断上下文、判断问题、群聊插话，以及群聊 / 私聊冷场后主动开口。
+  支持自定义判断上下文、判断问题、判断选项温度和自定义选项权重，以及群聊插话和群聊 / 私聊冷场后主动开口。
   面向 QQ（aiocqhttp），表情包由「表情包管理器」管理，本插件按描述精确选图。
 
   **安装与配置**
 
-  1. 本仓库当前为私有仓库，不能在 WebUI 通过仓库链接远程安装；请在有权限的机器下载 ZIP，在插件页「从文件安装」上传。仓库公开后才可使用此地址安装：
+  1. 在 AstrBot WebUI 插件页选择「从链接安装」，填入仓库地址；也可下载仓库 ZIP 后通过「从文件安装」上传：
      https://github.com/MartinXProMax/astrbot_plugin_quick_decision
   2. 使用 AstrBot >=4.29.4 且 <5，在「模型提供商 → 判断」配置 System One 判断提供商；本插件不使用聊天模型替代判断提供商。
   3. 如需配表情包，请另行安装并启用[表情包管理器](https://github.com/anka-afk/astrbot_plugin_meme_manager)，并在其页面管理图库与逐图描述。未安装时仅发文字。
@@ -15,8 +15,8 @@ desc: |-
   5. 在本插件配置中调整群聊 / 私聊策略；可先开启「试运行模式」查看决策日志。
 
   本插件无额外 Python 依赖。详细说明见[README](https://github.com/MartinXProMax/astrbot_plugin_quick_decision#readme)。
-short_desc: 用判断模型决定是否发言和回复策略，支持自定义判断问题，并从表情包管理器按描述配图。
-version: 1.3.0
+short_desc: 用判断模型决定是否发言和回复策略，支持自定义问题、温度和选项权重，并从表情包管理器按描述配图。
+version: 1.3.1
 author: 狼与葡萄酒
 repo: https://github.com/MartinXProMax/astrbot_plugin_quick_decision
 astrbot_version: ">=4.29.4,<5"

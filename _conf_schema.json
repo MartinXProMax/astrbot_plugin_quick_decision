@@ -27,11 +27,22 @@
   "choice_threshold": {
     "description": "判断选项生效阈值",
     "type": "float",
-    "hint": "选择类结果的选中项概率需达到该阈值才生效，否则按不发言或不配图处理。文档示例常用 0.7，默认 0.5。",
+    "hint": "内置发言、配图结果的原始概率需达到该阈值才生效，否则按不发言或不配图处理。温度采样不会绕过阈值；自定义问题不使用该阈值。",
     "default": 0.5,
     "slider": {
       "min": 0,
       "max": 1,
+      "step": 0.05
+    }
+  },
+  "choice_temperature": {
+    "description": "判断选项温度",
+    "type": "float",
+    "hint": "0 时保持确定性，自定义权重生效时取加权后最高项；大于 0 按温度随机选择。1 按加权概率采样，小于 1 更集中，大于 1 更随机。适用于选择题和自定义是否题；不改变判断模型请求。",
+    "default": 0,
+    "slider": {
+      "min": 0,
+      "max": 2,
       "step": 0.05
     }
   },
@@ -158,7 +169,7 @@
   "decision_questions": {
     "description": "自定义判断问题（JSON）",
     "type": "text",
-    "hint": "配置判断模型在「是否发言、回哪一条、配哪张表情」之外要回答的问题，例如回复长短或语气。格式为 JSON 数组。建议在插件网页的「判断配置」里用表单编辑。JSON 无效时会记录警告并回退到默认长短问题。",
+    "hint": "配置回复长短或语气等自定义问题，格式为 JSON 数组。选择题选项可设 weight，是否题可设 true_weight / false_weight；权重 0–100，默认 1，0 禁用，调高更偏向该项。建议在插件网页的「判断配置」里用表单编辑。JSON 无效时会记录警告并回退到默认长短问题。",
     "default": "[\n  {\n    \"id\": \"length\",\n    \"enabled\": true,\n    \"type\": \"choice\",\n    \"instructions\": \"如果发言，回复应该简短还是稍详细？\",\n    \"options\": [\n      {\n        \"id\": \"short\",\n        \"criteria\": \"简短回复，一两句即可\",\n        \"session_hint\": \"本轮回复策略：请给出简短、自然的回复，一两句即可。\"\n      },\n      {\n        \"id\": \"long\",\n        \"criteria\": \"更完整、稍详细的回复\",\n        \"session_hint\": \"本轮回复策略：请给出稍详细、完整的回复，但仍保持自然。\"\n      }\n    ]\n  }\n]",
     "editor_mode": true,
     "editor_language": "json",

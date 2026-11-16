@@ -12,6 +12,7 @@ import unittest
 from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Mapping
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -157,6 +158,7 @@ class DecisionConfigTests(unittest.TestCase):
             )
         )
         self.assertIn("decision_custom_context", schema)
+        self.assertEqual(schema["choice_temperature"]["default"], 0)
         self.assertEqual(schema["decision_custom_context"]["type"], "text")
         self.assertEqual(schema["decision_custom_context"]["default"], "")
         self.assertEqual(schema["decision_questions"]["type"], "text")
@@ -258,6 +260,195 @@ class DecisionConfigTests(unittest.TestCase):
         self.assertEqual(settings.decision_custom_context, "机器人叫小狼")
         empty = PluginSettings({"decision_custom_context": "   "})
         self.assertEqual(empty.decision_custom_context, "")
+
+    def test_choice_temperature_defaults_and_is_clamped(self) -> None:
+        self.assertEqual(PluginSettings({}).choice_temperature, 0.0)
+        self.assertEqual(
+            PluginSettings({"choice_temperature": 3}).choice_temperature,
+            2.0,
+        )
+        self.assertEqual(
+            PluginSettings({"choice_temperature": -1}).choice_temperature,
+            0.0,
+        )
+        for value in (float("nan"), float("inf"), "invalid", 10**400):
+            self.assertEqual(PluginSettings({"choice_temperature": value}).choice_temperature, 0.0)
+
+    def test_choice_temperature_can_select_a_lower_probability_option(self) -> None:
+        settings = PluginSettings(
+            {
+                "choice_temperature": 1.0,
+                "decision_questions": dump_decision_questions(
+                    [
+                        CustomDecisionQuestion(
+                            id="length",
+                            type="choice",
+                            instructions="回复长短？",
+                            options=[
+                                DecisionQuestionOption(id="short", criteria="短"),
+                                DecisionQuestionOption(id="long", criteria="长"),
+                            ],
+                        )
+                    ]
+                ),
+            }
+        )
+        with patch(
+            "astrbot_plugin_quick_decision.decision_engine.random.choices",
+            return_value=["long"],
+        ) as choices:
+            result = _parse_answers(
+                {"length": _choice("short", 0.8)},
+                scene="private_passive",
+                settings=settings,
+                memes=[],
+            )
+        self.assertEqual(result.length, "long")
+        self.assertEqual(result.raw["length"]["choice"], "short")
+        self.assertEqual(result.raw["length"]["selected_choice"], "long")
+        self.assertEqual(result.raw["length"]["selected_probability"], 0.3)
+        choices.assert_called_once()
+
+    def test_option_weights_roundtrip_and_invalid_weights_are_rejected(self) -> None:
+        questions = default_decision_questions() + [
+            CustomDecisionQuestion(
+                id="followup", type="boolean", instructions="要追问吗？",
+                true_weight=3.0, false_weight=0.5,
+            )
+        ]
+        questions[0].options[1].weight = 3.0
+        payload = json.loads(dump_decision_questions(questions))
+        loaded, error = parse_decision_questions(payload, strict=True)
+        self.assertIsNone(error)
+        self.assertEqual([item.to_dict() for item in loaded], payload)
+        for value in (-1, 101, None, True, "invalid", float("nan"), float("inf")):
+            for field in ("weight", "true_weight", "false_weight"):
+                with self.subTest(value=value, field=field):
+                    invalid = json.loads(dump_decision_questions(questions))
+                    if field == "weight":
+                        invalid[0]["options"][0][field] = value
+                    else:
+                        invalid[1][field] = value
+                    _, error = parse_decision_questions(invalid, strict=True)
+                    self.assertIn("权重", error or "")
+        for question in payload:
+            if question["type"] == "choice":
+                for option in question["options"]:
+                    option["weight"] = 0
+            else:
+                question["true_weight"] = question["false_weight"] = 0
+            _, error = parse_decision_questions([question], strict=True)
+            self.assertIn("至少需要一个", error or "")
+
+    def test_weighted_choice_selects_lower_model_probability_and_its_hint(self) -> None:
+        questions = default_decision_questions()
+        questions[0].options[1].weight = 3.0
+        result = _parse_answers(
+            {"length": _choice("short", 0.7)},
+            scene="private_passive",
+            settings=PluginSettings({"decision_questions": dump_decision_questions(questions)}),
+            memes=[],
+        )
+        self.assertEqual(result.length, "long")
+        self.assertEqual(result.session_hints, [DEFAULT_LONG_SESSION_HINT])
+        self.assertEqual(result.raw["length"]["choice"], "short")
+        self.assertEqual(result.raw["length"]["option_weights"]["long"], 3.0)
+
+    def test_temperature_adjusts_the_weighted_distribution(self) -> None:
+        questions = default_decision_questions()
+        questions[0].options[1].weight = 2.0
+        answer = DecisionChoiceAnswer(
+            choice="short", probability=0.8,
+            probabilities={"short": 0.8, "long": 0.2, "unknown": 1.0}, confidence=0.8,
+        )
+        for temperature, expected_long in ((0.5, 0.2), (1.0, 1 / 3), (2.0, 1 / (1 + 2**0.5))):
+            with self.subTest(temperature=temperature), patch(
+                "astrbot_plugin_quick_decision.decision_engine.random.choices", return_value=["long"]
+            ) as sample:
+                result = _parse_answers(
+                    {"length": answer}, scene="private_passive", memes=[],
+                    settings=PluginSettings({
+                        "choice_temperature": temperature,
+                        "decision_questions": dump_decision_questions(questions),
+                    }),
+                )
+                distribution = result.raw["length"]["selection_probabilities"]
+                self.assertAlmostEqual(distribution["long"], expected_long)
+                self.assertAlmostEqual(sum(distribution.values()), 1.0)
+                self.assertEqual(set(sample.call_args.args[0]), {"short", "long"})
+                passed = dict(zip(sample.call_args.args[0], sample.call_args.kwargs["weights"]))
+                self.assertAlmostEqual(passed["long"] / sum(passed.values()), expected_long)
+                self.assertEqual(result.session_hints, [DEFAULT_LONG_SESSION_HINT])
+
+    def test_zero_weight_excludes_an_option_with_or_without_sampling(self) -> None:
+        questions = default_decision_questions()
+        questions[0].options[0].weight = 0.0
+        for temperature in (0.0, 1.0):
+            result = _parse_answers(
+                {"length": _choice("short", 0.9)},
+                scene="private_passive", memes=[],
+                settings=PluginSettings({
+                    "choice_temperature": temperature,
+                    "decision_questions": dump_decision_questions(questions),
+                }),
+            )
+            self.assertEqual(result.length, "long")
+            self.assertNotIn("short", result.raw["length"]["selection_probabilities"])
+
+    def test_weighted_boolean_uses_selected_hint(self) -> None:
+        question = CustomDecisionQuestion(
+            id="followup", type="boolean", instructions="要追问吗？",
+            true_session_hint="可以追问", false_session_hint="不用追问",
+            true_weight=3.0,
+        )
+        for temperature in (0.0, 1.0):
+            with patch(
+                "astrbot_plugin_quick_decision.decision_engine.random.choices", return_value=["true"]
+            ):
+                result = _parse_answers(
+                    {"followup": DecisionBooleanAnswer(probability=0.4)},
+                    scene="private_passive", memes=[],
+                    settings=PluginSettings({
+                        "choice_temperature": temperature,
+                        "decision_questions": dump_decision_questions([question]),
+                    }),
+                )
+            self.assertTrue(result.custom_answers["followup"])
+            self.assertEqual(result.session_hints, ["可以追问"])
+            self.assertEqual(result.raw["followup"]["probability"], 0.4)
+            if temperature == 1.0:
+                self.assertAlmostEqual(result.raw["followup"]["selection_probabilities"]["true"], 2 / 3)
+
+    def test_sampling_handles_very_low_temperature_and_invalid_probabilities(self) -> None:
+        for probabilities, expected in (
+            ({"short": 0.8, "long": 0.2}, "short"),
+            ({"short": float("nan"), "long": float("inf")}, None),
+            ({"short": 0.0, "long": -1.0}, None),
+        ):
+            result = _parse_answers(
+                {"length": DecisionChoiceAnswer(
+                    choice="long", probability=0.2, probabilities=probabilities, confidence=0.8,
+                )},
+                scene="private_passive", memes=[],
+                settings=PluginSettings({"choice_temperature": 1e-300}),
+            )
+            self.assertEqual(result.length, expected)
+            self.assertEqual(bool(result.session_hints), expected is not None)
+
+    def test_sampling_does_not_bypass_builtin_confidence_threshold(self) -> None:
+        with patch(
+            "astrbot_plugin_quick_decision.decision_engine.random.choices", return_value=["reply"]
+        ):
+            result = _parse_answers(
+                {"action": DecisionChoiceAnswer(
+                    choice="none", probability=0.6,
+                    probabilities={"none": 0.6, "reply": 0.4}, confidence=0.6,
+                )},
+                scene="group_passive", memes=[],
+                settings=PluginSettings({"choice_temperature": 1, "decision_questions": "[]"}),
+            )
+        self.assertEqual(result.action, "none")
+        self.assertFalse(result.should_speak())
 
     def test_build_state_custom_context_only_when_nonempty(self) -> None:
         messages = [

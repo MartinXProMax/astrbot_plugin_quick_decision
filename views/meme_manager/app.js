@@ -11,11 +11,13 @@ const DEFAULT_QUESTIONS = [
         id: "short",
         criteria: "简短回复，一两句即可",
         session_hint: "本轮回复策略：请给出简短、自然的回复，一两句即可。",
+        weight: 1,
       },
       {
         id: "long",
         criteria: "更完整、稍详细的回复",
         session_hint: "本轮回复策略：请给出稍详细、完整的回复，但仍保持自然。",
+        weight: 1,
       },
     ],
   },
@@ -164,6 +166,8 @@ function normalizeQuestion(raw) {
     options: [],
     true_session_hint: String(raw?.true_session_hint || ""),
     false_session_hint: String(raw?.false_session_hint || ""),
+    true_weight: raw?.true_weight ?? 1,
+    false_weight: raw?.false_weight ?? 1,
   };
   if (type === "choice") {
     const options = Array.isArray(raw?.options) ? raw.options : [];
@@ -171,6 +175,7 @@ function normalizeQuestion(raw) {
       id: String(option?.id || "").trim(),
       criteria: String(option?.criteria || ""),
       session_hint: String(option?.session_hint || ""),
+      weight: option?.weight ?? 1,
     }));
     ensureTwoOptions(question);
   }
@@ -183,7 +188,7 @@ function ensureTwoOptions(question) {
   while (question.options.length < 2) {
     const id = nextId("option_", used);
     used.add(id);
-    question.options.push({ id, criteria: "", session_hint: "" });
+    question.options.push({ id, criteria: "", session_hint: "", weight: 1 });
   }
 }
 
@@ -197,6 +202,8 @@ function collectQuestionsFromForm() {
         instructions: question.instructions,
         true_session_hint: question.true_session_hint,
         false_session_hint: question.false_session_hint,
+        true_weight: question.true_weight,
+        false_weight: question.false_weight,
       };
     }
     return {
@@ -208,6 +215,7 @@ function collectQuestionsFromForm() {
         id: String(option.id || "").trim(),
         criteria: option.criteria,
         session_hint: option.session_hint,
+        weight: option.weight,
       })),
     };
   });
@@ -426,8 +434,26 @@ function arrow() {
   return h("span", { class: "opt-arrow", "aria-hidden": "true" }, icon("arrow"));
 }
 
+function optionWeight(value, label, field, onInput) {
+  return h(
+    "label",
+    { class: "opt-weight" },
+    "权重",
+    h("input", {
+      type: "number",
+      min: 0,
+      max: 100,
+      step: "any",
+      value: value ?? 1,
+      "aria-label": label,
+      dataset: { field },
+      oninput: (event) => onInput(event.target.valueAsNumber),
+    }),
+  );
+}
+
 function renderBooleanLanes(question) {
-  const row = (fixed, text, key) =>
+  const row = (fixed, text, key, weightKey) =>
     h(
       "div",
       { class: "lane-row opt" },
@@ -442,13 +468,16 @@ function renderBooleanLanes(question) {
         question[key] = value;
       }),
       h("div", { class: "opt-tools" }),
+      optionWeight(question[weightKey], `「${fixed}」的选择权重`, weightKey, (value) => {
+        question[weightKey] = value;
+      }),
     );
   return h(
     "div",
     { class: "lanes" },
     laneHead("判断模型的回答"),
-    row("是", "判断为「是」时", "true_session_hint"),
-    row("否", "判断为「否」时", "false_session_hint"),
+    row("是", "判断为「是」时", "true_session_hint", "true_weight"),
+    row("否", "判断为「否」时", "false_session_hint", "false_weight"),
   );
 }
 
@@ -514,6 +543,9 @@ function renderChoiceLanes(question, qIndex) {
             { disabled: options.length <= 2, danger: true },
           ),
         ),
+        optionWeight(option.weight, `选项 ${n} 的选择权重`, "opt-weight", (value) => {
+          option.weight = value;
+        }),
       ),
     );
   });
@@ -525,7 +557,7 @@ function renderChoiceLanes(question, qIndex) {
       class: "btn btn-add-opt",
       onclick: () => {
         const used = new Set(question.options.map((item) => item.id));
-        question.options.push({ id: nextId("option_", used), criteria: "", session_hint: "" });
+        question.options.push({ id: nextId("option_", used), criteria: "", session_hint: "", weight: 1 });
         const last = question.options.length - 1;
         renderQuestions(`[data-q="${qIndex}"] [data-o="${last}"] [data-field="opt-criteria"]`);
         updateDirty();
@@ -562,7 +594,17 @@ function validate(questions) {
     if (!question.instructions.trim()) {
       return { q, field: "instructions", message: `问题「${label}」还没有填写判断标准` };
     }
-    if (question.type !== "choice") continue;
+    if (question.type === "boolean") {
+      for (const field of ["true_weight", "false_weight"]) {
+        if (!Number.isFinite(question[field]) || question[field] < 0 || question[field] > 100) {
+          return { q, field, message: `问题「${label}」的权重必须是 0 到 100 之间的有限数字` };
+        }
+      }
+      if (question.true_weight === 0 && question.false_weight === 0) {
+        return { q, field: "true_weight", message: `问题「${label}」至少需要一个权重大于 0 的选项` };
+      }
+      continue;
+    }
     const optionIds = new Set();
     for (const [o, option] of question.options.entries()) {
       if (!option.id) {
@@ -580,6 +622,12 @@ function validate(questions) {
           message: `问题「${label}」的选项「${option.id}」还没有填写判断标准`,
         };
       }
+      if (!Number.isFinite(option.weight) || option.weight < 0 || option.weight > 100) {
+        return { q, o, field: "opt-weight", message: `问题「${label}」的选项「${option.id}」权重必须是 0 到 100 之间的有限数字` };
+      }
+    }
+    if (!question.options.some((option) => option.weight > 0)) {
+      return { q, o: 0, field: "opt-weight", message: `问题「${label}」至少需要一个权重大于 0 的选项` };
     }
   }
   return null;

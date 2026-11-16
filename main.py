@@ -559,6 +559,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 else (status.message or "不可用，仅发文字")
             ),
             f"判断阈值：{settings.choice_threshold}",
+            f"判断选项温度：{settings.choice_temperature}",
         ]
         runtime = self.sessions.get(event.unified_msg_origin)
         result = runtime.last_decision if runtime else None

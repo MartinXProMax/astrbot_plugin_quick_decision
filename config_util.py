@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
 from .models import (
@@ -82,9 +83,21 @@ def _as_float(
 ) -> float:
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        result = default
+    if not math.isfinite(result):
         result = default
     return min(maximum, max(minimum, result))
+
+
+def _parse_option_weight(value: Any) -> float:
+    try:
+        weight = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("权重必须是 0 到 100 之间的有限数字") from None
+    if isinstance(value, bool) or not math.isfinite(weight) or not 0.0 <= weight <= 100.0:
+        raise ValueError("权重必须是 0 到 100 之间的有限数字")
+    return weight
 
 
 def _clean_id(value: Any) -> str:
@@ -118,16 +131,23 @@ def _parse_choice_options(
             if strict:
                 return [], message
             continue
+        try:
+            weight = _parse_option_weight(item.get("weight", 1.0))
+        except ValueError as exc:
+            return [], f"问题 {question_id} 的选项 {option_id}：{exc}"
         seen.add(option_id)
         options.append(
             DecisionQuestionOption(
                 id=option_id,
                 criteria=criteria,
                 session_hint=str(item.get("session_hint") or "").strip(),
+                weight=weight,
             )
         )
     if len(options) < 2:
         return [], f"问题 {question_id} 至少需要两个有效选项"
+    if not any(option.weight > 0.0 for option in options):
+        return [], f"问题 {question_id} 至少需要一个权重大于 0 的选项"
     return options, None
 
 
@@ -167,6 +187,13 @@ def _parse_one_question(
             ),
             None,
         )
+    try:
+        true_weight = _parse_option_weight(item.get("true_weight", 1.0))
+        false_weight = _parse_option_weight(item.get("false_weight", 1.0))
+    except ValueError as exc:
+        return None, f"问题 {question_id}：{exc}"
+    if true_weight == false_weight == 0.0:
+        return None, f"问题 {question_id} 至少需要一个权重大于 0 的选项"
     return (
         CustomDecisionQuestion(
             id=question_id,
@@ -175,6 +202,8 @@ def _parse_one_question(
             enabled=enabled,
             true_session_hint=str(item.get("true_session_hint") or "").strip(),
             false_session_hint=str(item.get("false_session_hint") or "").strip(),
+            true_weight=true_weight,
+            false_weight=false_weight,
         ),
         None,
     )
@@ -256,6 +285,9 @@ class PluginSettings:
         self.decision_provider_id = str(data.get("decision_provider_id") or "").strip()
         self.vision_provider_id = str(data.get("vision_provider_id") or "").strip()
         self.choice_threshold = _as_float(data.get("choice_threshold"), 0.5)
+        self.choice_temperature = _as_float(
+            data.get("choice_temperature"), 0.0, maximum=2.0
+        )
         self.context_message_limit = _as_int(
             data.get("context_message_limit"), 20, minimum=1
         )

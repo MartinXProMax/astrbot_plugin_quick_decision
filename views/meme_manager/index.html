@@ -75,6 +75,9 @@
               判断模型每次都会回答下面这些问题。选中结果的「会话模型收到」会按问题顺序拼进本轮临时的
               <code>&lt;quick_decision&gt;</code> 提示，不写入聊天记录；留空就不告诉会话模型。
             </p>
+            <p class="hint">
+              选项权重默认 1，调高会更偏向该项，设为 0 则不选它。判断选项温度可在插件设置中调整：0 选加权后最优项，大于 0 时随机选择。
+            </p>
 
             <div id="config-warning" class="banner banner-danger" role="alert" hidden></div>
 
