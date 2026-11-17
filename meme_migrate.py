@@ -7,12 +7,13 @@
 from __future__ import annotations
 
 import json
-import logging
 import re
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from astrbot.api import logger
 
 from .legacy_meme_index import LegacyMemeIndex
 from .meme_adapter import (
@@ -21,8 +22,6 @@ from .meme_adapter import (
     semantic_entry_id,
 )
 from .plugin_paths import MEME_MANAGER_DATA_NAME
-
-logger = logging.getLogger("astrbot.plugin.quick_decision")
 
 DEFAULT_PACK_ID = "quick-decision-legacy"
 DEFAULT_PACK_NAME = "快速决策迁移图包"

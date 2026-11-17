@@ -19,11 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 from typing import Any
 
-logger = logging.getLogger("astrbot.plugin.quick_decision")
+from astrbot.api import logger
 
 # 与官方 ResultDecorateStage.process / RespondStage.is_seg_reply_required 保持一致。
 _OFFICIAL_NO_SEGMENT_PLATFORMS = (

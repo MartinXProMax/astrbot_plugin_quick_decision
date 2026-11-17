@@ -18,15 +18,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .plugin_paths import MEME_MANAGER_DATA_NAME, load_plugin_data_dir
+from astrbot.api import logger
 
-logger = logging.getLogger("astrbot.plugin.quick_decision")
+from .plugin_paths import MEME_MANAGER_DATA_NAME, load_plugin_data_dir
 
 MEME_MANAGER_STAR_NAME = "meme_manager"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
