@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+from dataclasses import asdict
+from uuid import uuid4
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -14,6 +16,7 @@ from astrbot.api.star import Context, Star
 
 from .config_util import PluginSettings
 from .decision_engine import ask_decision
+from .decision_tools import skip_tools
 from .event_utils import (
     event_has_command_handler,
     event_profile,
@@ -22,9 +25,8 @@ from .event_utils import (
     is_self_message,
     to_buffered_message,
 )
-from .meme_adapter import MemeManagerAdapter, UNAVAILABLE_HINT
+from .meme_adapter import UNAVAILABLE_HINT, MemeManagerAdapter
 from .meme_migrate import maybe_migrate_legacy_library
-from .plugin_paths import load_plugin_data_dir
 from .models import BufferedMessage, DecisionResult, SceneType, SessionProfile
 from .official_handoff import (
     begin_official_pipeline,
@@ -37,11 +39,12 @@ from .official_handoff import (
     should_use_default_official_agent,
     suppress_default_official_agent,
 )
+from .plugin_paths import load_plugin_data_dir
 from .reply_generator import (
     after_official_text_sent,
     apply_session_hints,
     generate_text,
-    install_direct_send_send_guard,
+    install_group_quote_guard,
     prepare_official_result_chain,
     send_decision_message,
 )
@@ -165,7 +168,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 is_private=profile.is_private,
                 messages=messages,
                 at_or_quoted=at_or_quoted,
-                memes=self.meme_adapter.described_catalog(),
+                memes=self._meme_candidates(settings),
             )
             if not runtime.pending:
                 break
@@ -195,6 +198,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             and not at_or_quoted
             and self.sessions.in_cooldown(profile.umo, settings.cooldown_seconds)
         ):
+            skip_tools(result, "会话冷却中")
             await self._log_decision(profile, result)
             logger.info("会话处于冷却中，跳过群聊插话：%s", profile.umo)
             event.stop_event()
@@ -216,44 +220,45 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             )
             return
 
+        request = None
+        if not use_default_official:
+            # 群聊未 @ 插话，或 debounce 合并了多条用户消息：yield 公开 request_llm。
+            # 主生成事件不 stop_event，以免跳过装饰/发送/after-send；用 should_call_llm(True)
+            # 阻止默认第二条 Agent。兄弟事件仍在 on_chat_message 里 stop_event。
+            suppress_default_official_agent(event)
+            conversation = await resolve_session_conversation(self.context, event)
+            if conversation is None:
+                logger.error("无法取得官方会话，取消本轮官方生成：%s", profile.umo)
+                skip_tools(result, "无法取得官方会话")
+                await self._log_decision(profile, result)
+                return None
+            prompt = build_inbound_user_prompt(
+                event_text=event.message_str or "",
+                messages=runtime.messages,
+                first_message_id=first_message_id,
+                first_timestamp=first_timestamp,
+                merged=merged,
+            )
+            image_urls, audio_urls = collect_event_media_urls(event)
+            if not prompt and not image_urls and not audio_urls:
+                logger.warning("没有可提交给官方模型的用户内容，取消本轮生成：%s", profile.umo)
+                skip_tools(result, "没有可生成回复的正文或附件")
+                await self._log_decision(profile, result)
+                return None
+            request = make_official_llm_request(
+                event,
+                conversation=conversation,
+                prompt=prompt,
+                image_urls=image_urls,
+                audio_urls=audio_urls,
+            )
+
+        # 仅已接纳的回复才能在后续发送钩子中使用工具。
         result.official_llm = True
-        # 必须在赋值后再写日志，避免误记 official_llm=false。
         await self._log_decision(profile, result)
         event.set_extra("quick_decision", result)
         begin_official_pipeline(runtime, result)
-
-        if use_default_official:
-            # 私聊 / 普通 @ 且未合并：放行官方默认 Agent，由官方收集附件与历史。
-            return None
-
-        # 群聊未 @ 插话，或 debounce 合并了多条用户消息：yield 公开 request_llm。
-        # 主生成事件不 stop_event，以免跳过装饰/发送/after-send；用 should_call_llm(True)
-        # 阻止默认第二条 Agent。兄弟事件仍在 on_chat_message 里 stop_event。
-        suppress_default_official_agent(event)
-        conversation = await resolve_session_conversation(self.context, event)
-        if conversation is None:
-            logger.error("无法取得官方会话，取消本轮官方生成：%s", profile.umo)
-            release_official_pipeline(runtime)
-            return None
-        prompt = build_inbound_user_prompt(
-            event_text=event.message_str or "",
-            messages=runtime.messages,
-            first_message_id=first_message_id,
-            first_timestamp=first_timestamp,
-            merged=merged,
-        )
-        image_urls, audio_urls = collect_event_media_urls(event)
-        if not prompt and not image_urls and not audio_urls:
-            logger.warning("没有可提交给官方模型的用户内容，取消本轮生成：%s", profile.umo)
-            release_official_pipeline(runtime)
-            return None
-        return make_official_llm_request(
-            event,
-            conversation=conversation,
-            prompt=prompt,
-            image_urls=image_urls,
-            audio_urls=audio_urls,
-        )
+        return request
 
     def _resolve_passive_scene(
         self, event: AstrMessageEvent, profile: SessionProfile
@@ -326,7 +331,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 decision=result,
                 user_prompt=prompt,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.exception("自行调用聊天模型生成回复失败")
             return
         if not text:
@@ -351,6 +356,11 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             if result.action == "proactive":
                 self.sessions.mark_proactive(profile.umo)
 
+    def _meme_candidates(self, settings):
+        if any(q.enabled and q.role == "meme" for q in settings.decision_questions):
+            return self.meme_adapter.described_catalog()
+        return []
+
     def _record_bot_text(self, profile: SessionProfile, text: str) -> None:
         self.sessions.append_message(
             profile,
@@ -369,8 +379,15 @@ class QuickDecisionPlugin(Star, WebApiMixin):
     async def _log_decision(
         self, profile: SessionProfile, result: DecisionResult
     ) -> None:
+        if not result.should_speak():
+            skip_tools(result, "本轮不发言")
+        if not result.round_id:
+            result.round_id = uuid4().hex
         await self.sessions.append_log(
             {
+                "round_id": result.round_id,
+                "tool_calls": [asdict(c) for c in result.tool_calls.values()],
+                "answers": result.answers,
                 "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "umo": profile.umo,
                 "scene": result.scene,
@@ -399,7 +416,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 await self._check_silence()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001
                 logger.exception("检查冷场主动发言时出错")
 
     async def _check_silence(self) -> None:
@@ -450,7 +467,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             is_private=profile.is_private,
             messages=messages,
             at_or_quoted=False,
-            memes=self.meme_adapter.described_catalog(),
+            memes=self._meme_candidates(settings),
         )
         result.dry_run = settings.dry_run
         runtime.last_decision = result
@@ -460,7 +477,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if settings.dry_run:
             logger.info("试运行：冷场判断为可以主动开口，但不会发送：%s", profile.umo)
             return
-        await self._self_generate_and_send(profile, result, None)
+        try:
+            await self._self_generate_and_send(profile, result, None)
+        finally:
+            await self._finish_tool_log(result)
 
     # --- 官方流水线钩子 ---
 
@@ -471,7 +491,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             return
         if self.settings.dry_run:
             event.stop_event()
-            release_official_pipeline(self.sessions.get(event.unified_msg_origin))
+            await self._cancel_official_round(event, decision, "已切换到试运行")
             return
         if event.get_extra("_qd_hints_applied"):
             return
@@ -487,21 +507,20 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if result is None:
             return
         is_private = event.is_private_chat()
-        if (
-            self.settings.group_direct_send
-            and not is_private
-        ):
-            install_direct_send_send_guard(event)
+        settings = self.settings
         if not prepare_official_result_chain(
             result.chain,
-            dry_run=self.settings.dry_run,
+            dry_run=settings.dry_run,
             should_speak=decision.should_speak(),
-            group_direct_send=self.settings.group_direct_send,
+            group_direct_send=settings.group_direct_send,
             is_private=is_private,
         ):
             event.stop_event()
-            release_official_pipeline(self.sessions.get(event.unified_msg_origin))
+            await self._cancel_official_round(event, decision, "已取消正文发送")
             return
+        if not is_private and (settings.group_direct_send or decision.target_message_id):
+            target = None if settings.group_direct_send else decision.target_message_id
+            install_group_quote_guard(event, target)
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent):
@@ -523,12 +542,28 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             else:
                 self.sessions.mark_bot_sent(runtime.profile.umo)
             release_official_pipeline(runtime)
-        await after_official_text_sent(
-            event,
-            context=self.context,
-            resolver=self.meme_adapter,
-            dry_run=self.settings.dry_run,
-        )
+        try:
+            await after_official_text_sent(
+                event,
+                context=self.context,
+                resolver=self.meme_adapter,
+                dry_run=self.settings.dry_run,
+            )
+        finally:
+            if isinstance(decision, DecisionResult):
+                await self._finish_tool_log(decision)
+
+    async def _cancel_official_round(self, event, decision, reason):
+        event.set_extra("quick_decision", None)
+        release_official_pipeline(self.sessions.get(event.unified_msg_origin))
+        await self._finish_tool_log(decision, reason)
+
+    async def _finish_tool_log(self, result, reason="正文未确认发送"):
+        skip_tools(result, reason)
+        if result.round_id and result.tool_calls:
+            await self.sessions.update_tool_log(
+                result.round_id, [asdict(c) for c in result.tool_calls.values()]
+            )
 
     def _pipeline_decision(self, event: AstrMessageEvent) -> DecisionResult | None:
         extra = event.get_extra("quick_decision")
@@ -569,11 +604,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             lines.append(
                 f"- 场景 {result.scene} / 动作 {result.action} / 长度 {length_text}"
             )
-            if result.custom_answers:
-                rendered = ", ".join(
-                    f"{key}={value}" for key, value in result.custom_answers.items()
-                )
-                lines.append(f"- 自定义判断：{rendered}")
+            answers = result.answers or result.custom_answers
+            if answers:
+                rendered = ", ".join(f"{key}={value}" for key, value in answers.items())
+                lines.append(f"- 问题答案：{rendered}")
             if result.session_hints:
                 lines.append("- 会话提示：" + " / ".join(result.session_hints))
             lines.append(

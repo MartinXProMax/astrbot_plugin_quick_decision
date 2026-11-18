@@ -1,8 +1,8 @@
 name: astrbot_plugin_quick_decision
 display_name: 快速决策
-desc: 用判断模型决定发言时机、回复策略和表情包，支持群聊插话、冷场主动回复、自定义问题、温度与选项权重。
-short_desc: 智能判断发言时机与回复策略，支持主动回复、自定义问题和表情包。
-version: 1.3.2
+desc: 用判断模型决定发言时机、回复策略和表情包，支持群聊插话、冷场主动回复、可编辑问题、温度与选项权重与答案工具。
+short_desc: 智能判断发言时机与回复策略，支持主动回复、可编辑问题和表情包。
+version: 1.4.0
 author: 狼与葡萄酒
 repo: https://github.com/MartinXProMax/astrbot_plugin_quick_decision
 astrbot_version: ">=4.29.4,<5"

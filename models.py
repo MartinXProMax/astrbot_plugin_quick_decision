@@ -95,33 +95,28 @@ class BufferedMessage:
         return item
 
 
-RESERVED_QUESTION_IDS = frozenset(
-    {"action", "target_message_id", "use_meme", "meme_id"}
-)
+QUESTION_ROLES = {
+    "answer": "记录答案",
+    "action": "控制发言",
+    "target": "选择回复目标",
+    "meme": "选择表情",
+}
 
 
 @dataclass
 class DecisionQuestionOption:
-    """自定义选择题的一个选项。"""
-
     id: str
     criteria: str
     session_hint: str = ""
     weight: float = 1.0
+    tool: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "criteria": self.criteria,
-            "session_hint": self.session_hint,
-            "weight": self.weight,
-        }
+        return asdict(self)
 
 
 @dataclass
-class CustomDecisionQuestion:
-    """用户可编辑的判断问题（不包括内置的发言、对象和表情选择）。"""
-
+class DecisionQuestion:
     id: str
     type: Literal["choice", "boolean"]
     instructions: str
@@ -131,22 +126,42 @@ class CustomDecisionQuestion:
     false_session_hint: str = ""
     true_weight: float = 1.0
     false_weight: float = 1.0
+    true_tool: str = ""
+    false_tool: str = ""
+    role: str = "answer"
+    use_threshold: bool = False
+    proactive_instructions: str = ""
+    proactive_none_criteria: str = ""
+    ask_private: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        data: dict[str, Any] = {
-            "id": self.id,
-            "enabled": self.enabled,
-            "type": self.type,
-            "instructions": self.instructions,
+        data = {
+            k: getattr(self, k)
+            for k in ("id", "enabled", "type", "instructions", "role", "use_threshold")
         }
         if self.type == "choice":
             data["options"] = [item.to_dict() for item in self.options]
         else:
-            data["true_session_hint"] = self.true_session_hint
-            data["false_session_hint"] = self.false_session_hint
-            data["true_weight"] = self.true_weight
-            data["false_weight"] = self.false_weight
+            for side in ("true", "false"):
+                for suffix in ("session_hint", "weight", "tool"):
+                    key = f"{side}_{suffix}"
+                    data[key] = getattr(self, key)
+        if self.role == "action":
+            data.update(
+                proactive_instructions=self.proactive_instructions,
+                ask_private=self.ask_private,
+                proactive_none_criteria=self.proactive_none_criteria,
+            )
         return data
+
+
+@dataclass
+class ToolCall:
+    name: str
+    sources: list[str] = field(default_factory=list)
+    args: dict[str, str] = field(default_factory=dict)
+    status: str = "planned"
+    reason: str = ""
 
 
 @dataclass
@@ -180,6 +195,23 @@ class DecisionResult:
     dry_run: bool = False
     official_llm: bool = False
     outcomes: dict[str, DecisionOutcome] = field(default_factory=dict)
+
+    tool_calls: dict[str, ToolCall] = field(default_factory=dict)
+    round_id: str = ""
+
+    def __post_init__(self) -> None:
+        if self.use_meme and self.meme_id and not self.tool_calls:
+            self.tool_calls["send_meme"] = ToolCall(
+                "send_meme", args={"meme_id": self.meme_id}
+            )
+
+    @property
+    def answers(self):
+        return {
+            key: o.value
+            for key, o in self.outcomes.items()
+            if o.status == "ok" or o.reason == "private_passive_default_reply"
+        }
 
     @property
     def failed(self) -> bool:

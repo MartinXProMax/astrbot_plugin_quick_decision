@@ -65,18 +65,15 @@
 
           <section class="block">
             <div class="block-head">
-              <h2>判断问题</h2>
+              <h2>问题</h2>
               <div class="legend" aria-label="颜色说明">
                 <span class="route route-judge">判断模型看到</span>
-                <span class="route route-chat">会话模型收到</span>
+                <span class="route route-chat">答案生效后</span>
               </div>
             </div>
             <div id="config-warning" class="banner banner-danger" role="alert" hidden></div>
-            <h3>内置问题 <small>只读</small></h3>
-            <div id="builtin-questions" class="builtin-list"><p class="hint">正在读取内置问题…</p></div>
-            <h3>自定义问题</h3>
-            <p class="hint">每轮只问已启用的问题。选中项的提示按顺序交给会话模型，仅当轮有效。</p>
-            <p class="hint">选项权重默认 1，调高会更偏向该项，设为 0 则不选它。温度在插件设置中调整：0 选加权后最优项，大于 0 时随机选择。</p>
+            <p class="hint">为每个问题选择用途，可为答案添加当轮提示或调用工具。发送表情使用「选择表情」问题的结果，同一轮最多发送一次。</p>
+            <p class="hint">选项权重默认 1，调高会更偏向该项，设为 0 则不选它。温度在插件设置中调整，适用于选择题和未勾选插件阈值的是否题。</p>
             <ol id="questions" class="questions"></ol>
 
             <div class="questions-foot">
@@ -84,7 +81,7 @@
                 <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
                 添加问题
               </button>
-              <button id="restore-default" type="button" class="btn btn-text">恢复默认长短问题</button>
+              <button id="restore-default" type="button" class="btn btn-text">恢复默认问题</button>
             </div>
           </section>
 

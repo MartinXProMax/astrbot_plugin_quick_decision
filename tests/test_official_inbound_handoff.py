@@ -12,7 +12,7 @@ import unittest
 from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -153,7 +153,7 @@ from astrbot_plugin_quick_decision.official_handoff import (
 )
 from astrbot_plugin_quick_decision.reply_generator import (
     apply_session_hints,
-    install_direct_send_send_guard,
+    install_group_quote_guard,
     prepare_official_result_chain,
 )
 from astrbot_plugin_quick_decision.session_store import SessionRuntime, SessionStore
@@ -482,7 +482,7 @@ class DirectSendGuardTests(unittest.IsolatedAsyncioTestCase):
                 is_private=False,
             )
         )
-        install_direct_send_send_guard(event)
+        install_group_quote_guard(event)
         # 官方 ResultDecorateStage 在钩子之后插入引用。
         chain.insert(0, Reply(id="inbound-1"))
         payload = SimpleNamespace(chain=chain)
@@ -611,35 +611,15 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         from astrbot_plugin_quick_decision.models import BufferedMessage
 
         payload = self.plugin._decision_config_payload()
-        catalog = {q["id"]: q["variants"] for q in payload["builtin_questions"]}
-        self.assertEqual(set(catalog), set(payload["reserved_question_ids"]))
-        self.assertEqual([q["id"] for q in payload["decision_questions"]], ["length"])
+        self.assertNotIn("builtin_questions", payload)
+        self.assertEqual(payload["version"], 2)
+        self.assertIn("send_meme", payload["tools"])
+        ids = {q["id"] for q in payload["decision_questions"]}
         messages = [BufferedMessage("msg1", "u1", "User", "user", "Hello")]
-        memes = [{"id": "meme1", "description": "smile"}]
-        displayed = {
-            (key, v["prompt"])
-            for key, variants in catalog.items()
-            for v in variants
-            if "prompt" in v
-        }
         asked = set()
-        for scene in (
-            "group_passive",
-            "private_passive",
-            "group_proactive",
-            "private_proactive",
-        ):
-            for key, question in _build_questions(scene, messages, memes).items():
-                asked.add((key, question.instructions))
-                (variant,) = (
-                    v for v in catalog[key] if v.get("prompt") == question.instructions
-                )
-                options = getattr(question, "criteria", {})
-                self.assertEqual(
-                    variant.get("options", {}),
-                    {k: v for k, v in options.items() if k not in {"msg1", "meme1"}},
-                )
-        self.assertEqual(displayed, asked)
+        for scene in ("group_passive", "private_passive", "group_proactive", "private_proactive"):
+            asked.update(_build_questions(scene, messages, [{"id": "cat", "description": "猫"}]))
+        self.assertEqual(asked, ids)
 
     async def test_private_unmerged_keeps_default_official_path(self) -> None:
         event = FakeEvent(
@@ -838,6 +818,73 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.on_llm_request(ev, second)
         self.assertEqual(second.extra_user_content_parts, [])
 
+    async def test_cancelled_handoff_cannot_send_meme_for_another_reply(self) -> None:
+        self.plugin.context.send_message = AsyncMock()
+        for text, manager, reason in (
+            ("插话", None, "官方会话"), ("", FakeConvMgr(), "正文或附件"),
+        ):
+            with self.subTest(reason=reason):
+                event = FakeEvent(umo=f"aiocqhttp:GroupMessage:{reason}", text=text)
+                self.plugin.context.conversation_manager = manager
+                result = DecisionResult(action="reply", use_meme=True, meme_id="cat")
+                self.main_mod.ask_decision = AsyncMock(return_value=result)
+                self.assertIsNone(await self.plugin.on_chat_message(event))
+                self.assertIsNone(event.get_extra("quick_decision"))
+                self.assertFalse(self.plugin.sessions.get(event.unified_msg_origin).deciding)
+                event.set_result(SimpleNamespace(chain=[self.main_mod.Plain("其他插件的回复")]))
+                event._has_send_oper = True
+                await self.plugin.after_message_sent(event)
+                row = self.plugin.sessions.recent_logs()[0]
+                self.assertFalse(row["official_llm"])
+                self.assertEqual(row["tool_calls"][0]["status"], "skipped")
+                self.assertIn(reason, row["tool_calls"][0]["reason"])
+                self.plugin.context.send_message.assert_not_awaited()
+
+    async def test_interrupted_platform_send_is_logged_and_never_retried(self) -> None:
+        started = asyncio.Event()
+
+        async def wait_for_platform(*_args):
+            started.set()
+            await asyncio.Future()
+
+        result = DecisionResult(action="reply", use_meme=True, meme_id="cat")
+        self.main_mod.ask_decision = AsyncMock(return_value=result)
+        self.plugin.context.send_message = AsyncMock(side_effect=wait_for_platform)
+        event = FakeEvent(at_or_wake=True, text="你好")
+        await self.plugin.on_chat_message(event)
+        event.set_result(SimpleNamespace(chain=[self.main_mod.Plain("正文")]))
+        event._has_send_oper = True
+        with patch(
+            "astrbot_plugin_quick_decision.decision_tools.meme_chain",
+            return_value=SimpleNamespace(chain=["image"]),
+        ):
+            task = asyncio.create_task(self.plugin.after_message_sent(event))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            await self.plugin.after_message_sent(event)
+        self.plugin.context.send_message.assert_awaited_once()
+        receipt = self.plugin.sessions.recent_logs()[0]["tool_calls"][0]
+        self.assertEqual(receipt["status"], "interrupted")
+        self.assertIn("送达结果未确认", receipt["reason"])
+
+    async def test_selected_target_quotes_only_first_group_text_segment(self) -> None:
+        self.plugin.config["group"]["direct_send"] = False
+        event = FakeEvent(message_id="new", text="最新消息", at_or_wake=True)
+        self.main_mod.ask_decision = AsyncMock(
+            return_value=DecisionResult(action="reply", target_message_id="old")
+        )
+        await self.plugin.on_chat_message(event)
+        pieces = [self.main_mod.Plain("第一段"), self.main_mod.Plain("第二段")]
+        event.set_result(SimpleNamespace(chain=pieces[:]))
+        await self.plugin.on_decorating_result(event)
+        await event.send(SimpleNamespace(chain=[Reply(id="new"), pieces[0]]))
+        await event.send(SimpleNamespace(chain=[pieces[1]]))
+        quotes = [c.id for msg in event._sends for c in msg.chain if hasattr(c, "id")]
+        self.assertEqual(quotes, ["old"])
+        self.assertEqual(event._sends[0].chain[0].id, "old")
+
     async def test_proactive_still_uses_self_generate(self) -> None:
         generate_calls = []
 
@@ -896,7 +943,7 @@ class MemeAfterSegmentsTests(unittest.IsolatedAsyncioTestCase):
         rg = importlib.reload(rg)
         sent: list[str] = []
 
-        async def fake_send(context, umo, chain):  # noqa: ARG002
+        async def fake_send(umo, chain):  # noqa: ARG002
             texts = [
                 getattr(comp, "text", None) or getattr(comp, "file", "")
                 for comp in chain.chain
@@ -906,8 +953,7 @@ class MemeAfterSegmentsTests(unittest.IsolatedAsyncioTestCase):
             sent.append(" ".join(str(t) for t in texts))
             return True
 
-        self._orig = rg._send_chain
-        rg._send_chain = fake_send
+        context = SimpleNamespace(send_message=fake_send)
 
         class Store:
             def resolve_image(self, meme_id):  # noqa: ARG002
@@ -931,7 +977,7 @@ class MemeAfterSegmentsTests(unittest.IsolatedAsyncioTestCase):
 
         decision = DecisionResult(action="reply", use_meme=True, meme_id="m1")
         ok = await rg.send_decision_message(
-            context=SimpleNamespace(),
+            context=context,
             umo="umo",
             text="一|二",
             resolver=Store(),
@@ -945,8 +991,9 @@ class MemeAfterSegmentsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent[-1].endswith("fake.jpg"))
 
         sent.clear()
+        decision = DecisionResult(action="reply", use_meme=True, meme_id="m1")
         failed = await rg.send_decision_message(
-            context=SimpleNamespace(),
+            context=context,
             umo="umo",
             text="一|fail|三",
             resolver=Store(),
@@ -958,7 +1005,6 @@ class MemeAfterSegmentsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(failed)
         self.assertEqual(sent, ["一", "三"])
         self.assertFalse(any("fake.jpg" in item for item in sent))
-        rg._send_chain = self._orig
 
 
 if __name__ == "__main__":

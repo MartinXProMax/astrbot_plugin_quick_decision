@@ -23,7 +23,7 @@ from astrbot_plugin_quick_decision.decision_engine import (
 )
 from astrbot_plugin_quick_decision.models import (
     BufferedMessage,
-    CustomDecisionQuestion,
+    DecisionQuestion,
     DecisionResult,
 )
 
@@ -71,7 +71,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_one_batch_preserves_question_and_sampling_order(self) -> None:
         configured = default_decision_questions() + [
-            CustomDecisionQuestion(
+            DecisionQuestion(
                 id="followup",
                 type="boolean",
                 instructions="追问？",
@@ -132,7 +132,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
             (result.action, result.target_message_id, result.length),
             ("reply", "m1", "long"),
         )
-        self.assertEqual(result.custom_answers, {"length": "long", "followup": False})
+        self.assertEqual(result.custom_answers, {"length": "long", "followup": False, "use_meme": True})
         self.assertEqual(result.session_hints[-1], "无需追问")
         self.assertTrue(result.use_meme)
         self.assertEqual(result.meme_id, "cat")
@@ -160,7 +160,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
             )
             settings.choice_threshold = 1.0
             settings.choice_temperature = 1.0
-            long_option = settings.decision_questions[0].options[1]
+            long_option = next(q for q in settings.decision_questions if q.id == "length").options[1]
             long_option.weight = 0.0
             long_option.session_hint = "updated during request"
             messages[:] = [message("m2")]
@@ -366,7 +366,7 @@ class OutcomeTests(unittest.TestCase):
         self,
     ) -> None:
         configured = default_decision_questions() + [
-            CustomDecisionQuestion(
+            DecisionQuestion(
                 id="followup",
                 type="boolean",
                 instructions="追问？",

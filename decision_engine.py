@@ -18,106 +18,19 @@ from astrbot.api.provider import (
     DecisionError,
 )
 
-from .config_util import PluginSettings
+from .config_util import PluginSettings, default_questions
+from .decision_tools import TOOLS
 from .models import (
-    RESERVED_QUESTION_IDS,
     BufferedMessage,
-    CustomDecisionQuestion,
     DecisionOutcome,
     DecisionResult,
     SceneType,
+    ToolCall,
     normalize_action,
 )
 
-ACTION_CRITERIA_GROUP = {
-    "none": "现在不适合发言，保持沉默",
-    "reply": (
-        "现在适合发言：可以针对某条具体消息回复，"
-        "也可以自然参与当前讨论或插话，不必强行引用某一条"
-    ),
-}
-ACTION_CRITERIA_PROACTIVE = {
-    "none": "现在仍应保持沉默，不要主动开口",
-    "proactive": "现在适合在冷场后主动开口",
-}
-GROUP_ACTION_PROMPT = (
-    "根据近期群聊判断机器人现在应该怎么做。"
-    "reply 表示发言，既包括针对某条消息回复，也包括自然参与讨论或插话；"
-    "即使被 @ 或引用，也可以选择 none 不回复。"
-)
-PROACTIVE_PROMPT = "会话已经沉默一段时间。判断现在是否适合主动开口。"
-TARGET_PROMPT = (
-    "如果决定发言，可以针对哪一条消息？若不针对某一条特定消息，可选 latest。"
-)
-USE_MEME_PROMPT = "这次回复是否适合配上一张表情包？没有合适的表情时应为否。"
-MEME_PROMPT = (
-    "若需要配图，请根据描述选择最合适的一张表情包；不合适则选 none。"
-    "只根据描述选择，不要假设你能看到原图。"
-)
-TARGET_DEFAULT = {"latest": "针对最近一条消息回复"}
-MEME_DEFAULT = {"none": "不配表情包"}
-
-
-def builtin_question_catalog() -> list[dict]:
-    """WebUI 的只读题目清单；动态选项只说明来源，不读取具体会话或图库。"""
-    return [
-        {
-            "id": "action",
-            "title": "要不要发言",
-            "variants": [
-                {
-                    "when": "群聊收到消息",
-                    "prompt": GROUP_ACTION_PROMPT,
-                    "options": ACTION_CRITERIA_GROUP,
-                },
-                {
-                    "when": "群聊或私聊冷场",
-                    "prompt": PROACTIVE_PROMPT,
-                    "options": ACTION_CRITERIA_PROACTIVE,
-                },
-                {"when": "私聊收到消息", "note": "固定为 reply，不向判断模型提问。"},
-            ],
-        },
-        {
-            "id": "target_message_id",
-            "title": "回复哪条消息",
-            "variants": [
-                {
-                    "when": "群聊收到消息，且有可选消息",
-                    "prompt": TARGET_PROMPT,
-                    "options": TARGET_DEFAULT,
-                    "note": "其余选项取自最近 8 条记录中带消息 ID 的用户消息。没有可选消息时跳过。",
-                },
-            ],
-        },
-        {
-            "id": "use_meme",
-            "title": "是否配表情",
-            "variants": [
-                {
-                    "when": "每轮判断",
-                    "prompt": USE_MEME_PROMPT,
-                    "note": "是否题：「是」的概率达到判断阈值才允许配图。",
-                },
-            ],
-        },
-        {
-            "id": "meme_id",
-            "title": "选哪张表情",
-            "variants": [
-                {
-                    "when": "图库有候选表情",
-                    "prompt": MEME_PROMPT,
-                    "options": MEME_DEFAULT,
-                    "note": "其余选项是本轮候选表情的 ID 和描述。图库为空时跳过。",
-                },
-            ],
-        },
-    ]
-
-
 Question = DecisionBooleanQuestion | DecisionChoiceQuestion
-Binding = Literal["action", "target_message_id", "use_meme", "meme_id", "session_hint"]
+
 _MISSING = object()
 
 
@@ -128,14 +41,14 @@ class DecisionSpec:
     id: str
     kind: Literal["choice", "boolean", "fixed"]
     question: Question | None
-    binding: Binding
+    binding: str
     default: str | bool | None = None
     threshold: float = 0.0
     temperature: float = 0.0
     allowed: frozenset[str] = frozenset()
     option_weights: dict[str, float] = field(default_factory=dict)
     session_hints: dict[str | bool, str] = field(default_factory=dict)
-    stage: str = "pre_reply"
+    tools: dict[str | bool, str] = field(default_factory=dict)
 
 
 def _select_option(
@@ -239,8 +152,8 @@ def _evaluate_answers(
     specs: list[DecisionSpec], answers: Mapping[str, object]
 ) -> dict[str, DecisionOutcome]:
     # 旧解析器最后才采样回复目标；保留顺序，避免同一随机输入下选中不同选项。
-    ordered = [spec for spec in specs if spec.binding != "target_message_id"]
-    ordered.extend(spec for spec in specs if spec.binding == "target_message_id")
+    ordered = [spec for spec in specs if spec.binding != "target"]
+    ordered.extend(spec for spec in specs if spec.binding == "target")
     return {
         spec.id: _evaluate_answer(spec, answers.get(spec.id, _MISSING))
         for spec in ordered
@@ -289,203 +202,156 @@ def build_state(
     return state
 
 
-def _add_custom_questions(
-    questions: dict[str, DecisionBooleanQuestion | DecisionChoiceQuestion],
-    configured: list[CustomDecisionQuestion],
-) -> None:
-    """追加用户配置的判断问题；不会覆盖内置的发言、对象和表情问题。"""
+def _build_specs(configured, scene, messages, memes, settings, *, targets=None):
+    specs = []
     for item in configured:
-        if (
-            not item.enabled
-            or not item.id
-            or item.id in questions
-            or item.id in RESERVED_QUESTION_IDS
-        ):
+        if not item.enabled:
             continue
-        if item.type == "choice":
-            criteria = {option.id: option.criteria for option in item.options}
-            if len(criteria) < 2:
+        role = item.role
+        prompt = item.instructions
+        fixed = role == "action" and scene == "private_passive" and not item.ask_private
+        default = {
+            "action": "reply" if fixed else "none",
+            "target": "latest",
+            "meme": "none",
+        }.get(role)
+        if item.type == "boolean":
+            default = False if item.use_threshold else None
+        spec = DecisionSpec(
+            id=item.id,
+            kind="fixed" if fixed else item.type,
+            binding=role,
+            question=None,
+            default=default,
+            threshold=settings.choice_threshold
+            if item.use_threshold
+            else (0.5 if item.type == "boolean" else 0.0),
+            temperature=0.0
+            if item.type == "boolean" and item.use_threshold
+            else settings.choice_temperature,
+        )
+        specs.append(spec)
+        if fixed:
+            reply = next(o for o in item.options if o.id == "reply")
+            spec.session_hints["reply"] = reply.session_hint
+            spec.tools["reply"] = reply.tool
+        if fixed or (role == "target" and scene != "group_passive"):
+            continue
+        if item.type == "boolean":
+            spec.question = DecisionBooleanQuestion(prompt)
+            spec.allowed = frozenset({"true", "false"})
+            spec.option_weights = {"true": item.true_weight, "false": item.false_weight}
+            spec.session_hints = {
+                True: item.true_session_hint,
+                False: item.false_session_hint,
+            }
+            spec.tools = {True: item.true_tool, False: item.false_tool}
+            continue
+        dynamic = {}
+        if role == "target":
+            dynamic = (
+                targets
+                if targets is not None
+                else {
+                    m.message_id: f"回复 {m.sender_name or m.sender_id} 的消息：{m.text[:40] or '（无文本）'}"
+                    for m in messages[-8:]
+                    if m.message_id and m.role == "user"
+                }
+            )
+        elif role == "meme":
+            dynamic = {m["id"]: m["description"] for m in memes}
+        proactive = scene.endswith("_proactive")
+        if role == "action" and proactive:
+            prompt = item.proactive_instructions or prompt
+        criteria = {}
+        for opt in item.options:
+            if role == "action" and opt.id == ("reply" if proactive else "proactive"):
                 continue
-            questions[item.id] = DecisionChoiceQuestion(
-                instructions=item.instructions,
-                criteria=criteria,
+            expanded = role in {"target", "meme"} and opt.id == "*"
+            entries = dynamic if expanded else {opt.id: opt.criteria}
+            for key, label in entries.items():
+                if expanded and key in {default, "*"}:
+                    continue
+                if expanded and "{描述}" in opt.criteria:
+                    label = opt.criteria.replace("{描述}", label)
+                elif expanded:
+                    label = f"{opt.criteria}：{label}"
+                criteria[key] = label
+                if (
+                    role == "action"
+                    and key == "none"
+                    and proactive
+                    and item.proactive_none_criteria
+                ):
+                    criteria[key] = item.proactive_none_criteria
+                spec.option_weights[key] = opt.weight
+                spec.session_hints[key] = opt.session_hint
+                spec.tools[key] = opt.tool
+        if len(criteria) >= 2:
+            spec.question = DecisionChoiceQuestion(
+                instructions=prompt, criteria=criteria
             )
-        elif item.type == "boolean":
-            questions[item.id] = DecisionBooleanQuestion(item.instructions)
-
-
-def _build_questions(
-    scene: SceneType,
-    messages: list[BufferedMessage],
-    memes: list[dict[str, str]],
-    configured: list[CustomDecisionQuestion] | None = None,
-) -> dict[str, DecisionBooleanQuestion | DecisionChoiceQuestion]:
-    questions: dict[str, DecisionBooleanQuestion | DecisionChoiceQuestion] = {}
-    if scene == "group_passive":
-        questions["action"] = DecisionChoiceQuestion(
-            instructions=GROUP_ACTION_PROMPT,
-            criteria=ACTION_CRITERIA_GROUP,
-        )
-        # 选择类问题至少需要两个选项；始终提供 latest 作为兜底。
-        target_criteria = TARGET_DEFAULT.copy()
-        for item in messages[-8:]:
-            if item.message_id and item.role == "user":
-                preview = item.text[:40] or "（无文本）"
-                target_criteria[item.message_id] = (
-                    f"回复 {item.sender_name or item.sender_id} 的消息：{preview}"
-                )
-        if len(target_criteria) >= 2:
-            questions["target_message_id"] = DecisionChoiceQuestion(
-                instructions=TARGET_PROMPT,
-                criteria=target_criteria,
-            )
-    elif scene in {"group_proactive", "private_proactive"}:
-        questions["action"] = DecisionChoiceQuestion(
-            instructions=PROACTIVE_PROMPT,
-            criteria=ACTION_CRITERIA_PROACTIVE,
-        )
-    # 私聊被动默认要回复，不问 action。
-    _add_custom_questions(questions, configured or [])
-    questions["use_meme"] = DecisionBooleanQuestion(USE_MEME_PROMPT)
-    if memes:
-        meme_criteria = MEME_DEFAULT.copy()
-        for meme in memes:
-            meme_criteria[meme["id"]] = meme["description"]
-        questions["meme_id"] = DecisionChoiceQuestion(
-            instructions=MEME_PROMPT,
-            criteria=meme_criteria,
-        )
-    return questions
-
-
-def _build_specs(
-    questions: Mapping[str, Question],
-    *,
-    scene: SceneType,
-    settings: PluginSettings,
-) -> list[DecisionSpec]:
-    """将内置规则和旧自定义配置映射到同一种题目定义，并固定候选及提示。"""
-    threshold = settings.choice_threshold
-    temperature = settings.choice_temperature
-    private_default = scene == "private_passive"
-    action_allowed = (
-        {"none", "reply", "join"} if scene == "group_passive" else {"none", "proactive"}
-    )
-    specs = [
-        DecisionSpec(
-            id="action",
-            kind="fixed" if private_default else "choice",
-            question=questions.get("action"),
-            binding="action",
-            default="reply" if private_default else "none",
-            threshold=threshold,
-            temperature=temperature,
-            allowed=frozenset(action_allowed),
-        )
-    ]
-    target = questions.get("target_message_id")
-    specs.append(
-        DecisionSpec(
-            id="target_message_id",
-            kind="choice",
-            question=target,
-            binding="target_message_id",
-            default="latest",
-            temperature=temperature,
-            allowed=frozenset(target.criteria if target is not None else {"latest"}),
-        )
-    )
-    for item in settings.decision_questions:
-        question = questions.get(item.id)
-        if not item.enabled or item.id in RESERVED_QUESTION_IDS or question is None:
-            continue
-        if item.type == "choice":
-            weights = {option.id: option.weight for option in item.options}
-            hints = {option.id: option.session_hint for option in item.options}
-            allowed = frozenset(question.criteria)
-        else:
-            weights = {"true": item.true_weight, "false": item.false_weight}
-            hints = {True: item.true_session_hint, False: item.false_session_hint}
-            allowed = frozenset({"true", "false"})
-        specs.append(
-            DecisionSpec(
-                id=item.id,
-                kind=item.type,
-                question=question,
-                binding="session_hint",
-                threshold=0.5 if item.type == "boolean" else 0.0,
-                temperature=temperature,
-                allowed=allowed,
-                option_weights=weights,
-                session_hints=hints,
-            )
-        )
-    meme_question = questions.get("meme_id")
-    specs.extend(
-        [
-            DecisionSpec(
-                id="use_meme",
-                kind="boolean",
-                question=questions.get("use_meme"),
-                binding="use_meme",
-                default=False,
-                threshold=threshold,
-                allowed=frozenset({"true", "false"}),
-            ),
-            DecisionSpec(
-                id="meme_id",
-                kind="choice",
-                question=meme_question,
-                binding="meme_id",
-                default="none",
-                threshold=threshold,
-                temperature=temperature,
-                allowed=frozenset(
-                    meme_question.criteria if meme_question is not None else {"none"}
-                ),
-            ),
-        ]
-    )
+            spec.allowed = frozenset(criteria)
+            if role == "action" and "reply" in criteria:
+                spec.allowed |= {"join"}
+                spec.option_weights["join"] = spec.option_weights["reply"]
     return specs
 
 
-def _assemble_result(
-    specs: list[DecisionSpec],
-    outcomes: dict[str, DecisionOutcome],
-    *,
-    scene: SceneType,
-) -> DecisionResult:
-    """统一结果只投影一次；旧调用者、提示注入和发送路径继续读取兼容字段。"""
-    result = DecisionResult(scene=scene, outcomes=outcomes)
-    by_id = {spec.id: spec for spec in specs}
-    for question_id, outcome in outcomes.items():
-        spec = by_id[question_id]
-        binding, value = spec.binding, outcome.value
-        if (
-            binding in {"action", "use_meme"}
-            or outcome.raw
-            or (binding == "meme_id" and outcome.status not in {"missing", "skipped"})
-        ):
-            result.raw[question_id] = outcome.raw
-        if binding == "session_hint":
-            if outcome.status != "ok":
-                continue
-            result.custom_answers[question_id] = value
-            if question_id == "length" and value in {"short", "long"}:
-                result.length = value
-            hint = spec.session_hints.get(value, "").strip()
-            if hint:
-                result.session_hints.append(hint)
-        elif binding == "action":
+def _build_questions(scene, messages, memes, configured=None):
+    settings = PluginSettings({})
+    specs = _build_specs(
+        default_questions() if configured is None else configured,
+        scene,
+        messages,
+        memes,
+        settings,
+    )
+    return {s.id: s.question for s in specs if s.question is not None}
+
+
+def _assemble_result(specs, outcomes, *, scene):
+    result = DecisionResult(
+        scene=scene,
+        outcomes=outcomes,
+        action="reply" if scene == "private_passive" else "none",
+    )
+    role_answers = {}
+    for spec in specs:
+        outcome = outcomes[spec.id]
+        value = outcome.value
+        if outcome.raw:
+            result.raw[spec.id] = outcome.raw
+        if spec.binding == "action":
             result.action = normalize_action(value)
-        elif binding == "target_message_id":
-            result.target_message_id = value if value != "latest" else None
-        elif binding == "use_meme":
-            result.use_meme = bool(value)
-        elif binding == "meme_id":
-            result.meme_id = value if value != "none" else None
-    if not result.use_meme or result.meme_id is None:
-        result.use_meme, result.meme_id = False, None
+        elif spec.binding == "target" and outcome.status == "ok" and value != "latest":
+            result.target_message_id = value
+        elif spec.binding == "meme" and outcome.status == "ok" and value != "none":
+            role_answers["meme"] = value
+        if outcome.status != "ok" and spec.kind != "fixed":
+            continue
+        if spec.binding == "answer":
+            result.custom_answers[spec.id] = value
+        if spec.id == "length" and value in {"short", "long"}:
+            result.length = value
+        effect_key = normalize_action(value) if spec.binding == "action" else value
+        if hint := spec.session_hints.get(effect_key):
+            result.session_hints.append(hint)
+        if name := spec.tools.get(effect_key):
+            call = result.tool_calls.setdefault(name, ToolCall(name))
+            call.sources.append(
+                f"{spec.id}={str(value).lower() if isinstance(value, bool) else value}"
+            )
+    for call in result.tool_calls.values():
+        _, resolve_args, _ = TOOLS[call.name]
+        args = resolve_args(role_answers)
+        if args is None:
+            call.status, call.reason = "skipped", "缺少本轮所需答案"
+        else:
+            call.args = args
+    meme_call = result.tool_calls.get("send_meme")
+    if meme_call and meme_call.args:
+        result.use_meme, result.meme_id = True, meme_call.args["meme_id"]
     return result
 
 
@@ -498,20 +364,22 @@ def _parse_answers(
     target_message_ids: set[str] | None = None,
 ) -> DecisionResult:
     """保留本地解析入口；实际调用通过 evaluate_specs 使用提问时的同一快照。"""
-    questions = _build_questions(scene, [], memes, settings.decision_questions)
-    if scene == "group_passive":
-        allowed = {"latest"}
-        target_answer = answers.get("target_message_id")
-        if target_message_ids is not None:
-            allowed.update(target_message_ids)
-        elif isinstance(target_answer, DecisionChoiceAnswer):
-            allowed.update(target_answer.probabilities)
-            allowed.add(target_answer.choice)
-        if len(allowed) >= 2:
-            questions["target_message_id"] = DecisionChoiceQuestion(
-                instructions="回复目标", criteria={mid: mid for mid in allowed}
-            )
-    specs = _build_specs(questions, scene=scene, settings=settings)
+    targets = target_message_ids
+    if targets is None:
+        target = next(
+            (q for q in settings.decision_questions if q.role == "target"), None
+        )
+        answer = answers.get(target.id) if target else None
+        if isinstance(answer, DecisionChoiceAnswer):
+            targets = set(answer.probabilities) | {answer.choice}
+    specs = _build_specs(
+        settings.decision_questions,
+        scene,
+        [],
+        memes,
+        settings,
+        targets={k: k for k in targets or ()},
+    )
     return _assemble_result(specs, _evaluate_answers(specs, answers), scene=scene)
 
 
@@ -537,8 +405,7 @@ async def ask_decision(
         memes=memes,
         custom_context=settings.decision_custom_context,
     )
-    questions = _build_questions(scene, messages, memes, settings.decision_questions)
-    specs = _build_specs(questions, scene=scene, settings=settings)
+    specs = _build_specs(settings.decision_questions, scene, messages, memes, settings)
     try:
         outcomes = await evaluate_specs(
             context.decision,

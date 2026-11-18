@@ -617,38 +617,7 @@ textarea.is-invalid {
   font-weight: normal;
 }
 
-.builtin-list {
-  margin: 8px 0 20px;
-  overflow-wrap: anywhere;
-}
-
-.builtin-list details {
-  border-bottom: 1px solid var(--line);
-}
-
-.builtin-list summary {
-  cursor: pointer;
-  padding: 9px 0;
-}
-
-.builtin-list summary code {
-  margin-inline-start: 6px;
-  color: var(--muted);
-}
-
-.builtin-variant {
-  margin: 4px 0 14px 18px;
-}
-
-.builtin-variant :is(p, ul) {
-  margin: 4px 0;
-}
-
-.builtin-variant ul {
-  padding-inline-start: 20px;
-}
-
-/* ---------- 自定义问题 ---------- */
+/* ---------- 问题 ---------- */
 
 .questions {
   list-style: none;
@@ -930,7 +899,6 @@ textarea.is-invalid {
 }
 
 .opt-chat {
-  grid-area: chat;
   min-height: 38px;
   border-color: var(--chat-line);
   background: var(--chat-soft);
@@ -1384,3 +1352,6 @@ textarea.opt-chat,
     transition: none !important;
   }
 }
+
+.answer-effects { grid-area: chat; display: grid; gap: .4rem; min-width: 0; }
+.tool-select select { max-width: 100%; }

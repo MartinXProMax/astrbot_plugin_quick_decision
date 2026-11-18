@@ -27,7 +27,7 @@
   "choice_threshold": {
     "description": "判断选项生效阈值",
     "type": "float",
-    "hint": "内置发言、配图结果的原始概率需达到该阈值才生效，否则按不发言或不配图处理。温度采样不会绕过阈值；自定义问题不使用该阈值。",
+    "hint": "适用于勾选「使用插件判断阈值」的问题。选择题按所选项的原始概率验收，是否题两侧权重均为 1 时按「是」的原始概率判断。任一侧改为其他权重后，忽略阈值，选取加权概率最高的一侧。",
     "default": 0.5,
     "slider": {
       "min": 0,
@@ -38,7 +38,7 @@
   "choice_temperature": {
     "description": "判断选项温度",
     "type": "float",
-    "hint": "0 时保持确定性，自定义权重生效时取加权后最高项；大于 0 按温度随机选择。1 按加权概率采样，小于 1 更集中，大于 1 更随机。适用于选择题和自定义是否题；不改变判断模型请求。",
+    "hint": "选择题与普通是否题按选项权重和温度选择。使用插件阈值的是否题默认按阈值判断。0 为确定选择，1 按加权概率抽样。",
     "default": 0,
     "slider": {
       "min": 0,
@@ -128,7 +128,7 @@
   "private": {
     "description": "私聊策略",
     "type": "object",
-    "hint": "仅作用于私聊会话。私聊收到消息时默认回复；判断模型会询问你配置的自定义问题（默认包括回复长短），以及是否配图、选哪张图。",
+    "hint": "仅作用于私聊。收到消息默认回复，可在控制发言的问题中开启「私聊也判断是否发言」。",
     "items": {
       "enable_proactive_after_silence": {
         "description": "允许私聊冷场后主动开口",
@@ -167,10 +167,10 @@
     "full_width": true
   },
   "decision_questions": {
-    "description": "自定义判断问题（JSON）",
+    "description": "问题（JSON）",
     "type": "text",
-    "hint": "配置回复长短或语气等自定义问题，格式为 JSON 数组。选择题选项可设 weight，是否题可设 true_weight / false_weight；权重 0–100，默认 1，0 禁用，调高更偏向该项。建议在插件网页的「判断配置」里用表单编辑。JSON 无效时会记录警告并回退到默认长短问题。",
-    "default": "[\n  {\n    \"id\": \"length\",\n    \"enabled\": true,\n    \"type\": \"choice\",\n    \"instructions\": \"如果发言，回复应该简短还是稍详细？\",\n    \"options\": [\n      {\n        \"id\": \"short\",\n        \"criteria\": \"简短回复，一两句即可\",\n        \"session_hint\": \"本轮回复策略：请给出简短、自然的回复，一两句即可。\"\n      },\n      {\n        \"id\": \"long\",\n        \"criteria\": \"更完整、稍详细的回复\",\n        \"session_hint\": \"本轮回复策略：请给出稍详细、完整的回复，但仍保持自然。\"\n      }\n    ]\n  }\n]",
+    "hint": "在插件详情页编辑问题、选项、权重和工具。version 为 2 的配置保存完整列表，旧数组会自动补齐默认问题。",
+    "default": "{\n  \"version\": 2,\n  \"questions\": [\n    {\n      \"id\": \"action\",\n      \"enabled\": true,\n      \"type\": \"choice\",\n      \"instructions\": \"根据近期群聊判断机器人现在应该怎么做。reply 表示发言，既包括针对某条消息回复，也包括自然参与讨论或插话；即使被 @ 或引用，也可以选择 none 不回复。\",\n      \"role\": \"action\",\n      \"use_threshold\": true,\n      \"options\": [\n        {\n          \"id\": \"none\",\n          \"criteria\": \"现在不适合发言，保持沉默\",\n          \"session_hint\": \"\",\n          \"weight\": 1.0,\n          \"tool\": \"\"\n        },\n        {\n          \"id\": \"reply\",\n          \"criteria\": \"现在适合发言：可以针对某条具体消息回复，也可以自然参与当前讨论或插话，不必强行引用某一条\",\n          \"session_hint\": \"\",\n          \"weight\": 1.0,\n          \"tool\": \"\"\n        },\n        {\n          \"id\": \"proactive\",\n          \"criteria\": \"现在适合在冷场后主动开口\",\n          \"session_hint\": \"\",\n          \"weight\": 1.0,\n          \"tool\": \"\"\n        }\n      ],\n      \"proactive_instructions\": \"会话已经沉默一段时间。判断现在是否适合主动开口。\",\n      \"ask_private\": false,\n      \"proactive_none_criteria\": \"现在仍应保持沉默，不要主动开口\"\n    },\n    {\n      \"id\": \"target_message_id\",\n      \"enabled\": true,\n      \"type\": \"choice\",\n      \"instructions\": \"如果决定发言，可以针对哪一条消息？若不针对某一条特定消息，可选 latest。\",\n      \"role\": \"target\",\n      \"use_threshold\": false,\n      \"options\": [\n        {\n          \"id\": \"latest\",\n          \"criteria\": \"针对最近一条消息回复\",\n          \"session_hint\": \"\",\n          \"weight\": 1.0,\n          \"tool\": \"\"\n        },\n        {\n          \"id\": \"*\",\n          \"criteria\": \"{描述}\",\n          \"session_hint\": \"\",\n          \"weight\": 1.0,\n          \"tool\": \"\"\n        }\n      ]\n    },\n    {\n      \"id\": \"length\",\n      \"enabled\": true,\n      \"type\": \"choice\",\n      \"instructions\": \"如果发言，回复应该简短还是稍详细？\",\n      \"role\": \"answer\",\n      \"use_threshold\": false,\n      \"options\": [\n        {\n          \"id\": \"short\",\n          \"criteria\": \"简短回复，一两句即可\",\n          \"session_hint\": \"本轮回复策略：请给出简短、自然的回复，一两句即可。\",\n          \"weight\": 1.0,\n          \"tool\": \"\"\n        },\n        {\n          \"id\": \"long\",\n          \"criteria\": \"更完整、稍详细的回复\",\n          \"session_hint\": \"本轮回复策略：请给出稍详细、完整的回复，但仍保持自然。\",\n          \"weight\": 1.0,\n          \"tool\": \"\"\n        }\n      ]\n    },\n    {\n      \"id\": \"use_meme\",\n      \"enabled\": true,\n      \"type\": \"boolean\",\n      \"instructions\": \"这次回复是否适合配上一张表情包？没有合适的表情时应为否。\",\n      \"role\": \"answer\",\n      \"use_threshold\": true,\n      \"true_session_hint\": \"\",\n      \"true_weight\": 1.0,\n      \"true_tool\": \"send_meme\",\n      \"false_session_hint\": \"\",\n      \"false_weight\": 1.0,\n      \"false_tool\": \"\"\n    },\n    {\n      \"id\": \"meme_id\",\n      \"enabled\": true,\n      \"type\": \"choice\",\n      \"instructions\": \"若需要配图，请根据描述选择最合适的一张表情包；不合适则选 none。只根据描述选择，不要假设你能看到原图。\",\n      \"role\": \"meme\",\n      \"use_threshold\": true,\n      \"options\": [\n        {\n          \"id\": \"none\",\n          \"criteria\": \"不配表情包\",\n          \"session_hint\": \"\",\n          \"weight\": 1.0,\n          \"tool\": \"\"\n        },\n        {\n          \"id\": \"*\",\n          \"criteria\": \"{描述}\",\n          \"session_hint\": \"\",\n          \"weight\": 1.0,\n          \"tool\": \"\"\n        }\n      ]\n    }\n  ]\n}",
     "editor_mode": true,
     "editor_language": "json",
     "full_width": true

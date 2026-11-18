@@ -67,7 +67,6 @@ from astrbot_plugin_quick_decision.meme_migrate import (
 )
 from astrbot_plugin_quick_decision.models import DecisionResult
 from astrbot_plugin_quick_decision.reply_generator import (
-    append_meme_to_chain,
     build_meme_chain,
     build_send_chain,
 )
@@ -303,9 +302,8 @@ class MemeAdapterTests(unittest.TestCase):
         chain = build_send_chain("should-not-matter", adapter, decision, quote_target=False)
         self.assertFalse(any(getattr(item, 'file', None) for item in chain.chain))
         self.assertFalse(build_meme_chain(adapter, decision).chain)
-        appended = append_meme_to_chain([], adapter, DecisionResult(use_meme=True, meme_id=meme_id, action="none"))
-        # 上层在 none 时本不应发消息；这里只断言 use_meme=False 才是发图开关。
-        self.assertTrue(appended)
+        selected = DecisionResult(use_meme=True, meme_id=meme_id, action="reply")
+        self.assertTrue(build_meme_chain(adapter, selected).chain)
 
     def test_reply_attaches_exactly_one_image(self) -> None:
         _make_pack(

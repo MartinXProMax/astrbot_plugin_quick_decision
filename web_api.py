@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
+import json
+
 from astrbot.api import logger
 from astrbot.api.web import error_response, json_response, request
 
-from .config_util import (
-    dump_decision_questions,
-    parse_decision_questions,
-)
-from .decision_engine import builtin_question_catalog
-from .models import RESERVED_QUESTION_IDS
+from .config_util import default_questions, load_questions
+from .decision_tools import TOOLS
+from .models import QUESTION_ROLES
 
 PLUGIN_NAME = "astrbot_plugin_quick_decision"
 
@@ -53,11 +52,13 @@ class WebApiMixin:
         settings = self.settings
         return {
             "decision_custom_context": settings.decision_custom_context,
-            "builtin_questions": builtin_question_catalog(),
+            "version": 2,
+            "default_questions": [q.to_dict() for q in default_questions()],
+            "roles": QUESTION_ROLES,
+            "tools": {key: label for key, (label, _, _) in TOOLS.items()},
             "decision_questions": [
                 item.to_dict() for item in settings.decision_questions
             ],
-            "reserved_question_ids": sorted(RESERVED_QUESTION_IDS),
             "warning": warning
             if warning is not None
             else settings.decision_questions_warning,
@@ -71,8 +72,12 @@ class WebApiMixin:
         if not isinstance(payload, dict):
             return error_response("请求体必须是 JSON 对象", status_code=400)
         custom_context = str(payload.get("decision_custom_context") or "").strip()
-        questions, error = parse_decision_questions(
-            payload.get("decision_questions"), strict=True
+        questions, error = load_questions(
+            {
+                "version": payload.get("version"),
+                "questions": payload.get("decision_questions"),
+            },
+            strict=True,
         )
         if error:
             return error_response(error, status_code=400)
@@ -81,7 +86,11 @@ class WebApiMixin:
         if config is None or not hasattr(config, "save_config"):
             return error_response("当前环境无法写入官方插件配置", status_code=500)
         config["decision_custom_context"] = custom_context
-        config["decision_questions"] = dump_decision_questions(questions)
+        config["decision_questions"] = json.dumps(
+            {"version": 2, "questions": [q.to_dict() for q in questions]},
+            ensure_ascii=False,
+            indent=2,
+        )
         save = getattr(config, "save_config_async", None)
         if callable(save):
             await save()

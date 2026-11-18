@@ -156,6 +156,25 @@ class SessionStore:
             except OSError:
                 return
 
+    async def update_tool_log(self, round_id: str, calls: list[dict]) -> None:
+        async with self._log_lock:
+            try:
+                lines = self.log_path.read_text(encoding="utf-8").splitlines()
+                for i in range(len(lines) - 1, -1, -1):
+                    try:
+                        row = json.loads(lines[i])
+                    except ValueError:
+                        continue
+                    if isinstance(row, dict) and row.get("round_id") == round_id:
+                        row["tool_calls"] = calls
+                        lines[i] = json.dumps(row, ensure_ascii=False)
+                        tmp = self.log_path.with_suffix(".jsonl.tmp")
+                        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        tmp.replace(self.log_path)
+                        break
+            except OSError:
+                return
+
     def recent_logs(self, limit: int = 20, umo: str | None = None) -> list[dict]:
         if not self.log_path.exists():
             return []

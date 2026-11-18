@@ -47,7 +47,6 @@ class Reply:
 sys.modules["astrbot.api.event"].MessageChain = MessageChain
 sys.modules["astrbot.api.message_components"].Image = Image
 sys.modules["astrbot.api.message_components"].Reply = Reply
-sys.modules["astrbot.api.message_components"].Plain = type("Plain", (), {})
 
 import importlib
 import astrbot_plugin_quick_decision.reply_generator as reply_generator

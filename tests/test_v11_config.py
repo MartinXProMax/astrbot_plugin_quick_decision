@@ -52,6 +52,7 @@ def _install_astrbot_stubs() -> None:
     api = sys.modules["astrbot.api"]
     api.logger = types.SimpleNamespace(
         warning=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
         info=lambda *args, **kwargs: None,
         exception=lambda *args, **kwargs: None,
         debug=lambda *args, **kwargs: None,
@@ -100,9 +101,18 @@ def _install_astrbot_stubs() -> None:
 
     sys.modules["astrbot.core.agent.message"].TextPart = TextPart
     sys.modules["astrbot.api.event"].MessageChain = type("MessageChain", (), {})
+    @dataclass
+    class Plain:
+        text: str
+
+    @dataclass
+    class Reply:
+        id: str
+
     components = sys.modules["astrbot.api.message_components"]
+    components.Plain = Plain
+    components.Reply = Reply
     components.Image = type("Image", (), {})
-    components.Reply = type("Reply", (), {})
 
 
 _install_astrbot_stubs()
@@ -110,14 +120,13 @@ _install_astrbot_stubs()
 from astrbot.api.provider import DecisionBooleanAnswer, DecisionChoiceAnswer
 from astrbot.core.agent.message import TextPart
 from astrbot_plugin_quick_decision.config_util import (
-    DEFAULT_DECISION_QUESTIONS_JSON,
     DEFAULT_LENGTH_INSTRUCTIONS,
     DEFAULT_LONG_CRITERIA,
     DEFAULT_LONG_SESSION_HINT,
     DEFAULT_SHORT_CRITERIA,
     DEFAULT_SHORT_SESSION_HINT,
     PluginSettings,
-    default_decision_questions,
+    default_decision_questions, default_questions, load_questions,
     dump_decision_questions,
     parse_decision_questions,
 )
@@ -127,9 +136,8 @@ from astrbot_plugin_quick_decision.decision_engine import (
     build_state,
 )
 from astrbot_plugin_quick_decision.models import (
-    RESERVED_QUESTION_IDS,
     BufferedMessage,
-    CustomDecisionQuestion,
+    DecisionQuestion,
     DecisionQuestionOption,
     DecisionResult,
 )
@@ -163,19 +171,10 @@ class DecisionConfigTests(unittest.TestCase):
         self.assertEqual(schema["decision_custom_context"]["default"], "")
         self.assertEqual(schema["decision_questions"]["type"], "text")
         self.assertTrue(schema["decision_questions"]["editor_mode"])
-        parsed_schema, warning = parse_decision_questions(
-            schema["decision_questions"]["default"]
-        )
+        parsed_schema, warning = load_questions(schema["decision_questions"]["default"], strict=True)
         self.assertIsNone(warning)
-        parsed_default, default_warning = parse_decision_questions(
-            DEFAULT_DECISION_QUESTIONS_JSON
-        )
-        self.assertIsNone(default_warning)
-        self.assertEqual(
-            [item.to_dict() for item in parsed_schema],
-            [item.to_dict() for item in parsed_default],
-        )
-        question = parsed_default[0]
+        self.assertEqual([q.to_dict() for q in parsed_schema], [q.to_dict() for q in default_questions()])
+        question = next(q for q in parsed_schema if q.id == "length")
         self.assertEqual(question.id, "length")
         self.assertEqual(question.instructions, DEFAULT_LENGTH_INSTRUCTIONS)
         by_id = {option.id: option for option in question.options}
@@ -197,7 +196,7 @@ class DecisionConfigTests(unittest.TestCase):
         self.assertIn("回退到默认长短问题", warning or "")
         self.assertEqual([item.id for item in questions], ["length"])
         settings = PluginSettings({"decision_questions": "[[[invalid"})
-        self.assertEqual([item.id for item in settings.decision_questions], ["length"])
+        self.assertEqual([q.id for q in settings.decision_questions], [q.id for q in default_questions()])
         self.assertIsNotNone(settings.decision_questions_warning)
 
     def test_empty_array_is_valid(self) -> None:
@@ -234,11 +233,13 @@ class DecisionConfigTests(unittest.TestCase):
             },
         ]
         questions, warning = parse_decision_questions(payload)
-        self.assertIsNotNone(warning)
-        self.assertEqual([item.id for item in questions], ["tone"])
-        questions, error = parse_decision_questions(payload, strict=True)
-        self.assertEqual(questions, [])
-        self.assertIn("保留", error or "")
+        self.assertIn("保留 ID", warning)
+        self.assertEqual([q.id for q in questions], ["tone"])
+        effective, warning = load_questions(payload)
+        self.assertEqual(next(q for q in effective if q.id == "action").role, "action")
+        effective, warning = load_questions({"version": 2, "questions": payload}, strict=True)
+        self.assertIsNone(warning)
+        self.assertEqual(next(q for q in effective if q.id == "action").role, "answer")
 
     def test_choice_needs_two_options(self) -> None:
         payload = [
@@ -280,7 +281,7 @@ class DecisionConfigTests(unittest.TestCase):
                 "choice_temperature": 1.0,
                 "decision_questions": dump_decision_questions(
                     [
-                        CustomDecisionQuestion(
+                        DecisionQuestion(
                             id="length",
                             type="choice",
                             instructions="回复长短？",
@@ -311,7 +312,7 @@ class DecisionConfigTests(unittest.TestCase):
 
     def test_option_weights_roundtrip_and_invalid_weights_are_rejected(self) -> None:
         questions = default_decision_questions() + [
-            CustomDecisionQuestion(
+            DecisionQuestion(
                 id="followup", type="boolean", instructions="要追问吗？",
                 true_weight=3.0, false_weight=0.5,
             )
@@ -396,7 +397,7 @@ class DecisionConfigTests(unittest.TestCase):
             self.assertNotIn("short", result.raw["length"]["selection_probabilities"])
 
     def test_weighted_boolean_uses_selected_hint(self) -> None:
-        question = CustomDecisionQuestion(
+        question = DecisionQuestion(
             id="followup", type="boolean", instructions="要追问吗？",
             true_session_hint="可以追问", false_session_hint="不用追问",
             true_weight=3.0,
@@ -494,18 +495,13 @@ class DecisionConfigTests(unittest.TestCase):
 
     def test_build_questions_includes_custom_and_keeps_builtin(self) -> None:
         configured = default_decision_questions() + [
-            CustomDecisionQuestion(
+            DecisionQuestion(
                 id="ask_followup",
                 type="boolean",
                 instructions="要不要追问一句？",
                 true_session_hint="可以自然追问一句。",
             ),
-            CustomDecisionQuestion(
-                id="use_meme",
-                type="boolean",
-                instructions="这不该覆盖内置表情问题",
-            ),
-            CustomDecisionQuestion(
+            DecisionQuestion(
                 id="disabled_tone",
                 type="choice",
                 instructions="已停用",
@@ -528,7 +524,7 @@ class DecisionConfigTests(unittest.TestCase):
                 )
             ],
             [{"id": "cat", "description": "微笑的猫"}],
-            configured,
+            default_questions(configured),
         )
         self.assertIn("action", questions)
         self.assertIn("target_message_id", questions)
@@ -549,7 +545,7 @@ class DecisionConfigTests(unittest.TestCase):
                 "decision_questions": dump_decision_questions(
                     default_decision_questions()
                     + [
-                        CustomDecisionQuestion(
+                        DecisionQuestion(
                             id="tone",
                             type="choice",
                             instructions="语气？",
@@ -566,7 +562,7 @@ class DecisionConfigTests(unittest.TestCase):
                                 ),
                             ],
                         ),
-                        CustomDecisionQuestion(
+                        DecisionQuestion(
                             id="ask_followup",
                             type="boolean",
                             instructions="要不要追问？",
@@ -682,13 +678,6 @@ class DecisionConfigTests(unittest.TestCase):
             [item.to_dict() for item in loaded],
             [item.to_dict() for item in original],
         )
-
-    def test_reserved_ids_constant(self) -> None:
-        self.assertEqual(
-            RESERVED_QUESTION_IDS,
-            {"action", "target_message_id", "use_meme", "meme_id"},
-        )
-
 
 if __name__ == "__main__":
     unittest.main()

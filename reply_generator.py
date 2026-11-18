@@ -3,16 +3,16 @@
 from __future__ import annotations
 
 import json
-
-from astrbot.api import logger
-from astrbot.api.event import MessageChain
-from astrbot.api.message_components import Image, Reply
-from astrbot.api.provider import ProviderRequest
-from astrbot.core.agent.message import TextPart
-
 from pathlib import Path
 from typing import Protocol
 
+from astrbot.api import logger
+from astrbot.api.event import MessageChain
+from astrbot.api.message_components import Plain, Reply
+from astrbot.api.provider import ProviderRequest
+from astrbot.core.agent.message import TextPart
+
+from .decision_tools import meme_chain, run_tools, send_chain, skip_tools
 from .models import DecisionResult, normalize_action
 
 
@@ -37,26 +37,6 @@ def apply_session_hints(req: ProviderRequest, decision: DecisionResult) -> None:
         return
     hint = TextPart(text=f"<quick_decision>\n{text}\n</quick_decision>").mark_as_temp()
     req.extra_user_content_parts.append(hint)
-
-
-def meme_component(resolver: ImageResolver, decision: DecisionResult):
-    if not decision.use_meme or not decision.meme_id:
-        return None
-    path = resolver.resolve_image(decision.meme_id)
-    if path is None:
-        logger.info("决策选择的表情包不可用，将退回纯文字：%s", decision.meme_id)
-        return None
-    return Image.fromFileSystem(str(path))
-
-
-def append_meme_to_chain(
-    chain: list, resolver: ImageResolver, decision: DecisionResult
-) -> bool:
-    component = meme_component(resolver, decision)
-    if component is None:
-        return False
-    chain.append(component)
-    return True
 
 
 def build_send_chain(
@@ -84,9 +64,7 @@ def build_send_chain(
 
 def build_meme_chain(resolver: ImageResolver, decision: DecisionResult) -> MessageChain:
     """构造不含文字、默认不引用的独立表情消息；最多一张。缺图时为空链。"""
-    chain = MessageChain()
-    append_meme_to_chain(chain.chain, resolver, decision)
-    return chain
+    return meme_chain(resolver, decision.meme_id if decision.use_meme else None)
 
 
 def take_event_decision(event) -> DecisionResult | None:
@@ -120,33 +98,6 @@ def official_text_was_sent(event) -> bool:
         if str(getattr(comp, "text", "") or "").strip()
     ).strip()
     return bool(text)
-
-
-async def _send_chain(context, umo: str, chain: MessageChain) -> bool:
-    if not chain.chain:
-        return False
-    try:
-        sent = await context.send_message(umo, chain)
-    except Exception:
-        logger.exception("向会话 %s 发送消息失败", umo)
-        return False
-    return sent is not False
-
-
-async def send_meme_followup(
-    context,
-    *,
-    umo: str,
-    resolver: ImageResolver,
-    decision: DecisionResult,
-) -> bool:
-    """在文字已经发出后，发送最多一张独立表情；不引用，失败不重试以免双图。"""
-    if not decision.use_meme or not decision.meme_id:
-        return False
-    chain = build_meme_chain(resolver, decision)
-    if not chain.chain:
-        return False
-    return await _send_chain(context, umo, chain)
 
 
 def prepare_official_result_chain(
@@ -183,27 +134,35 @@ def strip_reply_components(chain: list | None) -> None:
     chain[:] = [comp for comp in chain if not _is_reply_component(comp)]
 
 
-def install_direct_send_send_guard(event) -> None:
-    """在实际发送时去掉引用。
-
-    官方 ResultDecorateStage 会在 on_decorating_result 钩子返回之后，才把
-    reply_with_quote 的 Reply 插到链首。只在钩子里删一次不够，必须拦在 send。
-    """
-    if getattr(event, "_qd_direct_send_guard", False):
+def install_group_quote_guard(event, target_id: str | None = None) -> None:
+    """官方在装饰钩子之后加引用，在实际发送时处理最终的消息链。"""
+    if getattr(event, "_qd_group_quote_guard", False):
         return
     original = getattr(event, "send", None)
     if not callable(original):
         return
+    result = event.get_result()
+    quoted = False
 
-    async def _send_without_quote(message, *args, **kwargs):
-        strip_reply_components(getattr(message, "chain", None))
+    async def send(message, *args, **kwargs):
+        nonlocal quoted
+        chain = getattr(message, "chain", None)
+        if target_id is None:
+            strip_reply_components(chain)
+        elif event.get_result() is result and chain and any(
+            isinstance(comp, Plain) and comp.text.strip() for comp in chain
+        ):
+            strip_reply_components(chain)
+            if not quoted:
+                chain.insert(0, Reply(id=target_id))
+                quoted = True
         return await original(message, *args, **kwargs)
 
     try:
-        event.send = _send_without_quote
-        event._qd_direct_send_guard = True
+        event.send = send
+        event._qd_group_quote_guard = True
     except Exception:  # noqa: BLE001
-        logger.debug("无法为当前事件安装直接发送守卫，将只去掉装饰阶段已有的引用")
+        logger.debug("当前事件不支持在发送时调整群聊引用")
 
 
 async def after_official_text_sent(
@@ -225,6 +184,9 @@ async def after_official_text_sent(
     if dry_run or not decision.should_speak():
         return False
     if not official_text_was_sent(event):
+        skip_tools(decision, "正文未确认发送")
+        return False
+    if not any(call.status == "planned" for call in decision.tool_calls.values()):
         return False
     from .official_segment import OfficialSegmenter, platform_name_from_event
 
@@ -237,7 +199,7 @@ async def after_official_text_sent(
     platform_name = platform_name_from_event(event)
     if segmenter.should_delay(is_llm_result=True, platform_name=platform_name):
         await segmenter.sleep(await segmenter.interval_for_image())
-    return await send_meme_followup(
+    return await run_tools(
         context,
         umo=event.unified_msg_origin,
         resolver=resolver,
@@ -394,17 +356,20 @@ async def send_decision_message(
         if not text_chain.chain:
             all_text_ok = False
             continue
-        if await _send_chain(context, umo, text_chain):
+        if await send_chain(context, umo, text_chain):
             any_text_sent = True
             if sent_texts is not None:
                 sent_texts.append(seg)
         else:
             all_text_ok = False
     if not any_text_sent or not all_text_ok:
+        skip_tools(decision, "正文未全部发送")
         return any_text_sent
+    if not any(call.status == "planned" for call in decision.tool_calls.values()):
+        return True
     if delay:
         await segmenter.sleep(await segmenter.interval_for_image())
-    await send_meme_followup(
+    await run_tools(
         context,
         umo=umo,
         resolver=resolver,

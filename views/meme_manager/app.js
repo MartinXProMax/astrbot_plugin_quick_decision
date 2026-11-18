@@ -2,36 +2,6 @@ import { probabilityRows } from "./log-probabilities.mjs";
 
 const bridge = window.AstrBotPluginView;
 
-const DEFAULT_QUESTIONS = [
-  {
-    id: "length",
-    enabled: true,
-    type: "choice",
-    instructions: "如果发言，回复应该简短还是稍详细？",
-    options: [
-      {
-        id: "short",
-        criteria: "简短回复，一两句即可",
-        session_hint: "本轮回复策略：请给出简短、自然的回复，一两句即可。",
-        weight: 1,
-      },
-      {
-        id: "long",
-        criteria: "更完整、稍详细的回复",
-        session_hint: "本轮回复策略：请给出稍详细、完整的回复，但仍保持自然。",
-        weight: 1,
-      },
-    ],
-  },
-];
-
-const RESERVED_IDS = new Set([
-  "action",
-  "target_message_id",
-  "use_meme",
-  "meme_id",
-]);
-
 const SCENE_LABELS = {
   group_passive: "群聊",
   private_passive: "私聊",
@@ -124,10 +94,6 @@ function autosize(el) {
   el.style.height = `${el.scrollHeight + 2}px`;
 }
 
-function cloneDefaultQuestions() {
-  return JSON.parse(JSON.stringify(DEFAULT_QUESTIONS));
-}
-
 function nextId(prefix, used) {
   let index = 1;
   while (used.has(`${prefix}${index}`)) index += 1;
@@ -150,8 +116,8 @@ function normalizeAction(action) {
 
 const state = {
   questions: [],
-  reservedIds: new Set(RESERVED_IDS),
-  saved: { context: "", questions: cloneDefaultQuestions() },
+  defaults: [], roles: {}, tools: {},
+  saved: { context: "", questions: [] },
   savedSnapshot: "",
   saving: false,
   freshIndex: -1,
@@ -166,6 +132,12 @@ function normalizeQuestion(raw) {
     type,
     instructions: String(raw?.instructions || ""),
     options: [],
+    role: raw?.role || "answer",
+    use_threshold: !!raw?.use_threshold,
+    ask_private: !!raw?.ask_private,
+    proactive_instructions: raw?.proactive_instructions || "",
+    proactive_none_criteria: raw?.proactive_none_criteria || "",
+    true_tool: raw?.true_tool || "", false_tool: raw?.false_tool || "",
     true_session_hint: String(raw?.true_session_hint || ""),
     false_session_hint: String(raw?.false_session_hint || ""),
     true_weight: raw?.true_weight ?? 1,
@@ -177,7 +149,7 @@ function normalizeQuestion(raw) {
       id: String(option?.id || "").trim(),
       criteria: String(option?.criteria || ""),
       session_hint: String(option?.session_hint || ""),
-      weight: option?.weight ?? 1,
+      weight: option?.weight ?? 1, tool: option?.tool || "",
     }));
     ensureTwoOptions(question);
   }
@@ -196,12 +168,13 @@ function ensureTwoOptions(question) {
 
 function collectQuestionsFromForm() {
   return state.questions.map((question) => {
+    const common = {id: question.id.trim(), role: question.role, enabled: question.enabled,
+      type: question.type, instructions: question.instructions, use_threshold: question.use_threshold};
+    if (question.role === "action") Object.assign(common, {ask_private: question.ask_private,
+      proactive_instructions: question.proactive_instructions, proactive_none_criteria: question.proactive_none_criteria});
     if (question.type === "boolean") {
       return {
-        id: question.id.trim(),
-        enabled: Boolean(question.enabled),
-        type: "boolean",
-        instructions: question.instructions,
+        ...common, true_tool: question.true_tool, false_tool: question.false_tool,
         true_session_hint: question.true_session_hint,
         false_session_hint: question.false_session_hint,
         true_weight: question.true_weight,
@@ -209,15 +182,12 @@ function collectQuestionsFromForm() {
       };
     }
     return {
-      id: question.id.trim(),
-      enabled: Boolean(question.enabled),
-      type: "choice",
-      instructions: question.instructions,
+      ...common,
       options: (question.options || []).map((option) => ({
         id: String(option.id || "").trim(),
         criteria: option.criteria,
         session_hint: option.session_hint,
-        weight: option.weight,
+        weight: option.weight, tool: option.tool || "",
       })),
     };
   });
@@ -256,26 +226,6 @@ function updateDirty() {
 
 // ---------- 判断问题 ----------
 
-function renderBuiltinQuestions(questions) {
-  const root = $("builtin-questions");
-  if (!Array.isArray(questions) || !questions.length) {
-    root.replaceChildren(h("p", { class: "hint" }, "未能读取内置题面，请重载插件后刷新。"));
-    return;
-  }
-  root.replaceChildren(...questions.map(({ id, title, variants }) =>
-    h("details", null,
-      h("summary", null, title, " ", h("code", null, id)),
-      ...variants.map(({ when, prompt, options, note }) => h("div", { class: "builtin-variant" },
-        h("strong", null, when),
-        prompt && h("p", null, prompt),
-        options && h("ul", null, Object.entries(options).map(([key, label]) =>
-          h("li", null, h("code", null, key), "：", label))),
-        note && h("p", { class: "hint" }, note),
-      )),
-    )
-  ));
-}
-
 function renderQuestions(focus) {
   const root = $("questions");
   root.replaceChildren();
@@ -284,7 +234,7 @@ function renderQuestions(focus) {
       h(
         "li",
         { class: "questions-empty" },
-        "现在没有自定义问题，判断模型只回答上面的内置问题。可以点「添加问题」，比如加一个语气或要不要追问。",
+        "还没有问题。可以添加问题，也可以恢复默认问题。",
       ),
     );
   } else {
@@ -336,6 +286,7 @@ function renderQuestion(question, qIndex) {
         {
           type: "button",
           "aria-pressed": String(question.type === type),
+          disabled: question.role !== "answer" && type === "boolean",
           onclick: () => {
             if (question.type === type) return;
             question.type = type;
@@ -413,8 +364,31 @@ function renderQuestion(question, qIndex) {
     }),
   );
 
-  const body = h("div", { class: "q-body" }, instructions);
+  const selectRole = selectField("问题用途", state.roles, question.role, (value) => {
+    question.role = value;
+    if (value !== "answer") {
+      const preset = state.defaults.find(q => q.role === value);
+      question.type = "choice";
+      question.options = preset.options.map(o => ({...(question.options.find(old => old.id === o.id) || o)}));
+    }
+    renderQuestions(); updateDirty();
+  });
+  const body = h("div", { class: "q-body" }, selectRole, instructions);
+  body.append(h("label", null, h("input", {type: "checkbox", checked: question.use_threshold,
+    onchange: e => { question.use_threshold = e.target.checked; }}), " 使用插件判断阈值"));
+  if (question.role === "action") {
+    for (const [key, label] of [["proactive_instructions", "冷场时的判断标准"], ["proactive_none_criteria", "冷场时保持沉默的标准"]]) {
+      body.append(h("label", {class: "q-instr"}, label, h("textarea", {value: question[key], rows: 1,
+        placeholder: "留空沿用上方标准", oninput: e => { question[key] = e.target.value; }})));
+    }
+    body.append(h("label", null, h("input", {type: "checkbox", checked: question.ask_private,
+      onchange: e => { question.ask_private = e.target.checked; }}), " 私聊也判断是否发言（关闭时直接回复）"));
+  }
+  if (["target", "meme"].includes(question.role)) body.append(h("p", {class: "hint"},
+    "* 代表当轮每一个候选项，可用 {描述} 引用消息摘要或表情描述。"));
   if (question.type === "boolean") {
+    body.append(h("p", {class: "hint"},
+      "勾选插件阈值时，两侧权重均为 1 才按阈值判断。任一权重不为 1 时，忽略阈值并选择加权概率最高的一侧。两种情况下都不按温度抽样。"));
     body.append(renderBooleanLanes(question));
   } else {
     body.append(renderChoiceLanes(question, qIndex));
@@ -437,7 +411,7 @@ function laneHead(judgeText) {
     "div",
     { class: "lane-row lanes-head", "aria-hidden": "true" },
     h("span", { class: "lane-title is-judge" }, judgeText),
-    h("span", { class: "lane-title is-chat" }, "会话模型收到"),
+    h("span", { class: "lane-title is-chat" }, "选中后的提示与工具"),
   );
 }
 
@@ -454,6 +428,17 @@ function chatHint(value, label, onInput) {
 
 function arrow() {
   return h("span", { class: "opt-arrow", "aria-hidden": "true" }, icon("arrow"));
+}
+
+function selectField(label, choices, selected, change) {
+  const input = h("select", {"aria-label": label, onchange: e => change(e.target.value)},
+    Object.entries(choices).map(([key, text]) => h("option", {value: key}, text)));
+  input.value = selected;
+  return h("label", {class: "tool-select"}, label, " ", input);
+}
+
+function toolField(current, update) {
+  return selectField("调用工具", {"": "不调用", ...state.tools}, current || "", update);
 }
 
 function optionWeight(value, label, field, onInput) {
@@ -486,9 +471,9 @@ function renderBooleanLanes(question) {
         h("span", { class: "opt-fixed-text" }, text),
       ),
       arrow(),
-      chatHint(question[key] || "", `判断为「${fixed}」时告诉会话模型`, (value) => {
+      h("div", {class: "answer-effects"}, chatHint(question[key] || "", `判断为「${fixed}」时告诉会话模型`, (value) => {
         question[key] = value;
-      }),
+      }), toolField(question[key.replace("session_hint", "tool")], v => {question[key.replace("session_hint", "tool")] = v;})),
       h("div", { class: "opt-tools" }),
       optionWeight(question[weightKey], `「${fixed}」的选择权重`, weightKey, (value) => {
         question[weightKey] = value;
@@ -519,6 +504,7 @@ function renderChoiceLanes(question, qIndex) {
             type: "text",
             class: "opt-id mono",
             value: option.id,
+            readOnly: question.role !== "answer" || undefined,
             placeholder: "选项 ID",
             spellcheck: "false",
             autocomplete: "off",
@@ -541,9 +527,9 @@ function renderChoiceLanes(question, qIndex) {
           }),
         ),
         arrow(),
-        chatHint(option.session_hint || "", `选中选项 ${n} 时告诉会话模型`, (value) => {
+        h("div", {class: "answer-effects"}, chatHint(option.session_hint || "", `选中选项 ${n} 时告诉会话模型`, (value) => {
           option.session_hint = value;
-        }),
+        }), toolField(option.tool, v => {option.tool = v;})),
         h(
           "div",
           { class: "opt-tools" },
@@ -562,7 +548,7 @@ function renderChoiceLanes(question, qIndex) {
               renderQuestions();
               updateDirty();
             },
-            { disabled: options.length <= 2, danger: true },
+            { disabled: question.role !== "answer" || options.length <= 2, danger: true },
           ),
         ),
         optionWeight(option.weight, `选项 ${n} 的选择权重`, "opt-weight", (value) => {
@@ -588,7 +574,7 @@ function renderChoiceLanes(question, qIndex) {
     icon("plus"),
     "添加选项",
   );
-  return h("div", null, lanes, h("div", { class: "q-foot" }, addOption));
+  return h("div", null, lanes, question.role === "answer" && h("div", { class: "q-foot" }, addOption));
 }
 
 function moveOption(question, qIndex, oIndex, delta) {
@@ -605,9 +591,6 @@ function validate(questions) {
     const label = question.id || `第 ${q + 1} 个问题`;
     if (!question.id) {
       return { q, field: "id", message: `第 ${q + 1} 个问题还没有填写 ID` };
-    }
-    if (state.reservedIds.has(question.id) || RESERVED_IDS.has(question.id)) {
-      return { q, field: "id", message: `「${question.id}」是内置问题的 ID，请换一个` };
     }
     if (used.has(question.id)) {
       return { q, field: "id", message: `问题 ID「${question.id}」重复了` };
@@ -680,13 +663,11 @@ function fillForm(saved) {
 }
 
 function applyConfig(data, fallbackQuestions) {
-  renderBuiltinQuestions(data.builtin_questions);
-  if (Array.isArray(data.reserved_question_ids)) {
-    state.reservedIds = new Set(data.reserved_question_ids);
-  }
-  const questions = Array.isArray(data.decision_questions)
-    ? data.decision_questions
-    : fallbackQuestions || cloneDefaultQuestions();
+  if (data.version !== 2 || !Array.isArray(data.default_questions)) throw new Error("请重载插件并刷新页面");
+  state.defaults = data.default_questions;
+  state.roles = data.roles;
+  state.tools = data.tools;
+  const questions = data.decision_questions ?? fallbackQuestions;
   state.saved = {
     context: data.decision_custom_context || "",
     questions: JSON.parse(JSON.stringify(questions)),
@@ -711,6 +692,7 @@ async function loadDecisionConfig() {
 
 async function saveDecisionConfig() {
   const payload = {
+    version: 2,
     decision_custom_context: $("custom-context").value,
     decision_questions: collectQuestionsFromForm(),
   };
@@ -879,9 +861,7 @@ function renderProbabilityChart(id, answer) {
 function renderLog(item) {
   const action = normalizeAction(item.action);
   const time = splitTime(item.time);
-  const answers = item.custom_answers && typeof item.custom_answers === "object"
-    ? Object.entries(item.custom_answers)
-    : [];
+  const answers = Object.entries(item.answers || item.custom_answers || {});
   if (!answers.length && item.length) answers.push(["length", item.length]);
   const hints = Array.isArray(item.session_hints) ? item.session_hints.filter(Boolean) : [];
 
@@ -913,7 +893,9 @@ function renderLog(item) {
   const raw = item.raw && typeof item.raw === "object" && Object.keys(item.raw).length
     ? item.raw
     : null;
-  const detail = hints.length || raw || item.target_message_id || item.degraded
+  const calls = item.tool_calls || [];
+  const statusLabels = {planned: item.dry_run ? "试运行" : "未确认执行", executed: "已执行", skipped: "已跳过", failed: "失败", running: "执行中", interrupted: "已中断"};
+  const detail = calls.length || hints.length || raw || item.target_message_id || item.degraded
     ? h(
         "details",
         { class: "log-detail" },
@@ -922,6 +904,7 @@ function renderLog(item) {
           ? h("p", { class: "log-meta" }, "回复的消息：", h("code", null, item.target_message_id))
           : null,
         hints.length ? h("ul", { class: "log-hints" }, hints.map((text) => h("li", null, text))) : null,
+        ...calls.map(call => h("p", {class: "log-meta"}, `${call.name} · ${statusLabels[call.status] || call.status}`, call.sources?.length ? `（${call.sources.join("、")}）` : "", call.reason ? ` · ${call.reason}` : "")),
         !raw && item.degraded ? h("p", { class: "hint" }, "判断失败，本轮没有可展示的概率。") : null,
       )
     : null;
@@ -1001,7 +984,6 @@ async function reload() {
     try {
       await loadDecisionConfig();
     } catch (error) {
-      if (!state.loaded) renderBuiltinQuestions(null);
       setSaveState("error", `读取判断配置失败：${error.message}`);
     }
   } finally {
@@ -1024,7 +1006,7 @@ function resetRestoreButton() {
   window.clearTimeout(restoreTimer);
   const button = $("restore-default");
   button.classList.remove("is-confirm");
-  button.textContent = "恢复默认长短问题";
+  button.textContent = "恢复默认问题";
 }
 
 function onRestoreDefault() {
@@ -1032,7 +1014,7 @@ function onRestoreDefault() {
   if (!button.classList.contains("is-confirm")) {
     button.classList.add("is-confirm");
     button.textContent = "再点一次确认恢复";
-    setSaveState("notice", "确认后问题列表会换成默认长短问题，背景信息不受影响");
+    setSaveState("notice", "确认后问题列表会换成默认问题，背景信息不受影响");
     restoreTimer = window.setTimeout(() => {
       resetRestoreButton();
       setSaveState(isDirty() ? "dirty" : "clean");
@@ -1040,9 +1022,9 @@ function onRestoreDefault() {
     return;
   }
   resetRestoreButton();
-  state.questions = cloneDefaultQuestions().map(normalizeQuestion);
+  state.questions = state.defaults.map(normalizeQuestion);
   renderQuestions();
-  if (isDirty()) setSaveState("dirty", "已换成默认长短问题，保存后生效");
+  if (isDirty()) setSaveState("dirty", "已换成默认问题，保存后生效");
   else setSaveState("clean");
 }
 
@@ -1050,7 +1032,7 @@ function onAddQuestion() {
   const used = new Set(state.questions.map((item) => item.id));
   state.questions.push(
     normalizeQuestion({
-      id: nextId("custom_", used),
+      id: nextId("question_", used),
       enabled: true,
       type: "choice",
       instructions: "",
