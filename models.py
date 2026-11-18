@@ -150,6 +150,18 @@ class CustomDecisionQuestion:
 
 
 @dataclass
+class DecisionOutcome:
+    """单题评估结果；raw 保留旧日志所需的提供商及采样数据。"""
+
+    value: str | bool | None
+    status: Literal["ok", "missing", "invalid", "skipped", "fallback"] = "ok"
+    reason: str = ""
+    probabilities: dict[str, float] = field(default_factory=dict)
+    selection_probabilities: dict[str, float] = field(default_factory=dict)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class DecisionResult:
     """一次结构化判断的业务结果。"""
 
@@ -167,9 +179,17 @@ class DecisionResult:
     duration_ms: int = 0
     dry_run: bool = False
     official_llm: bool = False
+    outcomes: dict[str, DecisionOutcome] = field(default_factory=dict)
+
+    @property
+    def failed(self) -> bool:
+        return self.degraded or bool(self.error)
 
     def should_speak(self) -> bool:
-        return normalize_action(self.action) in {"reply", "proactive"} and not self.error
+        return not self.failed and normalize_action(self.action) in {
+            "reply",
+            "proactive",
+        }
 
 
 @dataclass

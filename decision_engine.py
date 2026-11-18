@@ -6,7 +6,8 @@ import math
 import random
 import time
 from collections.abc import Mapping
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Literal
 
 from astrbot.api import logger
 from astrbot.api.provider import (
@@ -22,8 +23,8 @@ from .models import (
     RESERVED_QUESTION_IDS,
     BufferedMessage,
     CustomDecisionQuestion,
+    DecisionOutcome,
     DecisionResult,
-    LengthType,
     SceneType,
     normalize_action,
 )
@@ -40,11 +41,26 @@ ACTION_CRITERIA_PROACTIVE = {
     "proactive": "现在适合在冷场后主动开口",
 }
 
+Question = DecisionBooleanQuestion | DecisionChoiceQuestion
+Binding = Literal["action", "target_message_id", "use_meme", "meme_id", "session_hint"]
+_MISSING = object()
 
-def _provider_kwargs(settings: PluginSettings) -> dict[str, str]:
-    if settings.decision_provider_id:
-        return {"provider_id": settings.decision_provider_id}
-    return {}
+
+@dataclass
+class DecisionSpec:
+    """固定本轮题目、选择规则及结果用途；question=None 表示本轮无需提问。"""
+
+    id: str
+    kind: Literal["choice", "boolean", "fixed"]
+    question: Question | None
+    binding: Binding
+    default: str | bool | None = None
+    threshold: float = 0.0
+    temperature: float = 0.0
+    allowed: frozenset[str] = frozenset()
+    option_weights: dict[str, float] = field(default_factory=dict)
+    session_hints: dict[str | bool, str] = field(default_factory=dict)
+    stage: str = "pre_reply"
 
 
 def _select_option(
@@ -77,53 +93,102 @@ def _select_option(
     return selected, distribution
 
 
-def _choice(
-    answer: object,
-    *,
-    threshold: float,
-    allowed: set[str],
-    default: str,
-    temperature: float = 0.0,
-    option_weights: Mapping[str, float] | None = None,
-) -> tuple[str, dict[str, Any]]:
-    raw: dict[str, Any] = {}
-    if not isinstance(answer, DecisionChoiceAnswer):
-        return default, raw
-    raw = {
-        "choice": answer.choice,
-        "probability": answer.probability,
-        "probabilities": dict(answer.probabilities),
-        "confidence": answer.confidence,
-    }
-    selected = answer.choice
-    selected_probability = answer.probability
-    option_weights = option_weights or {}
-    if temperature > 0.0 or any(weight != 1.0 for weight in option_weights.values()):
-        selected, distribution = _select_option(
-            {key: value for key, value in answer.probabilities.items() if key in allowed},
-            temperature=temperature,
-            option_weights=option_weights,
+def _evaluate_answer(spec: DecisionSpec, answer: object) -> DecisionOutcome:
+    outcome = DecisionOutcome(value=spec.default)
+    if spec.kind == "fixed":
+        outcome.status = "skipped"
+        outcome.reason = "private_passive_default_reply"
+        outcome.raw = {"choice": spec.default, "note": outcome.reason}
+        return outcome
+    if spec.question is None:
+        outcome.status, outcome.reason = "skipped", "not_asked"
+        return outcome
+    if answer is _MISSING:
+        outcome.status, outcome.reason = "missing", "missing_answer"
+        return outcome
+    is_choice = spec.kind == "choice"
+    raw = outcome.raw
+    if is_choice and isinstance(answer, DecisionChoiceAnswer):
+        raw.update(
+            choice=answer.choice,
+            probability=answer.probability,
+            probabilities=dict(answer.probabilities),
+            confidence=answer.confidence,
         )
+        outcome.probabilities = dict(answer.probabilities)
+        selected = answer.choice
+    elif not is_choice and isinstance(answer, DecisionBooleanAnswer):
+        raw["probability"] = answer.probability
+        outcome.probabilities = {
+            "true": answer.probability,
+            "false": 1.0 - answer.probability,
+        }
+        selected = "true" if answer.probability >= spec.threshold else "false"
+    else:
+        outcome.status, outcome.reason = "invalid", "answer_type"
+        return outcome
+    selected_probability = answer.probability
+    if spec.temperature > 0.0 or any(w != 1.0 for w in spec.option_weights.values()):
+        selected, distribution = _select_option(
+            {
+                key: value
+                for key, value in outcome.probabilities.items()
+                if key in spec.allowed
+            },
+            temperature=spec.temperature,
+            option_weights=spec.option_weights,
+        )
+        outcome.selection_probabilities = distribution
         raw.update(
             selected_choice=selected,
             selection_probabilities=distribution,
-            selection_temperature=temperature,
-            option_weights=dict(option_weights),
+            selection_temperature=spec.temperature,
+            option_weights=dict(spec.option_weights),
         )
         if selected is None:
-            return default, raw
-        selected_probability = answer.probabilities[selected]
-        raw["selected_probability"] = selected_probability
-    if selected in allowed and selected_probability >= threshold:
-        return selected, raw
-    return default, raw
+            outcome.status, outcome.reason = "invalid", "no_selectable_option"
+            return outcome
+        selected_probability = outcome.probabilities[selected]
+        if is_choice:
+            raw["selected_probability"] = selected_probability
+    if selected not in spec.allowed:
+        outcome.status, outcome.reason = "invalid", "unknown_option"
+    elif is_choice and not selected_probability >= spec.threshold:
+        outcome.status, outcome.reason = "fallback", "below_threshold"
+    else:
+        outcome.value = selected if is_choice else selected == "true"
+    return outcome
 
 
-def _boolean(answer: object, *, threshold: float) -> tuple[bool, dict[str, Any]]:
-    if not isinstance(answer, DecisionBooleanAnswer):
-        return False, {}
-    raw = {"probability": answer.probability}
-    return answer.probability >= threshold, raw
+def _evaluate_answers(
+    specs: list[DecisionSpec], answers: Mapping[str, object]
+) -> dict[str, DecisionOutcome]:
+    # 旧解析器最后才采样回复目标；保留顺序，避免同一随机输入下选中不同选项。
+    ordered = [spec for spec in specs if spec.binding != "target_message_id"]
+    ordered.extend(spec for spec in specs if spec.binding == "target_message_id")
+    return {
+        spec.id: _evaluate_answer(spec, answers.get(spec.id, _MISSING))
+        for spec in ordered
+    }
+
+
+async def evaluate_specs(
+    decision,
+    specs: list[DecisionSpec],
+    *,
+    state: dict[str, Any],
+    provider_id: str = "",
+) -> dict[str, DecisionOutcome]:
+    """批量提问并评估；批次异常交由调用者按原场景规则降级。"""
+    questions = {spec.id: spec.question for spec in specs if spec.question is not None}
+    answers = {}
+    if questions:
+        answers = await decision.ask(
+            questions,
+            state=state,
+            **({"provider_id": provider_id} if provider_id else {}),
+        )
+    return _evaluate_answers(specs, dict(answers))
 
 
 def build_state(
@@ -227,72 +292,135 @@ def _build_questions(
     return questions
 
 
-def _parse_custom_answers(
-    answers: dict[str, object],
-    configured: list[CustomDecisionQuestion],
-    raw: dict[str, Any],
+def _build_specs(
+    questions: Mapping[str, Question],
     *,
-    temperature: float,
-) -> tuple[dict[str, Any], list[str], LengthType | None]:
-    """解析用户配置的问题，收集会话提示；不强制用阈值改写选项。"""
-    custom_answers: dict[str, Any] = {}
-    session_hints: list[str] = []
-    length: LengthType | None = None
-    for question in configured:
-        if not question.enabled:
+    scene: SceneType,
+    settings: PluginSettings,
+) -> list[DecisionSpec]:
+    """将内置规则和旧自定义配置映射到同一种题目定义，并固定候选及提示。"""
+    threshold = settings.choice_threshold
+    temperature = settings.choice_temperature
+    private_default = scene == "private_passive"
+    action_allowed = (
+        {"none", "reply", "join"} if scene == "group_passive" else {"none", "proactive"}
+    )
+    specs = [
+        DecisionSpec(
+            id="action",
+            kind="fixed" if private_default else "choice",
+            question=questions.get("action"),
+            binding="action",
+            default="reply" if private_default else "none",
+            threshold=threshold,
+            temperature=temperature,
+            allowed=frozenset(action_allowed),
+        )
+    ]
+    target = questions.get("target_message_id")
+    specs.append(
+        DecisionSpec(
+            id="target_message_id",
+            kind="choice",
+            question=target,
+            binding="target_message_id",
+            default="latest",
+            temperature=temperature,
+            allowed=frozenset(target.criteria if target is not None else {"latest"}),
+        )
+    )
+    for item in settings.decision_questions:
+        question = questions.get(item.id)
+        if not item.enabled or item.id in RESERVED_QUESTION_IDS or question is None:
             continue
-        answer = answers.get(question.id)
-        if question.type == "choice":
-            allowed = {option.id for option in question.options}
-            chosen, chosen_raw = _choice(
-                answer,
-                threshold=0.0,  # 自定义选择题不使用 choice_threshold
-                allowed=allowed,
-                default="",
+        if item.type == "choice":
+            weights = {option.id: option.weight for option in item.options}
+            hints = {option.id: option.session_hint for option in item.options}
+            allowed = frozenset(question.criteria)
+        else:
+            weights = {"true": item.true_weight, "false": item.false_weight}
+            hints = {True: item.true_session_hint, False: item.false_session_hint}
+            allowed = frozenset({"true", "false"})
+        specs.append(
+            DecisionSpec(
+                id=item.id,
+                kind=item.type,
+                question=question,
+                binding="session_hint",
+                threshold=0.5 if item.type == "boolean" else 0.0,
                 temperature=temperature,
-                option_weights={option.id: option.weight for option in question.options},
+                allowed=allowed,
+                option_weights=weights,
+                session_hints=hints,
             )
-            if chosen_raw:
-                raw[question.id] = chosen_raw
-            if not chosen:
+        )
+    meme_question = questions.get("meme_id")
+    specs.extend(
+        [
+            DecisionSpec(
+                id="use_meme",
+                kind="boolean",
+                question=questions.get("use_meme"),
+                binding="use_meme",
+                default=False,
+                threshold=threshold,
+                allowed=frozenset({"true", "false"}),
+            ),
+            DecisionSpec(
+                id="meme_id",
+                kind="choice",
+                question=meme_question,
+                binding="meme_id",
+                default="none",
+                threshold=threshold,
+                temperature=temperature,
+                allowed=frozenset(
+                    meme_question.criteria if meme_question is not None else {"none"}
+                ),
+            ),
+        ]
+    )
+    return specs
+
+
+def _assemble_result(
+    specs: list[DecisionSpec],
+    outcomes: dict[str, DecisionOutcome],
+    *,
+    scene: SceneType,
+) -> DecisionResult:
+    """统一结果只投影一次；旧调用者、提示注入和发送路径继续读取兼容字段。"""
+    result = DecisionResult(scene=scene, outcomes=outcomes)
+    by_id = {spec.id: spec for spec in specs}
+    for question_id, outcome in outcomes.items():
+        spec = by_id[question_id]
+        binding, value = spec.binding, outcome.value
+        if (
+            binding in {"action", "use_meme"}
+            or outcome.raw
+            or (binding == "meme_id" and outcome.status not in {"missing", "skipped"})
+        ):
+            result.raw[question_id] = outcome.raw
+        if binding == "session_hint":
+            if outcome.status != "ok":
                 continue
-            custom_answers[question.id] = chosen
-            if question.id == "length" and chosen in {"short", "long"}:
-                length = chosen  # type: ignore[assignment]
-            hint_map = {option.id: option.session_hint for option in question.options}
-            hint = (hint_map.get(chosen) or "").strip()
+            result.custom_answers[question_id] = value
+            if question_id == "length" and value in {"short", "long"}:
+                result.length = value
+            hint = spec.session_hints.get(value, "").strip()
             if hint:
-                session_hints.append(hint)
-        elif question.type == "boolean":
-            if not isinstance(answer, DecisionBooleanAnswer):
-                continue
-            chosen_raw = {"probability": answer.probability}
-            raw[question.id] = chosen_raw
-            # 是否题以 0.5 为界，不复用表情包的 choice_threshold。
-            value = answer.probability >= 0.5
-            weights = {"true": question.true_weight, "false": question.false_weight}
-            if temperature > 0.0 or any(weight != 1.0 for weight in weights.values()):
-                selected, distribution = _select_option(
-                    {"true": answer.probability, "false": 1.0 - answer.probability},
-                    temperature=temperature,
-                    option_weights=weights,
-                )
-                chosen_raw.update(
-                    selected_choice=selected,
-                    selection_probabilities=distribution,
-                    selection_temperature=temperature,
-                    option_weights=weights,
-                )
-                if selected is None:
-                    continue
-                value = selected == "true"
-            custom_answers[question.id] = value
-            hint = (
-                question.true_session_hint if value else question.false_session_hint
-            ).strip()
-            if hint:
-                session_hints.append(hint)
-    return custom_answers, session_hints, length
+                result.session_hints.append(hint)
+        elif binding == "action":
+            result.action = normalize_action(value)
+        elif binding == "target_message_id":
+            result.target_message_id = value if value != "latest" else None
+        elif binding == "use_meme":
+            result.use_meme = bool(value)
+        elif binding == "meme_id":
+            result.meme_id = value if value != "none" else None
+    if not result.use_meme or result.meme_id is None:
+        result.use_meme, result.meme_id = False, None
+    return result
 
 
 def _parse_answers(
@@ -303,85 +431,22 @@ def _parse_answers(
     memes: list[dict[str, str]],
     target_message_ids: set[str] | None = None,
 ) -> DecisionResult:
-    threshold = settings.choice_threshold
-    raw: dict[str, Any] = {}
-    if scene == "private_passive":
-        action = "reply"
-        action_raw = {"choice": "reply", "note": "private_passive_default_reply"}
-    else:
-        allowed = (
-            # 提问已改为 none/reply；join 仅用于兼容尚未改写的旧答案。
-            {"none", "reply", "join"}
-            if scene == "group_passive"
-            else {"none", "proactive"}
-        )
-        action, action_raw = _choice(
-            answers.get("action"),
-            threshold=threshold,
-            allowed=allowed,
-            default="none",
-            temperature=settings.choice_temperature,
-        )
-        action = normalize_action(action)
-    raw["action"] = action_raw
-    custom_answers, session_hints, length = _parse_custom_answers(
-        answers,
-        settings.decision_questions,
-        raw,
-        temperature=settings.choice_temperature,
-    )
-    use_meme, use_raw = _boolean(answers.get("use_meme"), threshold=threshold)
-    raw["use_meme"] = use_raw
-    meme_id: str | None = None
-    if "meme_id" in answers:
-        chosen, meme_raw = _choice(
-            answers.get("meme_id"),
-            threshold=threshold,
-            allowed={meme["id"] for meme in memes} | {"none"},
-            default="none",
-            temperature=settings.choice_temperature,
-        )
-        raw["meme_id"] = meme_raw
-        if chosen != "none":
-            meme_id = chosen
-    if not use_meme:
-        meme_id = None
-    if meme_id is None:
-        use_meme = False
-    target: str | None = None
-    target_answer = answers.get("target_message_id")
-    if isinstance(target_answer, DecisionChoiceAnswer):
-        allowed_targets = {"latest"}
-        if target_message_ids is None:
-            allowed_targets.update(target_answer.probabilities)
-            allowed_targets.add(target_answer.choice)
-        else:
-            allowed_targets.update(target_message_ids)
-        chosen_target, target_raw = _choice(
-            target_answer,
-            threshold=0.0,
-            allowed=allowed_targets,
-            default="latest",
-            temperature=settings.choice_temperature,
-        )
-        raw["target_message_id"] = target_raw
-        if (
-            chosen_target
-            and chosen_target != "latest"
-            and (target_message_ids is None or chosen_target in target_message_ids)
-        ):
-            target = chosen_target
-    return DecisionResult(
-        action=action,  # type: ignore[arg-type]
-        target_message_id=target,
-        length=length,
-        use_meme=bool(use_meme and meme_id),
-        meme_id=meme_id if use_meme else None,
-        scene=scene,
-        raw=raw,
-        custom_answers=custom_answers,
-        session_hints=session_hints,
-    )
+    """保留本地解析入口；实际调用通过 evaluate_specs 使用提问时的同一快照。"""
+    questions = _build_questions(scene, [], memes, settings.decision_questions)
+    if scene == "group_passive":
+        allowed = {"latest"}
+        target_answer = answers.get("target_message_id")
+        if target_message_ids is not None:
+            allowed.update(target_message_ids)
+        elif isinstance(target_answer, DecisionChoiceAnswer):
+            allowed.update(target_answer.probabilities)
+            allowed.add(target_answer.choice)
+        if len(allowed) >= 2:
+            questions["target_message_id"] = DecisionChoiceQuestion(
+                instructions="回复目标", criteria={mid: mid for mid in allowed}
+            )
+    specs = _build_specs(questions, scene=scene, settings=settings)
+    return _assemble_result(specs, _evaluate_answers(specs, answers), scene=scene)
 
 
 async def ask_decision(
@@ -407,40 +472,34 @@ async def ask_decision(
         custom_context=settings.decision_custom_context,
     )
     questions = _build_questions(scene, messages, memes, settings.decision_questions)
+    specs = _build_specs(questions, scene=scene, settings=settings)
     try:
-        answers = await context.decision.ask(
-            questions,
+        outcomes = await evaluate_specs(
+            context.decision,
+            specs,
             state=state,
-            **_provider_kwargs(settings),
+            provider_id=settings.decision_provider_id,
         )
-        result = _parse_answers(
-            dict(answers),
-            scene=scene,
-            settings=settings,
-            memes=memes,
-            target_message_ids={
-                item.message_id
-                for item in messages[-8:]
-                if item.role == "user" and item.message_id
-            },
-        )
-    except DecisionError as exc:
-        logger.warning("判断提供商调用失败：%s", exc)
-        result = DecisionResult(
-            action="none" if scene != "private_passive" else "reply",
-            use_meme=False,
-            meme_id=None,
-            scene=scene,
-            error=str(exc),
-            degraded=True,
-        )
+        result = _assemble_result(specs, outcomes, scene=scene)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("判断过程出现未预期异常")
+        error = str(exc) or type(exc).__name__
+        if isinstance(exc, DecisionError):
+            logger.warning("判断提供商调用失败：%s", error)
+        else:
+            logger.exception("判断过程出现未预期异常")
         result = DecisionResult(
             action="none" if scene != "private_passive" else "reply",
             scene=scene,
-            error=str(exc),
+            error=error,
             degraded=True,
+            outcomes={
+                spec.id: _evaluate_answer(spec, _MISSING)
+                if spec.question is None
+                else DecisionOutcome(
+                    value=spec.default, status="fallback", reason="batch_error"
+                )
+                for spec in specs
+            },
         )
     result.duration_ms = int((time.monotonic() - started) * 1000)
     result.dry_run = settings.dry_run

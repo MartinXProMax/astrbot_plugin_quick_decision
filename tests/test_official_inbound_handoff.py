@@ -9,8 +9,10 @@ import sys
 import tempfile
 import types
 import unittest
+from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -756,6 +758,39 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(req)
         self.assertTrue(ev.is_stopped())
         self.assertIsNone(ev.get_extra("quick_decision"))
+
+    async def test_real_decision_failure_preserves_private_official_fallback(
+        self,
+    ) -> None:
+        from astrbot_plugin_quick_decision.decision_engine import ask_decision
+
+        self.main_mod.ask_decision = ask_decision
+        for private, dry_run, message in product(
+            (True, False), (True, False), ("", "判断超时")
+        ):
+            with self.subTest(private=private, dry_run=dry_run, message=message):
+                self.plugin.context.decision = SimpleNamespace(
+                    ask=AsyncMock(side_effect=TimeoutError(message))
+                )
+                self.plugin.config["dry_run"] = dry_run
+                kind = "FriendMessage" if private else "GroupMessage"
+                ev = FakeEvent(
+                    umo=f"aiocqhttp:{kind}:failure-{dry_run}-{bool(message)}",
+                    is_private=private,
+                    at_or_wake=True,
+                    message_id="failure",
+                )
+                returned = await self.plugin.on_chat_message(ev)
+                self.assertIsNone(returned)
+                self.assertEqual(ev.is_stopped(), dry_run or not private)
+                self.assertFalse(ev.call_llm)
+                self.assertIsNone(ev.get_extra("quick_decision"))
+                runtime = self.plugin.sessions.get(ev.unified_msg_origin)
+                self.assertIsNone(runtime.pending_pipeline)
+                self.assertFalse(runtime.deciding)
+                self.assertEqual(runtime.last_decision.error, message or "TimeoutError")
+                self.assertFalse(runtime.last_decision.should_speak())
+                self.assertTrue(runtime.last_decision.outcomes)
 
     async def test_on_llm_request_attaches_temp_hints(self) -> None:
         ev = FakeEvent(text="hi", at_or_wake=False, message_id="h1", timestamp=4)

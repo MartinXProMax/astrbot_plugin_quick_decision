@@ -176,10 +176,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         result.dry_run = settings.dry_run
         runtime.last_decision = result
 
-        if result.error:
+        if result.failed:
             # 先落盘再返回，此时尚未决定是否走官方流水线。
             await self._log_decision(profile, result)
-            if scene == "private_passive":
+            if scene == "private_passive" and not settings.dry_run:
                 logger.warning("私聊判断失败，将退回官方纯文字回复：%s", result.error)
                 return
             event.stop_event()
@@ -455,7 +455,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         result.dry_run = settings.dry_run
         runtime.last_decision = result
         await self._log_decision(profile, result)
-        if result.error or result.action != "proactive":
+        if result.failed or result.action != "proactive":
             return
         if settings.dry_run:
             logger.info("试运行：冷场判断为可以主动开口，但不会发送：%s", profile.umo)
