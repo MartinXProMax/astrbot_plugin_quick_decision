@@ -254,6 +254,26 @@ function updateDirty() {
 
 // ---------- 判断问题 ----------
 
+function renderBuiltinQuestions(questions) {
+  const root = $("builtin-questions");
+  if (!Array.isArray(questions) || !questions.length) {
+    root.replaceChildren(h("p", { class: "hint" }, "未能读取内置题面，请重载插件后刷新。"));
+    return;
+  }
+  root.replaceChildren(...questions.map(({ id, title, variants }) =>
+    h("details", null,
+      h("summary", null, title, " ", h("code", null, id)),
+      ...variants.map(({ when, prompt, options, note }) => h("div", { class: "builtin-variant" },
+        h("strong", null, when),
+        prompt && h("p", null, prompt),
+        options && h("ul", null, Object.entries(options).map(([key, label]) =>
+          h("li", null, h("code", null, key), "：", label))),
+        note && h("p", { class: "hint" }, note),
+      )),
+    )
+  ));
+}
+
 function renderQuestions(focus) {
   const root = $("questions");
   root.replaceChildren();
@@ -658,6 +678,7 @@ function fillForm(saved) {
 }
 
 function applyConfig(data, fallbackQuestions) {
+  renderBuiltinQuestions(data.builtin_questions);
   if (Array.isArray(data.reserved_question_ids)) {
     state.reservedIds = new Set(data.reserved_question_ids);
   }
@@ -927,6 +948,7 @@ async function reload() {
     try {
       await loadDecisionConfig();
     } catch (error) {
+      if (!state.loaded) renderBuiltinQuestions(null);
       setSaveState("error", `读取判断配置失败：${error.message}`);
     }
   } finally {

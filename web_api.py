@@ -9,6 +9,7 @@ from .config_util import (
     dump_decision_questions,
     parse_decision_questions,
 )
+from .decision_engine import builtin_question_catalog
 from .models import RESERVED_QUESTION_IDS
 
 PLUGIN_NAME = "astrbot_plugin_quick_decision"
@@ -52,6 +53,7 @@ class WebApiMixin:
         settings = self.settings
         return {
             "decision_custom_context": settings.decision_custom_context,
+            "builtin_questions": builtin_question_catalog(),
             "decision_questions": [
                 item.to_dict() for item in settings.decision_questions
             ],

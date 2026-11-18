@@ -606,6 +606,41 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.main_mod.generate_text = self._orig_gen
         self.tmp.cleanup()
 
+    def test_web_catalog_covers_questions_used_in_all_scenes(self) -> None:
+        from astrbot_plugin_quick_decision.decision_engine import _build_questions
+        from astrbot_plugin_quick_decision.models import BufferedMessage
+
+        payload = self.plugin._decision_config_payload()
+        catalog = {q["id"]: q["variants"] for q in payload["builtin_questions"]}
+        self.assertEqual(set(catalog), set(payload["reserved_question_ids"]))
+        self.assertEqual([q["id"] for q in payload["decision_questions"]], ["length"])
+        messages = [BufferedMessage("msg1", "u1", "User", "user", "Hello")]
+        memes = [{"id": "meme1", "description": "smile"}]
+        displayed = {
+            (key, v["prompt"])
+            for key, variants in catalog.items()
+            for v in variants
+            if "prompt" in v
+        }
+        asked = set()
+        for scene in (
+            "group_passive",
+            "private_passive",
+            "group_proactive",
+            "private_proactive",
+        ):
+            for key, question in _build_questions(scene, messages, memes).items():
+                asked.add((key, question.instructions))
+                (variant,) = (
+                    v for v in catalog[key] if v.get("prompt") == question.instructions
+                )
+                options = getattr(question, "criteria", {})
+                self.assertEqual(
+                    variant.get("options", {}),
+                    {k: v for k, v in options.items() if k not in {"msg1", "meme1"}},
+                )
+        self.assertEqual(displayed, asked)
+
     async def test_private_unmerged_keeps_default_official_path(self) -> None:
         event = FakeEvent(
             umo="aiocqhttp:FriendMessage:1",

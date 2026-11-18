@@ -128,7 +128,7 @@ cp -a astrbot_plugin_quick_decision /AstrBot/data/plugins/
 
 在 WebUI 登录 Dashboard 后，打开本插件详情页：
 
-- 「判断配置」：查看表情包管理器对接状态；编辑判断模型自定义上下文，以及自定义判断问题（含选项标准、是否启用、告诉会话模型的提示）。保存后写入官方插件配置（`data/config/astrbot_plugin_quick_decision_config.json`），与设置页是同一份数据。
+- 「判断配置」：查看全部判断问题。展开只读的内置题可查看各场景的题面、固定选项和动态候选来源；自定义题（含停用题）可编辑题面、选项、权重和临时提示。自定义题和背景信息保存到官方插件配置（`data/config/astrbot_plugin_quick_decision_config.json`），与设置页是同一份数据。
 - 「决策日志」：查看最近的判断结果。
 
 表情图库改由「表情包管理器」保存。本插件数据目录（`data/plugin_data/astrbot_plugin_quick_decision/`）仍保存决策日志和旧自制库备份，不会写进插件代码目录。内存中的会话缓冲会在重启后丢失，这是预期行为。

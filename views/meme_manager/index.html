@@ -71,29 +71,12 @@
                 <span class="route route-chat">会话模型收到</span>
               </div>
             </div>
-            <p class="hint">
-              判断模型每次都会回答下面这些问题。选中结果的「会话模型收到」会按问题顺序拼进本轮临时的
-              <code>&lt;quick_decision&gt;</code> 提示，不写入聊天记录；留空就不告诉会话模型。
-            </p>
-            <p class="hint">
-              选项权重默认 1，调高会更偏向该项，设为 0 则不选它。判断选项温度可在插件设置中调整：0 选加权后最优项，大于 0 时随机选择。
-            </p>
-
             <div id="config-warning" class="banner banner-danger" role="alert" hidden></div>
-
-            <div class="builtin" aria-label="内置问题">
-              <p class="builtin-label">
-                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2" /><path d="M8 11V8a4 4 0 0 1 8 0v3" /></svg>
-                内置问题，始终由插件提问，ID 不能被自定义问题占用
-              </p>
-              <ul class="builtin-list">
-                <li><code>action</code><span>要不要发言</span></li>
-                <li><code>target_message_id</code><span>回复哪一条</span></li>
-                <li><code>use_meme</code><span>配不配表情</span></li>
-                <li><code>meme_id</code><span>选哪张图</span></li>
-              </ul>
-            </div>
-
+            <h3>内置问题 <small>只读</small></h3>
+            <div id="builtin-questions" class="builtin-list"><p class="hint">正在读取内置问题…</p></div>
+            <h3>自定义问题</h3>
+            <p class="hint">每轮只问已启用的问题。选中项的提示按顺序交给会话模型，仅当轮有效。</p>
+            <p class="hint">选项权重默认 1，调高会更偏向该项，设为 0 则不选它。温度在插件设置中调整：0 选加权后最优项，大于 0 时随机选择。</p>
             <ol id="questions" class="questions"></ol>
 
             <div class="questions-foot">

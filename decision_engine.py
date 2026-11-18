@@ -40,6 +40,81 @@ ACTION_CRITERIA_PROACTIVE = {
     "none": "现在仍应保持沉默，不要主动开口",
     "proactive": "现在适合在冷场后主动开口",
 }
+GROUP_ACTION_PROMPT = (
+    "根据近期群聊判断机器人现在应该怎么做。"
+    "reply 表示发言，既包括针对某条消息回复，也包括自然参与讨论或插话；"
+    "即使被 @ 或引用，也可以选择 none 不回复。"
+)
+PROACTIVE_PROMPT = "会话已经沉默一段时间。判断现在是否适合主动开口。"
+TARGET_PROMPT = (
+    "如果决定发言，可以针对哪一条消息？若不针对某一条特定消息，可选 latest。"
+)
+USE_MEME_PROMPT = "这次回复是否适合配上一张表情包？没有合适的表情时应为否。"
+MEME_PROMPT = (
+    "若需要配图，请根据描述选择最合适的一张表情包；不合适则选 none。"
+    "只根据描述选择，不要假设你能看到原图。"
+)
+TARGET_DEFAULT = {"latest": "针对最近一条消息回复"}
+MEME_DEFAULT = {"none": "不配表情包"}
+
+
+def builtin_question_catalog() -> list[dict]:
+    """WebUI 的只读题目清单；动态选项只说明来源，不读取具体会话或图库。"""
+    return [
+        {
+            "id": "action",
+            "title": "要不要发言",
+            "variants": [
+                {
+                    "when": "群聊收到消息",
+                    "prompt": GROUP_ACTION_PROMPT,
+                    "options": ACTION_CRITERIA_GROUP,
+                },
+                {
+                    "when": "群聊或私聊冷场",
+                    "prompt": PROACTIVE_PROMPT,
+                    "options": ACTION_CRITERIA_PROACTIVE,
+                },
+                {"when": "私聊收到消息", "note": "固定为 reply，不向判断模型提问。"},
+            ],
+        },
+        {
+            "id": "target_message_id",
+            "title": "回复哪条消息",
+            "variants": [
+                {
+                    "when": "群聊收到消息，且有可选消息",
+                    "prompt": TARGET_PROMPT,
+                    "options": TARGET_DEFAULT,
+                    "note": "其余选项取自最近 8 条记录中带消息 ID 的用户消息。没有可选消息时跳过。",
+                },
+            ],
+        },
+        {
+            "id": "use_meme",
+            "title": "是否配表情",
+            "variants": [
+                {
+                    "when": "每轮判断",
+                    "prompt": USE_MEME_PROMPT,
+                    "note": "是否题：「是」的概率达到判断阈值才允许配图。",
+                },
+            ],
+        },
+        {
+            "id": "meme_id",
+            "title": "选哪张表情",
+            "variants": [
+                {
+                    "when": "图库有候选表情",
+                    "prompt": MEME_PROMPT,
+                    "options": MEME_DEFAULT,
+                    "note": "其余选项是本轮候选表情的 ID 和描述。图库为空时跳过。",
+                },
+            ],
+        },
+    ]
+
 
 Question = DecisionBooleanQuestion | DecisionChoiceQuestion
 Binding = Literal["action", "target_message_id", "use_meme", "meme_id", "session_hint"]
@@ -248,15 +323,11 @@ def _build_questions(
     questions: dict[str, DecisionBooleanQuestion | DecisionChoiceQuestion] = {}
     if scene == "group_passive":
         questions["action"] = DecisionChoiceQuestion(
-            instructions=(
-                "根据近期群聊判断机器人现在应该怎么做。"
-                "reply 表示发言，既包括针对某条消息回复，也包括自然参与讨论或插话；"
-                "即使被 @ 或引用，也可以选择 none 不回复。"
-            ),
+            instructions=GROUP_ACTION_PROMPT,
             criteria=ACTION_CRITERIA_GROUP,
         )
         # 选择类问题至少需要两个选项；始终提供 latest 作为兜底。
-        target_criteria = {"latest": "针对最近一条消息回复"}
+        target_criteria = TARGET_DEFAULT.copy()
         for item in messages[-8:]:
             if item.message_id and item.role == "user":
                 preview = item.text[:40] or "（无文本）"
@@ -265,28 +336,23 @@ def _build_questions(
                 )
         if len(target_criteria) >= 2:
             questions["target_message_id"] = DecisionChoiceQuestion(
-                instructions="如果决定发言，可以针对哪一条消息？若不针对某一条特定消息，可选 latest。",
+                instructions=TARGET_PROMPT,
                 criteria=target_criteria,
             )
     elif scene in {"group_proactive", "private_proactive"}:
         questions["action"] = DecisionChoiceQuestion(
-            instructions="会话已经沉默一段时间。判断现在是否适合主动开口。",
+            instructions=PROACTIVE_PROMPT,
             criteria=ACTION_CRITERIA_PROACTIVE,
         )
     # 私聊被动默认要回复，不问 action。
     _add_custom_questions(questions, configured or [])
-    questions["use_meme"] = DecisionBooleanQuestion(
-        "这次回复是否适合配上一张表情包？没有合适的表情时应为否。"
-    )
+    questions["use_meme"] = DecisionBooleanQuestion(USE_MEME_PROMPT)
     if memes:
-        meme_criteria = {"none": "不配表情包"}
+        meme_criteria = MEME_DEFAULT.copy()
         for meme in memes:
             meme_criteria[meme["id"]] = meme["description"]
         questions["meme_id"] = DecisionChoiceQuestion(
-            instructions=(
-                "若需要配图，请根据描述选择最合适的一张表情包；不合适则选 none。"
-                "只根据描述选择，不要假设你能看到原图。"
-            ),
+            instructions=MEME_PROMPT,
             criteria=meme_criteria,
         )
     return questions
