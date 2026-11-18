@@ -1268,6 +1268,31 @@ textarea.opt-chat,
   gap: 4px;
 }
 
+.prob-question {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  overflow-wrap: anywhere;
+}
+
+.prob-question h4 { margin: 0; }
+.prob-option { margin: 8px 0 2px; }
+.prob-option-name { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
+.prob-option-name small { color: var(--muted); }
+.prob-bar {
+  display: grid;
+  grid-template-columns: 3em minmax(0, 1fr) 5em;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.prob-track { background: var(--line); height: 7px; border-radius: 4px; overflow: hidden; }
+.prob-track > span { display: block; background: var(--judge); height: 100%; }
+.weighted .prob-track > span { background: var(--ok); }
+.prob-value { text-align: right; font-variant-numeric: tabular-nums; }
+
 .log-hints li {
   padding: 4px 10px;
   border-left: 3px solid var(--chat-line);

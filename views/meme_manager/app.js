@@ -1,3 +1,5 @@
+import { probabilityRows } from "./log-probabilities.mjs";
+
 const bridge = window.AstrBotPluginView;
 
 const DEFAULT_QUESTIONS = [
@@ -834,6 +836,46 @@ function formatAnswer(value) {
   return typeof value === "object" ? JSON.stringify(value) : String(value);
 }
 
+const percent = new Intl.NumberFormat("zh-CN", { style: "percent", maximumFractionDigits: 2 });
+
+function probabilityBar(label, value, series) {
+  return h("div", { class: `prob-bar ${series}` },
+    h("span", null, label),
+    h("span", { class: "prob-track", "aria-hidden": "true" },
+      value !== null && h("span", { style: `width: ${value * 100}%` })),
+    h("span", { class: "prob-value" }, value === null ? "—" : percent.format(value)),
+  );
+}
+
+function renderProbabilityChart(id, answer) {
+  const rows = probabilityRows(answer);
+  const title = h("h4", null, id);
+  if (!rows.length) {
+    const note = answer?.note === "private_passive_default_reply" ? "私聊固定回复，无模型概率。" : "未记录可用的概率分布。";
+    return h("section", { class: "prob-question" }, title, h("p", { class: "hint" }, note));
+  }
+  const isBoolean = !answer.probabilities;
+  const optionName = (key) => isBoolean ? (key === "true" ? "是" : "否") : key;
+  const selected = answer.selected_choice ?? answer.choice;
+  const info = [];
+  if (Number.isFinite(answer.selection_temperature)) info.push(`温度 ${answer.selection_temperature}`);
+  if (selected != null) {
+    info.push(`${Object.hasOwn(answer, "selected_choice") ? "调整后选中" : "模型原选"} ${optionName(selected)}`);
+    const chance = answer.selection_probabilities?.[selected];
+    if (Number.isFinite(chance)) info.push(`实际抽中概率 ${percent.format(chance)}`);
+  }
+  if (rows[0].weighted === null) info.push("无法计算加权分布");
+  return h("section", { class: "prob-question" }, title,
+    info.length ? h("p", { class: "log-meta" }, info.join(" · ")) : null,
+    rows.map(({ key, original, weight, weighted }) => h("div", { class: "prob-option" },
+      h("div", { class: "prob-option-name" }, h("b", null, optionName(key)),
+        Number.isFinite(weight) && weight !== 1 ? h("small", null, `权重 ×${weight}`) : null),
+      probabilityBar("原始", original, "original"),
+      probabilityBar("加权后", weighted, "weighted"),
+    )),
+  );
+}
+
 function renderLog(item) {
   const action = normalizeAction(item.action);
   const time = splitTime(item.time);
@@ -871,18 +913,29 @@ function renderLog(item) {
   const raw = item.raw && typeof item.raw === "object" && Object.keys(item.raw).length
     ? item.raw
     : null;
-  const detail = hints.length || raw || item.target_message_id
+  const detail = hints.length || raw || item.target_message_id || item.degraded
     ? h(
         "details",
         { class: "log-detail" },
-        h("summary", null, "查看详情"),
+        h("summary", null, raw ? "查看概率对比与详情" : "查看详情"),
         item.target_message_id
           ? h("p", { class: "log-meta" }, "回复的消息：", h("code", null, item.target_message_id))
           : null,
         hints.length ? h("ul", { class: "log-hints" }, hints.map((text) => h("li", null, text))) : null,
-        raw ? h("pre", { class: "log-raw" }, JSON.stringify(raw, null, 2)) : null,
+        !raw && item.degraded ? h("p", { class: "hint" }, "判断失败，本轮没有可展示的概率。") : null,
       )
     : null;
+
+  if (raw) detail.addEventListener("toggle", function showCharts() {
+    if (!detail.open) return;
+    detail.removeEventListener("toggle", showCharts);
+    detail.append(
+      h("p", { class: "hint" }, "加权后按本轮选项权重归一化，温度在此后生效。"),
+      ...Object.entries(raw).map(([id, answer]) => renderProbabilityChart(id, answer)),
+      h("details", { class: "prob-raw" }, h("summary", null, "查看原始数据"),
+        h("pre", { class: "log-raw" }, JSON.stringify(raw, null, 2))),
+    );
+  });
 
   return h(
     "li",
