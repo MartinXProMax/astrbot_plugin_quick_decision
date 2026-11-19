@@ -166,10 +166,34 @@ function ensureTwoOptions(question) {
   }
 }
 
+function setQuestions(raw) {
+  state.questions = raw.map(normalizeQuestion);
+  // 编辑期间引用问题对象，改名和排序后仍指向同一道题。
+  const byId = new Map(state.questions.map(q => [q.id, q]));
+  state.questions.forEach((q, index) => {
+    const branches = raw[index].branches || {};
+    if (q.type === "boolean") {
+      q.true_next = byId.get(branches.true);
+      q.false_next = byId.get(branches.false);
+    } else {
+      for (const option of q.options) option.next = byId.get(branches[option.id]);
+    }
+  });
+}
+
+function branchLinks(question) {
+  const links = question.type === "boolean"
+    ? [["true", question.true_next], ["false", question.false_next]]
+    : question.options.map(o => [o.id.trim(), o.next]);
+  return links.filter(([, target]) => target && state.questions.includes(target));
+}
+
 function collectQuestionsFromForm() {
   return state.questions.map((question) => {
     const common = {id: question.id.trim(), role: question.role, enabled: question.enabled,
       type: question.type, instructions: question.instructions, use_threshold: question.use_threshold};
+    const branches = Object.fromEntries(branchLinks(question).map(([key, target]) => [key, target.id.trim()]));
+    if (Object.keys(branches).length) common.branches = branches;
     if (question.role === "action") Object.assign(common, {ask_private: question.ask_private,
       proactive_instructions: question.proactive_instructions, proactive_none_criteria: question.proactive_none_criteria});
     if (question.type === "boolean") {
@@ -227,6 +251,29 @@ function updateDirty() {
 
 // ---------- 判断问题 ----------
 
+function renderTree() {
+  if (!$("workflow").open) return;
+  const children = new Set(state.questions.flatMap(q => branchLinks(q).map(([, target]) => target)));
+  const shown = new Set();
+  function node(q, option = "") {
+    const item = h("li", null, option && `${option} → `, h("code", null, q.id || "未命名问题"),
+      q.enabled ? "" : "（已停用）");
+    if (!shown.has(q)) {
+      shown.add(q);
+      const links = branchLinks(q);
+      if (links.length) item.append(h("ul", null, links.map(([key, target]) => {
+        const label = q.type === "boolean" ? (key === "true" ? "是" : "否") : key;
+        return node(target, label);
+      })));
+    }
+    return item;
+  }
+  const tree = $("workflow-tree");
+  tree.replaceChildren(...state.questions.filter(q => !children.has(q)).map(q => node(q)));
+  // 也显示编辑中尚未断开循环的节点。
+  for (const q of state.questions) if (!shown.has(q)) tree.append(node(q));
+}
+
 function renderQuestions(focus) {
   const root = $("questions");
   root.replaceChildren();
@@ -244,6 +291,8 @@ function renderQuestions(focus) {
     });
   }
   state.freshIndex = -1;
+  $("workflow").hidden = !state.questions.length;
+  renderTree();
   if (NEEDS_AUTOSIZE) root.querySelectorAll("textarea.autosize").forEach(autosize);
   if (focus) root.querySelector(focus)?.focus();
 }
@@ -319,6 +368,9 @@ function renderQuestion(question, qIndex) {
         dataset: { field: "id" },
         oninput: (event) => {
           question.id = event.target.value;
+          for (const option of $("questions").querySelectorAll(`option[data-target-index="${qIndex}"]`)) {
+            option.textContent = question.id.trim() || "未命名问题";
+          }
         },
       }),
     ),
@@ -412,7 +464,7 @@ function laneHead(judgeText) {
     "div",
     { class: "lane-row lanes-head", "aria-hidden": "true" },
     h("span", { class: "lane-title is-judge" }, judgeText),
-    h("span", { class: "lane-title is-chat" }, "选中后的提示与工具"),
+    h("span", { class: "lane-title is-chat" }, "选中后的提示、工具与后继问题"),
   );
 }
 
@@ -440,6 +492,20 @@ function selectField(label, choices, selected, change) {
 
 function toolField(current, update) {
   return selectField("调用工具", {"": "不调用", ...state.tools}, current || "", update);
+}
+
+function branchField(question, owner, key) {
+  const select = h("select", {onchange: e => {
+    owner[key] = e.target.value === "" ? undefined : state.questions[Number(e.target.value)];
+  }}, h("option", {value: ""}, "结束此分支"));
+  state.questions.forEach((target, index) => {
+    if (target !== question) select.append(h("option", {
+      value: String(index), dataset: {targetIndex: index},
+    }, target.id.trim() || "未命名问题"));
+  });
+  const selected = state.questions.indexOf(owner[key]);
+  select.value = selected < 0 ? "" : String(selected);
+  return h("label", {class: "tool-select"}, "后继问题 ", select);
 }
 
 function optionWeight(value, label, field, onInput) {
@@ -474,7 +540,8 @@ function renderBooleanLanes(question) {
       arrow(),
       h("div", {class: "answer-effects"}, chatHint(question[key] || "", `判断为「${fixed}」时告诉会话模型`, (value) => {
         question[key] = value;
-      }), toolField(question[key.replace("session_hint", "tool")], v => {question[key.replace("session_hint", "tool")] = v;})),
+      }), toolField(question[key.replace("session_hint", "tool")], v => {question[key.replace("session_hint", "tool")] = v;}),
+      branchField(question, question, key.replace("session_hint", "next"))),
       h("div", { class: "opt-tools" }),
       optionWeight(question[weightKey], `「${fixed}」的选择权重`, weightKey, (value) => {
         question[weightKey] = value;
@@ -530,7 +597,7 @@ function renderChoiceLanes(question, qIndex) {
         arrow(),
         h("div", {class: "answer-effects"}, chatHint(option.session_hint || "", `选中选项 ${n} 时告诉会话模型`, (value) => {
           option.session_hint = value;
-        }), toolField(option.tool, v => {option.tool = v;})),
+        }), toolField(option.tool, v => {option.tool = v;}), branchField(question, option, "next")),
         h(
           "div",
           { class: "opt-tools" },
@@ -660,12 +727,12 @@ function fillForm(saved) {
   $("decision-mode").value = saved.mode;
   $("custom-context").value = saved.context;
   updateContextCount();
-  state.questions = saved.questions.map(normalizeQuestion);
+  setQuestions(saved.questions);
   renderQuestions();
 }
 
 function applyConfig(data, fallbackQuestions) {
-  if (data.version !== 2 || !Array.isArray(data.default_questions)) throw new Error("请重载插件并刷新页面");
+  if (![2, 3].includes(data.version) || !Array.isArray(data.default_questions)) throw new Error("请重载插件并刷新页面");
   state.defaults = data.default_questions;
   state.roles = data.roles;
   state.tools = data.tools;
@@ -695,7 +762,7 @@ async function loadDecisionConfig() {
 
 async function saveDecisionConfig() {
   const payload = {
-    version: 2,
+    version: 3,
     decision_mode: $("decision-mode").value,
     decision_custom_context: $("custom-context").value,
     decision_questions: collectQuestionsFromForm(),
@@ -1031,7 +1098,7 @@ function onRestoreDefault() {
     return;
   }
   resetRestoreButton();
-  state.questions = state.defaults.map(normalizeQuestion);
+  setQuestions(state.defaults);
   renderQuestions();
   if (isDirty()) setSaveState("dirty", "已换成默认问题，保存后生效");
   else setSaveState("clean");
@@ -1076,6 +1143,7 @@ $("tab-btn-decision").addEventListener("keydown", onTabKey);
 $("tab-btn-logs").addEventListener("keydown", onTabKey);
 $("log-limit").addEventListener("change", loadLogs);
 $("add-question").addEventListener("click", onAddQuestion);
+$("workflow").addEventListener("toggle", renderTree);
 $("restore-default").addEventListener("click", onRestoreDefault);
 $("save-config").addEventListener("click", saveDecisionConfig);
 $("discard").addEventListener("click", onDiscard);
@@ -1087,6 +1155,7 @@ for (const type of ["input", "change"]) {
     event.target.classList?.remove("is-invalid");
     autosize(event.target);
     updateDirty();
+    if (event.target.closest("#questions")) renderTree();
   });
 }
 

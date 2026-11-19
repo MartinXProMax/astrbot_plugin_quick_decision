@@ -182,7 +182,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if result.failed:
             # 先落盘再返回，此时尚未决定是否走官方流水线。
             await self._log_decision(profile, result)
-            if scene == "private_passive" and not settings.dry_run:
+            if scene == "private_passive" and result.action == "reply" and not settings.dry_run:
                 logger.warning("私聊判断失败，将退回官方纯文字回复：%s", result.error)
                 return
             event.stop_event()

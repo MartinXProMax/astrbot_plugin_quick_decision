@@ -53,7 +53,7 @@ class WebApiMixin:
         return {
             "decision_mode": settings.decision_mode,
             "decision_custom_context": settings.decision_custom_context,
-            "version": 2,
+            "version": 3 if any(q.branches for q in settings.decision_questions) else 2,
             "default_questions": [q.to_dict() for q in default_questions()],
             "roles": QUESTION_ROLES,
             "tools": {key: label for key, (label, _, _) in TOOLS.items()},
@@ -72,13 +72,19 @@ class WebApiMixin:
         payload = await request.json(default={})
         if not isinstance(payload, dict):
             return error_response("请求体必须是 JSON 对象", status_code=400)
-        mode = payload.get("decision_mode", self.settings.decision_mode)
+        settings = self.settings
+        mode = payload.get("decision_mode", settings.decision_mode)
         if mode not in ("model", "random"):
             return error_response("请选择模型判断或纯随机", status_code=400)
+        version = payload.get("version")
+        if type(version) is not int or version not in (2, 3):
+            return error_response("无法识别的编辑器版本，请刷新页面", status_code=400)
+        if version == 2 and any(q.branches for q in settings.decision_questions):
+            return error_response("当前配置含有后继问题，请刷新编辑页后再保存", status_code=409)
         custom_context = str(payload.get("decision_custom_context") or "").strip()
         questions, error = load_questions(
             {
-                "version": payload.get("version"),
+                "version": 2,
                 "questions": payload.get("decision_questions"),
             },
             strict=True,

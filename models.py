@@ -133,6 +133,7 @@ class DecisionQuestion:
     proactive_instructions: str = ""
     proactive_none_criteria: str = ""
     ask_private: bool = False
+    branches: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -152,6 +153,8 @@ class DecisionQuestion:
                 ask_private=self.ask_private,
                 proactive_none_criteria=self.proactive_none_criteria,
             )
+        if self.branches:
+            data["branches"] = dict(self.branches)
         return data
 
 
@@ -174,6 +177,10 @@ class DecisionOutcome:
     probabilities: dict[str, float] = field(default_factory=dict)
     selection_probabilities: dict[str, float] = field(default_factory=dict)
     raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def has_answer(self) -> bool:
+        return self.status == "ok" or self.reason == "private_passive_default_reply"
 
 
 @dataclass
@@ -211,7 +218,7 @@ class DecisionResult:
         return {
             key: o.value
             for key, o in self.outcomes.items()
-            if o.status == "ok" or o.reason == "private_passive_default_reply"
+            if o.has_answer
         }
 
     @property

@@ -11,6 +11,7 @@ from test_v11_config import DecisionBooleanAnswer, DecisionChoiceAnswer  # isort
 
 from astrbot_plugin_quick_decision.config_util import (
     PluginSettings,
+    default_decision_questions,
     default_questions,
     load_questions,
 )
@@ -27,7 +28,7 @@ def choice(key):
 
 class QuestionToolTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.questions = [q.to_dict() for q in default_questions()]
+        self.questions = [q.to_dict() for q in default_questions(default_decision_questions())]
         self.gate, _, self.length, self.trigger, self.picture = self.questions
         self.gate.update(id="speak", ask_private=True, instructions="现在要回吗？")
         self.picture["id"] = "illustration"
@@ -139,8 +140,28 @@ class QuestionToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("illustration", warning)
         self.assertEqual(load_questions(saved, strict=True)[0], [])
 
+    def test_branch_config_roundtrip_and_invalid_graphs(self):
+        self.length["branches"] = {"short": "use_meme"}
+        self.trigger["branches"] = {"true": "illustration"}
+        saved = {"version": 2, "questions": self.questions}
+        questions, warning = load_questions(saved, strict=True)
+        self.assertIsNone(warning)
+        self.assertEqual([q.to_dict() for q in questions], self.questions)
+        for branches, message in [
+            ({"true": "missing"}, "不存在"),
+            ({"other": "length"}, "选项不存在"),
+            ({"false": "use_meme"}, "循环"),
+            ({"false": "length"}, "循环"),
+            (["length"], "对象"),
+        ]:
+            self.trigger["branches"] = branches
+            for strict in (True, False):
+                questions, warning = load_questions(saved, strict=strict)
+                self.assertEqual(questions, [])
+                self.assertIn(message, warning)
+
     def test_legacy_invalid_configs_keep_the_old_defaults(self):
-        expected = [q.to_dict() for q in default_questions()]
+        expected = [q.to_dict() for q in default_questions(default_decision_questions())]
         for old in ("{}", {}, [{"id": "action", "type": "boolean", "instructions": "旧问题"}]):
             with self.subTest(old=old):
                 loaded, warning = load_questions(old)

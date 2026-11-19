@@ -83,8 +83,12 @@
               </div>
             </div>
             <div id="config-warning" class="banner banner-danger" role="alert" hidden></div>
-            <p class="hint">为每个问题选择用途，可为答案添加当轮提示或调用工具。发送表情使用「选择表情」问题的结果，同一轮最多发送一次。</p>
+            <p class="hint">在选项的「后继问题」中选择下一题。没有前置选项的问题从本轮开始就参与判断，后继问题只在对应选项被选中时参与。</p>
             <p class="hint">选项权重默认 1，调高会更偏向该项，设为 0 则不选它。</p>
+            <details id="workflow" class="tips" hidden>
+              <summary>查看判断树</summary>
+              <ul id="workflow-tree"></ul>
+            </details>
             <ol id="questions" class="questions"></ol>
 
             <div class="questions-foot">

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -291,6 +292,83 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await evaluate_specs(service, [], state={}), {})
         service.ask.assert_not_awaited()
 
+    async def test_meme_workflow_only_evaluates_the_selected_path(self):
+        questions = default_questions()
+        action, target, length, gate, meme = questions
+        action.branches = {"reply": gate.id}
+        gate.branches["false"] = target.id
+        meme.branches = {"*": length.id}
+        # 子题可以排在父题前；即使提供商每次返回所有答案，也只接受已提问项。
+        settings = PluginSettings({"decision_questions": {
+            "version": 2, "questions": [q.to_dict() for q in reversed(questions)],
+        }})
+        for use_meme in (True, False):
+            service = SimpleNamespace(ask=AsyncMock(return_value={
+                "action": choice("join", join=1.0),
+                "use_meme": DecisionBooleanAnswer(probability=float(use_meme)),
+                "meme_id": choice("cat", cat=1.0),
+                "length": choice("short", short=1.0),
+                "target_message_id": choice("m1", m1=1.0),
+            }))
+            result = await self.ask(service, settings=settings)
+            calls = service.ask.await_args_list
+            path = ["action", "use_meme", "meme_id", "length"] if use_meme else [
+                "action", "use_meme", "target_message_id",
+            ]
+            self.assertEqual([list(c.args[0]) for c in calls], [[key] for key in path])
+            self.assertEqual(set(result.answers), set(path))
+            self.assertEqual(set(calls[-1].kwargs["state"]["previous_answers"]), set(path[:-1]))
+            self.assertEqual(result.use_meme, use_meme)
+            self.assertEqual(result.meme_id, "cat" if use_meme else None)
+            self.assertEqual(bool(result.tool_calls), use_meme)
+            self.assertEqual(bool(result.session_hints), use_meme)
+            self.assertEqual(result.target_message_id, None if use_meme else "m1")
+
+    async def test_unanswered_and_disabled_parents_do_not_activate_children(self):
+        settings = PluginSettings({})
+        action, _, length, gate, meme = settings.decision_questions
+        action.branches = {"none": length.id, "reply": gate.id}
+        action.use_threshold = True
+        for answer in ({}, {"action": object()}, {"action": choice("none", none=0.4)}):
+            service = SimpleNamespace(ask=AsyncMock(return_value=answer))
+            result = await self.ask(service, settings=settings)
+            service.ask.assert_awaited_once()
+            for key in (length.id, gate.id, meme.id):
+                self.assertEqual(result.outcomes[key].reason, "branch_not_selected")
+        action.enabled = False
+        settings.decision_mode = "random"
+        result = await self.ask(None, settings=settings)
+        self.assertEqual(set(result.answers), {"target_message_id"})
+        self.assertFalse(result.tool_calls)
+
+    async def test_random_workflow_deduplicates_shared_child_and_follows_fixed_reply(self):
+        settings = PluginSettings({"decision_mode": "random"})
+        action, _, length, gate, meme = settings.decision_questions
+        action.branches = {"reply": meme.id}
+        gate.false_weight = 0
+        meme.options[0].weight = 0
+        meme.branches = {"*": length.id}
+        length.options[0].weight = 0
+        with patch("random.choices", wraps=random.choices) as draw:
+            result = await self.ask(None, settings=settings, scene="private_passive")
+        self.assertEqual(draw.call_count, 3)
+        self.assertEqual((result.meme_id, result.length), ("cat", "long"))
+        gate.enabled = False
+        result = await self.ask(None, settings=settings, scene="private_passive")
+        self.assertEqual(result.answers[meme.id], "cat")
+        self.assertNotIn("send_meme", result.tool_calls)
+
+    async def test_failed_successor_discards_planned_effects(self):
+        service = SimpleNamespace(ask=AsyncMock(side_effect=[
+            {"action": choice("reply", reply=1), "use_meme": DecisionBooleanAnswer(probability=1)},
+            DecisionError("timeout"),
+        ]))
+        result = await self.ask(service)
+        self.assertTrue(result.failed)
+        self.assertFalse(result.should_speak())
+        self.assertFalse(result.tool_calls)
+        self.assertEqual(result.outcomes["meme_id"].reason, "batch_error")
+
     async def test_extra_answers_to_unasked_questions_are_ignored(self) -> None:
         service = SimpleNamespace(
             ask=AsyncMock(
@@ -308,9 +386,10 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
             result.outcomes["action"].reason, "private_passive_default_reply"
         )
         for key in ("target_message_id", "meme_id"):
+            reason = "branch_not_selected" if key == "meme_id" else "not_asked"
             self.assertEqual(
                 (result.outcomes[key].status, result.outcomes[key].reason),
-                ("skipped", "not_asked"),
+                ("skipped", reason),
             )
             self.assertNotIn(key, result.raw)
 
@@ -352,11 +431,10 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
                         asked,
                     )
                     for key in result.outcomes.keys() - asked:
-                        reason = (
-                            "private_passive_default_reply"
-                            if key == "action"
-                            else "not_asked"
-                        )
+                        reason = {
+                            "action": "private_passive_default_reply",
+                            "meme_id": "branch_not_selected",
+                        }.get(key, "not_asked")
                         self.assertEqual(
                             (result.outcomes[key].status, result.outcomes[key].reason),
                             ("skipped", reason),
@@ -418,7 +496,7 @@ class OutcomeTests(unittest.TestCase):
         )
         self.assertEqual(private.outcomes["action"].status, "skipped")
         self.assertEqual(private.outcomes["length"].status, "missing")
-        self.assertEqual(private.outcomes["meme_id"].reason, "not_asked")
+        self.assertEqual(private.outcomes["meme_id"].reason, "branch_not_selected")
         self.assertEqual(
             private.raw["action"],
             {"choice": "reply", "note": "private_passive_default_reply"},
@@ -440,7 +518,7 @@ class OutcomeTests(unittest.TestCase):
         )
         self.assertEqual(result.outcomes["length"].status, "invalid")
         self.assertEqual(result.outcomes["use_meme"].value, False)
-        self.assertEqual(result.outcomes["meme_id"].value, "cat")
+        self.assertEqual(result.outcomes["meme_id"].reason, "branch_not_selected")
         self.assertFalse(result.use_meme)
         self.assertIsNone(result.meme_id)
         self.assertNotIn("length", result.raw)

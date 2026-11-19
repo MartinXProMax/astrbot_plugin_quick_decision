@@ -1355,3 +1355,6 @@ textarea.opt-chat,
 
 .answer-effects { grid-area: chat; display: grid; gap: .4rem; min-width: 0; }
 .tool-select select { max-width: 100%; }
+#workflow-tree, #workflow-tree ul { padding-inline-start: 1.25em; }
+#workflow-tree ul { border-inline-start: 1px solid var(--line-strong); }
+#workflow-tree li { margin-block: .3em; overflow-wrap: anywhere; }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from graphlib import CycleError, TopologicalSorter
 from typing import Any
 
 from .decision_tools import TOOLS
@@ -107,6 +108,7 @@ def default_questions(legacy=None) -> list[DecisionQuestion]:
             USE_MEME_PROMPT,
             use_threshold=True,
             true_tool="send_meme",
+            branches={"true": "meme_id"} if legacy is None else {},
         ),
         DecisionQuestion(
             "meme_id",
@@ -271,7 +273,11 @@ def _parse_one_question(
         or (role != "answer" and qtype != "choice")
     ):
         return None, f"问题 {question_id} 的用途与题型不匹配"
-    common = {"role": role, "use_threshold": not legacy and _as_bool(item.get("use_threshold"), False)}
+    common = {
+        "role": role,
+        "use_threshold": not legacy and _as_bool(item.get("use_threshold"), False),
+        "branches": {} if legacy else item.get("branches", {}),
+    }
     if qtype == "choice":
         options, error = _parse_choice_options(
             item.get("options"), question_id=question_id, strict=strict, legacy=legacy
@@ -378,6 +384,10 @@ def parse_decision_questions(
         return default_decision_questions(), error + "，已回退到默认长短问题"
 
     questions: list[DecisionQuestion] = []
+    # 跳过无效的父题会让其后继变成入口，因此带分支的配置必须整体验证。
+    strict = strict or (
+        not legacy and any(isinstance(item, dict) and "branches" in item for item in payload)
+    )
     skipped: list[str] = []
     seen_ids: set[str] = set()
     active_roles: dict[str, str] = {}
@@ -408,11 +418,38 @@ def parse_decision_questions(
         if not questions and payload and legacy:
             return default_decision_questions(), warning + "，已回退到默认长短问题"
         return questions, warning
-    return questions, None
+    branch_error = _validate_branches(questions)
+    return ([], branch_error) if branch_error else (questions, None)
+
+
+def _validate_branches(questions: list[DecisionQuestion]) -> str | None:
+    ids = {q.id for q in questions}
+    graph = TopologicalSorter()
+    for question in questions:
+        if question.branches == {}:
+            continue
+        if not isinstance(question.branches, dict):
+            return f"问题 {question.id} 的 branches 必须是选项到后继问题 ID 的对象"
+        options = (
+            {o.id for o in question.options} if question.type == "choice" else {"true", "false"}
+        )
+        for option, target in question.branches.items():
+            if option not in options:
+                return f"问题 {question.id} 的分支选项不存在：{option}"
+            if not isinstance(target, str) or target not in ids:
+                return f"问题 {question.id} 的选项 {option} 指向不存在的后继问题：{target}"
+            graph.add(target, question.id)
+    try:
+        graph.prepare()
+    except CycleError as exc:
+        return "后继问题不能形成循环：" + " → ".join(exc.args[1])
+    return None
 
 
 def load_questions(value, *, strict=False):
     """旧数组仅存附加题；版本 2 保存完整列表，空列表也有效。"""
+    if not strict and (value is None or (isinstance(value, str) and not value.strip())):
+        return default_questions(), None
     if isinstance(value, str) and value.strip():
         try:
             decoded = json.loads(value)

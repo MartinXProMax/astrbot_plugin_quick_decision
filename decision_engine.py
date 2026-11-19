@@ -49,6 +49,8 @@ class DecisionSpec:
     option_weights: dict[str, float] = field(default_factory=dict)
     session_hints: dict[str | bool, str] = field(default_factory=dict)
     tools: dict[str | bool, str] = field(default_factory=dict)
+    is_root: bool = True
+    branches: dict[str, str] = field(default_factory=dict)
 
 
 def _select_option(
@@ -240,6 +242,7 @@ def build_state(
 
 def _build_specs(configured, scene, messages, memes, settings, *, targets=None):
     specs = []
+    children = {target for item in configured for target in item.branches.values()}
     for item in configured:
         if not item.enabled:
             continue
@@ -259,6 +262,8 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None):
             binding=role,
             question=None,
             default=default,
+            is_root=item.id not in children,
+            branches=dict(item.branches),
             threshold=settings.choice_threshold
             if item.use_threshold
             else (0.5 if item.type == "boolean" else 0.0),
@@ -334,6 +339,32 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None):
     return specs
 
 
+def _workflow_batches(specs, outcomes):
+    """每次交出已到达的一层；调用方写入该层实际结果后才安排后继。"""
+    pending = {spec.id: spec for spec in specs if not spec.is_root}
+    for key in pending:
+        outcomes[key] = DecisionOutcome(None, status="skipped", reason="branch_not_selected")
+    batch = [spec for spec in specs if spec.is_root]
+    while batch:
+        yield batch
+        following = []
+        for spec in batch:
+            outcome = outcomes[spec.id]
+            if not spec.branches or not outcome.has_answer:
+                continue
+            key = outcome.value
+            if spec.kind == "boolean":
+                key = "true" if key else "false"
+            elif spec.binding == "action":
+                key = normalize_action(key)
+            elif spec.binding in {"target", "meme"} and key != spec.default:
+                key = "*"
+            child = pending.pop(spec.branches.get(key), None)
+            if child is not None:
+                following.append(child)
+        batch = following
+
+
 def _build_questions(scene, messages, memes, configured=None):
     settings = PluginSettings({})
     specs = _build_specs(
@@ -355,6 +386,8 @@ def _assemble_result(specs, outcomes, *, scene):
     role_answers = {}
     for spec in specs:
         outcome = outcomes[spec.id]
+        if outcome.reason == "branch_not_selected":
+            continue
         value = outcome.value
         if outcome.raw:
             result.raw[spec.id] = outcome.raw
@@ -364,7 +397,7 @@ def _assemble_result(specs, outcomes, *, scene):
             result.target_message_id = value
         elif spec.binding == "meme" and outcome.status == "ok" and value != "none":
             role_answers["meme"] = value
-        if outcome.status != "ok" and spec.kind != "fixed":
+        if not outcome.has_answer:
             continue
         if spec.binding == "answer":
             result.custom_answers[spec.id] = value
@@ -416,7 +449,10 @@ def _parse_answers(
         settings,
         targets={k: k for k in targets or ()},
     )
-    return _assemble_result(specs, _evaluate_answers(specs, answers), scene=scene)
+    outcomes = {}
+    for batch in _workflow_batches(specs, outcomes):
+        outcomes.update(_evaluate_answers(batch, answers))
+    return _assemble_result(specs, outcomes, scene=scene)
 
 
 async def ask_decision(
@@ -434,10 +470,11 @@ async def ask_decision(
     if settings.decision_questions_warning:
         logger.warning("判断问题配置：%s", settings.decision_questions_warning)
     specs = _build_specs(settings.decision_questions, scene, messages, memes, settings)
+    outcomes = {}
+    batch = []
+    state = None
     try:
-        if settings.decision_mode == "random":
-            outcomes = {spec.id: _evaluate_random(spec) for spec in specs}
-        else:
+        if settings.decision_mode == "model":
             state = build_state(
                 scene=scene,
                 is_private=is_private,
@@ -446,12 +483,19 @@ async def ask_decision(
                 memes=memes,
                 custom_context=settings.decision_custom_context,
             )
-            outcomes = await evaluate_specs(
-                context.decision,
-                specs,
-                state=state,
-                provider_id=settings.decision_provider_id,
-            )
+        for batch in _workflow_batches(specs, outcomes):
+            if state is None:
+                outcomes.update({spec.id: _evaluate_random(spec) for spec in batch})
+            else:
+                batch_state = state
+                if not batch[0].is_root:
+                    previous = {key: o.value for key, o in outcomes.items() if o.has_answer}
+                    batch_state = {**state, "previous_answers": previous}
+                evaluated = await evaluate_specs(
+                    context.decision, batch, state=batch_state,
+                    provider_id=settings.decision_provider_id,
+                )
+                outcomes.update(evaluated)
         result = _assemble_result(specs, outcomes, scene=scene)
     except Exception as exc:  # noqa: BLE001
         error = str(exc) or type(exc).__name__
@@ -459,19 +503,22 @@ async def ask_decision(
             logger.warning("判断提供商调用失败：%s", error)
         else:
             logger.exception("判断过程出现未预期异常")
+        # 后继批次失败也要保留先前已生效的沉默决定。
+        keep_silent = any(
+            spec.binding == "action" and spec.id in outcomes and outcomes[spec.id].value == "none"
+            for spec in specs
+        )
+        for spec in batch:
+            outcomes[spec.id] = (
+                _evaluate_answer(spec, _MISSING) if spec.question is None
+                else DecisionOutcome(spec.default, status="fallback", reason="batch_error")
+            )
         result = DecisionResult(
-            action="none" if scene != "private_passive" else "reply",
+            action="reply" if scene == "private_passive" and not keep_silent else "none",
             scene=scene,
             error=error,
             degraded=True,
-            outcomes={
-                spec.id: _evaluate_answer(spec, _MISSING)
-                if spec.question is None
-                else DecisionOutcome(
-                    value=spec.default, status="fallback", reason="batch_error"
-                )
-                for spec in specs
-            },
+            outcomes=outcomes,
         )
     result.duration_ms = int((time.monotonic() - started) * 1000)
     result.dry_run = settings.dry_run
