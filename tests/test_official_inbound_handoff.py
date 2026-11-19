@@ -965,6 +965,56 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(quotes, ["old"])
         self.assertEqual(event._sends[0].chain[0].id, "old")
 
+    def test_late_messages_do_not_reopen_an_evaluated_silence(self) -> None:
+        from astrbot_plugin_quick_decision.models import BufferedMessage
+
+        profile = SessionProfile("room", False)
+        store = self.plugin.sessions
+        def record(ts):
+            message = BufferedMessage(str(ts), "u", "User", "user", "hello", timestamp=ts)
+            return store.append_message(profile, message, 10)
+
+        with patch("time.time", return_value=1300):
+            record(1200)
+            store.mark_silence_evaluated(profile.umo)
+            self.assertEqual(record(1000).last_activity, 1200)
+            self.assertTrue(store.silence_already_evaluated(profile.umo))
+            self.assertEqual(record(5000).last_activity, 1300)
+            self.assertFalse(store.silence_already_evaluated(profile.umo))
+
+    async def test_silence_timer_passes_session_time_and_actual_idle_duration(self) -> None:
+        from astrbot.api.provider import DecisionChoiceAnswer
+        from astrbot_plugin_quick_decision.decision_engine import ask_decision
+
+        self.main_mod.ask_decision = ask_decision
+        self.plugin.context.get_config = lambda umo: {"timezone": "UTC"}
+        questions = self.plugin._decision_config_payload()["decision_questions"]
+        gate = next(q for q in questions if q["role"] == "action")
+        gate.update(proactive_instructions="是否应该开口？", branches={"none": "length"})
+        length = next(q for q in questions if q["id"] == "length")
+        length["instructions"] = "现在是 {当前时间}，已沉默 {冷场时长}。"
+        self.plugin.config["decision_questions"] = {"version": 2, "questions": questions}
+        service = AsyncMock(return_value={
+            gate["id"]: DecisionChoiceAnswer(choice="none", probability=1,
+                                             probabilities={"none": 1}, confidence=1),
+        })
+        self.plugin.context.decision = SimpleNamespace(ask=service)
+        now = 1735689600
+        for private in (False, True):
+            runtime = self.plugin.sessions.ensure(SessionProfile(f"room-{private}", private))
+            runtime.last_user_ts = now - 4000
+            runtime.last_bot_ts = now - 2301
+        with patch("time.time", return_value=now):
+            await self.plugin._check_silence()
+        self.assertEqual(service.await_count, 4)
+        for root, child in (service.await_args_list[:2], service.await_args_list[2:]):
+            action_prompt = root.args[0][gate["id"]].instructions
+            self.assertIn("当前时间：2025-01-01 00:00:00+00:00", action_prompt)
+            self.assertIn("冷场时长：38 分 21 秒", action_prompt)
+            self.assertNotIn("38 分", root.args[0]["use_meme"].instructions)
+            self.assertEqual(child.args[0]["length"].instructions,
+                             "现在是 2025-01-01 00:00:00+00:00，已沉默 38 分 21 秒。")
+
     async def test_proactive_still_uses_self_generate(self) -> None:
         generate_calls = []
 

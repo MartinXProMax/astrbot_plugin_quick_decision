@@ -297,6 +297,26 @@ function renderQuestions(focus) {
   if (focus) root.querySelector(focus)?.focus();
 }
 
+function promptField(question, key, label, placeholder) {
+  const input = h("textarea", {
+    class: "autosize", rows: key === "instructions" ? 2 : 1, value: question[key],
+    placeholder, dataset: {field: key},
+    oninput: () => { question[key] = input.value; },
+  });
+  const buttons = ["当前时间", "冷场时长"].map(name => h("button", {
+    type: "button", class: "btn btn-text",
+    "aria-label": `在${label}插入${name}`,
+    onclick: () => {
+      input.setRangeText(`{${name}}`, input.selectionStart, input.selectionEnd, "end");
+      input.focus();
+      input.dispatchEvent(new Event("input", {bubbles: true}));
+    },
+  }, name));
+  return h("div", {class: "q-instr"},
+    h("label", null, h("span", {class: "field-label"}, label), input),
+    h("div", {class: "field-label"}, "插入补充信息", ...buttons));
+}
+
 function renderQuestion(question, qIndex) {
   const total = state.questions.length;
   const card = h("li", {
@@ -401,21 +421,8 @@ function renderQuestion(question, qIndex) {
     ),
   );
 
-  const instructions = h(
-    "label",
-    { class: "q-instr" },
-    h("span", { class: "field-label" }, "判断标准"),
-    h("textarea", {
-      class: "autosize",
-      rows: 2,
-      value: question.instructions,
-      placeholder: "写给判断模型的问题，例如：这轮回复应该用什么语气？",
-      dataset: { field: "instructions" },
-      oninput: (event) => {
-        question.instructions = event.target.value;
-      },
-    }),
-  );
+  const instructions = promptField(question, "instructions", "判断标准",
+    "写给判断模型的问题，例如：这轮回复应该用什么语气？");
 
   const selectRole = selectField("问题用途", state.roles, question.role, (value) => {
     question.role = value;
@@ -430,10 +437,11 @@ function renderQuestion(question, qIndex) {
   body.append(h("label", null, h("input", {type: "checkbox", checked: question.use_threshold,
     onchange: e => { question.use_threshold = e.target.checked; }}), " 使用插件判断阈值（仅模型判断）"));
   if (question.role === "action") {
-    for (const [key, label] of [["proactive_instructions", "冷场时的判断标准"], ["proactive_none_criteria", "冷场时保持沉默的标准"]]) {
-      body.append(h("label", {class: "q-instr"}, label, h("textarea", {value: question[key], rows: 1,
-        placeholder: "留空沿用上方标准", oninput: e => { question[key] = e.target.value; }})));
-    }
+    body.append(promptField(question, "proactive_instructions", "冷场时的判断标准", "留空沿用上方标准"));
+    body.append(h("p", {class: "hint"}, "冷场发言判断会自动补充当前时间和冷场时长。"));
+    body.append(h("label", {class: "q-instr"}, "冷场时保持沉默的标准",
+      h("textarea", {value: question.proactive_none_criteria, rows: 1,
+        placeholder: "留空沿用上方标准", oninput: e => { question.proactive_none_criteria = e.target.value; }})));
     body.append(h("label", null, h("input", {type: "checkbox", checked: question.ask_private,
       onchange: e => { question.ask_private = e.target.checked; }}), " 私聊也判断是否发言（关闭时直接回复）"));
   }

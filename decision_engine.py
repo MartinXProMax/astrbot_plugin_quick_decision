@@ -7,7 +7,9 @@ import random
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from astrbot.api import logger
 from astrbot.api.provider import (
@@ -32,6 +34,8 @@ from .models import (
 Question = DecisionBooleanQuestion | DecisionChoiceQuestion
 
 _MISSING = object()
+_TIME_TOKEN = "{当前时间}"
+_SILENCE_TOKEN = "{冷场时长}"
 
 
 @dataclass
@@ -240,14 +244,37 @@ def build_state(
     return state
 
 
-def _build_specs(configured, scene, messages, memes, settings, *, targets=None):
+def _question_info(context, umo, scene, last_activity):
+    now = time.time()
+    get_config = getattr(context, "get_config", None)
+    zone = None
+    try:
+        name = get_config(umo).get("timezone") if umo and callable(get_config) else None
+        if isinstance(name, str) and name.strip():
+            name = name.strip()
+            zone = timezone.utc if name == "UTC" else ZoneInfo(name)
+    except Exception as exc:
+        logger.warning("判断题无法读取会话时区，将使用系统时区：%s", exc)
+    instant = datetime.fromtimestamp(now, timezone.utc).astimezone(zone)
+    silence = "不适用（本轮收到消息）"
+    if scene.endswith("_proactive"):
+        silence = "未知"
+        if last_activity and last_activity > 0:
+            minutes, seconds = divmod(max(0, int(now - last_activity)), 60)
+            silence = f"{minutes} 分 {seconds} 秒"
+    return {_TIME_TOKEN: instant.isoformat(sep=" ", timespec="seconds"), _SILENCE_TOKEN: silence}
+
+
+def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
+                 context=None, umo="", last_activity=None):
     specs = []
+    proactive = scene.endswith("_proactive")
+    info = None
     children = {target for item in configured for target in item.branches.values()}
     for item in configured:
         if not item.enabled:
             continue
         role = item.role
-        prompt = item.instructions
         fixed = role == "action" and scene == "private_passive" and not item.ask_private
         default = {
             "action": "reply" if fixed else "none",
@@ -278,6 +305,17 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None):
             spec.tools["reply"] = reply.tool
         if fixed or (role == "target" and scene != "group_passive"):
             continue
+        prompt = item.instructions
+        if role == "action" and proactive:
+            prompt = item.proactive_instructions or prompt
+            for token in (_TIME_TOKEN, _SILENCE_TOKEN):
+                if token not in prompt:
+                    prompt += f"\n{token[1:-1]}：{token}"
+        if settings.decision_mode == "model" and (_TIME_TOKEN in prompt or _SILENCE_TOKEN in prompt):
+            if info is None:
+                info = _question_info(context, umo, scene, last_activity)
+            for token, value in info.items():
+                prompt = prompt.replace(token, value)
         if item.type == "boolean":
             spec.question = DecisionBooleanQuestion(prompt)
             spec.allowed = frozenset({"true", "false"})
@@ -301,9 +339,6 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None):
             )
         elif role == "meme":
             dynamic = {m["id"]: m["description"] for m in memes}
-        proactive = scene.endswith("_proactive")
-        if role == "action" and proactive:
-            prompt = item.proactive_instructions or prompt
         criteria = {}
         for opt in item.options:
             if role == "action" and opt.id == ("reply" if proactive else "proactive"):
@@ -464,12 +499,14 @@ async def ask_decision(
     messages: list[BufferedMessage],
     at_or_quoted: bool,
     memes: list[dict[str, str]],
+    umo: str = "",
+    last_activity: float | None = None,
 ) -> DecisionResult:
     """按当前模式评估本轮问题。失败时返回带 error 的结果。"""
     started = time.monotonic()
     if settings.decision_questions_warning:
         logger.warning("判断问题配置：%s", settings.decision_questions_warning)
-    specs = _build_specs(settings.decision_questions, scene, messages, memes, settings)
+    specs = []
     outcomes = {}
     batch = []
     state = None
@@ -483,6 +520,10 @@ async def ask_decision(
                 memes=memes,
                 custom_context=settings.decision_custom_context,
             )
+        specs = _build_specs(
+            settings.decision_questions, scene, messages, memes, settings,
+            context=context, umo=umo, last_activity=last_activity,
+        )
         for batch in _workflow_batches(specs, outcomes):
             if state is None:
                 outcomes.update({spec.id: _evaluate_random(spec) for spec in batch})

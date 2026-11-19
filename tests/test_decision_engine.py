@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import random
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 # 共享接口替身必须先于 AstrBot 导入。
 from test_v11_config import DecisionBooleanAnswer, DecisionChoiceAnswer  # isort: skip
@@ -20,6 +21,7 @@ from astrbot_plugin_quick_decision.config_util import (
 )
 from astrbot_plugin_quick_decision.decision_engine import (
     _parse_answers,
+    _question_info,
     ask_decision,
     evaluate_specs,
 )
@@ -291,6 +293,26 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
         service = SimpleNamespace(ask=AsyncMock(side_effect=AssertionError("不应请求")))
         self.assertEqual(await evaluate_specs(service, [], state={}), {})
         service.ask.assert_not_awaited()
+
+    def test_missing_timezone_uses_local_time_without_losing_idle_duration(self):
+        now = 1735689600
+        expected = datetime.fromtimestamp(now, timezone.utc).astimezone().isoformat(sep=" ")
+        for lookup in (Mock(side_effect=KeyError("room")), Mock(return_value={"timezone": "Missing/Zone"})):
+            with self.subTest(lookup=lookup), patch("time.time", return_value=now):
+                info = _question_info(SimpleNamespace(get_config=lookup), "room", "group_proactive", now - 125)
+                lookup.assert_called_once_with("room")
+                self.assertEqual(info, {"{当前时间}": expected, "{冷场时长}": "2 分 5 秒"})
+
+    async def test_information_tokens_in_passive_boolean_question(self):
+        settings = PluginSettings({})
+        question = next(q for q in settings.decision_questions if q.id == "use_meme")
+        question.instructions = "{当前时间} / {冷场时长} / {其他}"
+        service = SimpleNamespace(ask=AsyncMock(return_value={}))
+        result = await self.ask(service, settings=settings)
+        prompt = service.ask.await_args.args[0]["use_meme"].instructions
+        self.assertRegex(prompt, r"\d{4}-\d\d-\d\d .*?[+-]\d\d:\d\d / 不适用（本轮收到消息） / \{其他\}")
+        self.assertEqual(question.instructions, "{当前时间} / {冷场时长} / {其他}")
+        self.assertFalse(result.session_hints)
 
     async def test_meme_workflow_only_evaluates_the_selected_path(self):
         questions = default_questions()

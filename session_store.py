@@ -28,6 +28,10 @@ class SessionRuntime:
     pending_pipeline: DecisionResult | None = None
     known: bool = True
 
+    @property
+    def last_activity(self) -> float:
+        return max(self.last_user_ts, self.last_bot_ts)
+
 
 class SessionStore:
     """内存会话状态。重启后聊天缓冲会丢失，表情库不受影响。"""
@@ -68,7 +72,7 @@ class SessionStore:
                 or (lock is not None and lock.locked())
             ):
                 continue
-            last_activity = max(runtime.last_user_ts, runtime.last_bot_ts)
+            last_activity = runtime.last_activity
             if last_activity and last_activity < cutoff:
                 self._sessions.pop(umo, None)
                 self._session_locks.pop(umo, None)
@@ -85,14 +89,13 @@ class SessionStore:
         if runtime.messages.maxlen != max(limit * 2, 20):
             runtime.messages = deque(runtime.messages, maxlen=max(limit * 2, 20))
         runtime.messages.append(message)
+        received_at = time.time()
+        timestamp = min(received_at, message.timestamp or received_at)
         if message.role == "user":
-            runtime.last_user_ts = message.timestamp or time.time()
-            # 有新消息后，上一轮冷场评估作废，允许下一次沉默再次触发。
-            if runtime.silence_evaluated_at_user_ts != runtime.last_user_ts:
-                pass
-            runtime.silence_evaluated_at_user_ts = 0.0
+            # 迟到的消息仍进缓冲区；冷场计时只随更新的发言推进。
+            runtime.last_user_ts = max(runtime.last_user_ts, timestamp)
         else:
-            runtime.last_bot_ts = message.timestamp or time.time()
+            runtime.last_bot_ts = max(runtime.last_bot_ts, timestamp)
         return runtime
 
     def recent_messages(self, umo: str, limit: int) -> list[BufferedMessage]:

@@ -169,6 +169,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 messages=messages,
                 at_or_quoted=at_or_quoted,
                 memes=self._meme_candidates(settings),
+                umo=profile.umo,
             )
             if not runtime.pending:
                 break
@@ -434,8 +435,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 continue
             if self.sessions.silence_already_evaluated(profile.umo):
                 continue
-            last_activity = max(runtime.last_user_ts, runtime.last_bot_ts or 0)
-            if now - last_activity < settings.silence_seconds(profile.is_private):
+            if now - runtime.last_activity < settings.silence_seconds(profile.is_private):
                 continue
             if self.sessions.in_cooldown(profile.umo, settings.cooldown_seconds):
                 continue
@@ -469,6 +469,8 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             messages=messages,
             at_or_quoted=False,
             memes=self._meme_candidates(settings),
+            umo=profile.umo,
+            last_activity=runtime.last_activity,
         )
         result.dry_run = settings.dry_run
         runtime.last_decision = result
