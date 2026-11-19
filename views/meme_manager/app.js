@@ -482,7 +482,7 @@ function chatHint(value, label, onInput) {
     rows: 1,
     value,
     "aria-label": label,
-    placeholder: "留空则不告诉会话模型",
+    placeholder: "可选，给会话模型的额外提示",
     oninput: (event) => onInput(event.target.value),
   });
 }

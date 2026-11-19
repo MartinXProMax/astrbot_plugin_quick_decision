@@ -206,6 +206,8 @@ class DecisionResult:
     tool_calls: dict[str, ToolCall] = field(default_factory=dict)
     round_id: str = ""
     decision_mode: Literal["model", "random"] = "model"
+    target_summary: str = ""
+    meme_description: str = ""
 
     def __post_init__(self) -> None:
         if self.use_meme and self.meme_id and not self.tool_calls:

@@ -441,11 +441,15 @@ class HintsAndHistoryTests(unittest.TestCase):
         req = ProviderRequest(prompt="用户原文")
         apply_session_hints(
             req,
-            DecisionResult(session_hints=["请简短回复", "  "]),
+            DecisionResult(action="reply", session_hints=["请简短回复", "  "],
+                           use_meme=True, meme_id="internal-meme-42", meme_description="企鹅点头"),
         )
         self.assertEqual(len(req.extra_user_content_parts), 1)
         part = req.extra_user_content_parts[0]
         self.assertTrue(part._no_save)
+        self.assertIn('"动作":"回复"', part.text)
+        self.assertIn('"表情描述":"企鹅点头"', part.text)
+        self.assertNotIn("internal-meme-42", part.text)
         self.assertIn("请简短回复", part.text)
 
         # 模拟官方 _save_to_history：跳过 _no_save 的临时块，只保留用户原文。
@@ -467,8 +471,41 @@ class HintsAndHistoryTests(unittest.TestCase):
         apply_session_hints(req, DecisionResult(session_hints=[]))
         self.assertEqual(req.extra_user_content_parts, [])
 
+    def test_missing_meme_description_does_not_expose_its_id(self) -> None:
+        req = ProviderRequest()
+        decision = DecisionResult(action="reply", use_meme=True, meme_id="internal-meme-42")
+        apply_session_hints(req, decision)
+        text = req.extra_user_content_parts[0].text
+        self.assertIn("尝试另发一张表情", text)
+        self.assertNotIn("表情描述", text)
+        self.assertNotIn("internal-meme-42", text)
+        self.assertEqual(decision.tool_calls["send_meme"].args["meme_id"], "internal-meme-42")
+
 
 class DirectSendGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_proactive_generation_gets_one_temporary_summary(self) -> None:
+        from astrbot_plugin_quick_decision.reply_generator import generate_text
+
+        context = SimpleNamespace(
+            conversation_manager=FakeConvMgr(),
+            persona_manager=SimpleNamespace(get_persona=AsyncMock(return_value=None)),
+            get_current_chat_provider_id=AsyncMock(return_value="chat"),
+            llm_generate=AsyncMock(return_value=SimpleNamespace(completion_text="周末过得怎么样？")),
+        )
+        decision = DecisionResult(action="proactive", scene="group_proactive", length="short",
+                                  use_meme=True, meme_id="internal-meme-42", meme_description="企鹅点头")
+        await generate_text(context, umo="room", decision=decision, user_prompt="")
+        context.llm_generate.assert_awaited_once()
+        parts = context.llm_generate.await_args.kwargs["extra_user_content_parts"]
+        self.assertEqual(len(parts), 1)
+        self.assertTrue(parts[0]._no_save)
+        self.assertIn("冷场主动发言", parts[0].text)
+        self.assertIn('"篇幅":"简短"', parts[0].text)
+        self.assertIn('"表情描述":"企鹅点头"', parts[0].text)
+        self.assertNotIn("internal-meme-42", parts[0].text)
+        self.assertEqual(context.conversation_manager.updated[0]["history"],
+                         [{"role": "assistant", "content": "周末过得怎么样？"}])
+
     async def test_send_guard_strips_reply_inserted_after_decorate_hook(self) -> None:
         event = FakeEvent(is_private=False)
         chain = [SimpleNamespace(text="你好")]

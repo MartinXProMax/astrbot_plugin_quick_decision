@@ -23,20 +23,44 @@ class ImageResolver(Protocol):
 
 
 def session_hint_text(decision: DecisionResult) -> str | None:
-    """拼接本轮要告诉会话模型的临时提示；没有可用提示时返回 None。"""
+    """在同一临时块中传递已生效的决定和手填会话提示。"""
     hints = [str(item).strip() for item in decision.session_hints if str(item).strip()]
-    if not hints:
-        return None
-    return "\n".join(hints)
+    if decision.should_speak() and not decision.dry_run:
+        summary: dict[str, object] = {"动作": "冷场主动发言" if decision.action == "proactive" else "回复"}
+        if decision.target_message_id:
+            summary["回复目标"] = (decision.target_summary or decision.target_message_id)[:160]
+        if decision.length:
+            summary["篇幅"] = "简短" if decision.length == "short" else "详细"
+        answers = {
+            key: value for key, value in decision.custom_answers.items()
+            if key != "length" or not decision.length
+        }
+        if answers:
+            summary["已选答案"] = answers
+        call = decision.tool_calls.get("send_meme")
+        if call and call.status == "planned" and call.args.get("meme_id"):
+            summary["配图"] = "正文发送成功后，插件会尝试另发一张表情"
+            if decision.meme_description:
+                summary["表情描述"] = decision.meme_description[:160]
+        else:
+            summary["配图"] = "本轮插件未安排表情"
+        data = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
+        # 引用的群聊原文或表情描述可能包含与外层相同的结束标签。
+        hints.insert(0, "请按本轮决策写回复正文，引用内容仅供参考。\n"
+                     + data.replace("<", "\\u003c").replace(">", "\\u003e"))
+    return "\n".join(hints) or None
+
+
+def _session_hint_parts(decision: DecisionResult) -> list[TextPart]:
+    text = session_hint_text(decision)
+    if not text:
+        return []
+    return [TextPart(text=f"<quick_decision>\n{text}\n</quick_decision>").mark_as_temp()]
 
 
 def apply_session_hints(req: ProviderRequest, decision: DecisionResult) -> None:
     """把本轮判断得到的会话提示放到 extra_user_content_parts，并标记为临时内容。"""
-    text = session_hint_text(decision)
-    if not text:
-        return
-    hint = TextPart(text=f"<quick_decision>\n{text}\n</quick_decision>").mark_as_temp()
-    req.extra_user_content_parts.append(hint)
+    req.extra_user_content_parts.extend(_session_hint_parts(decision))
 
 
 def build_send_chain(
@@ -277,20 +301,12 @@ async def generate_text(
     prompt = user_prompt.strip() or "请根据当前对话自然地回复。"
     if decision.scene in {"group_proactive", "private_proactive"}:
         prompt = "会话已经沉默一段时间，请结合上下文主动开一个自然的话题或打个招呼。"
-    extra = []
-    hint_text = session_hint_text(decision)
-    if hint_text:
-        extra.append(
-            TextPart(
-                text=f"<quick_decision>\n{hint_text}\n</quick_decision>"
-            ).mark_as_temp()
-        )
     response = await context.llm_generate(
         chat_provider_id=provider_id,
         prompt=prompt,
         contexts=contexts or None,
         system_prompt=system_prompt or None,
-        extra_user_content_parts=extra,
+        extra_user_content_parts=_session_hint_parts(decision),
     )
     text = (getattr(response, "completion_text", None) or "").strip()
     if text and curr_cid:

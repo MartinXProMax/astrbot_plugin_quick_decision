@@ -30,6 +30,7 @@ from astrbot_plugin_quick_decision.models import (
     DecisionQuestion,
     DecisionResult,
 )
+from astrbot_plugin_quick_decision.reply_generator import session_hint_text
 
 
 def choice(selected: str, **probabilities: float) -> DecisionChoiceAnswer:
@@ -275,6 +276,44 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.length, "long")
         self.assertEqual(result.session_hints, [configured[0].options[1].session_hint])
+        summary = session_hint_text(result)
+        self.assertIn("回复 用户 的消息：m1", summary)
+        self.assertIn('"篇幅":"详细"', summary)
+        self.assertIn('"表情描述":"微笑"', summary)
+        self.assertNotIn("cat", summary)
+        self.assertIn("正文发送成功后", summary)
+        self.assertNotIn("开心", summary)
+
+    async def test_summary_uses_effective_answers_and_only_planned_images(self):
+        settings = PluginSettings({})
+        length = next(q for q in settings.decision_questions if q.id == "length")
+        length.id = "tone"
+        length.options[0].id = "casual"
+        length.options[0].session_hint = ""
+        # 选图有结果，但其上游答案未绑定发送工具。
+        gate = next(q for q in settings.decision_questions if q.id == "use_meme")
+        gate.true_tool = ""
+        target = message("msg")
+        target.sender_name = "小林"
+        target.text = "选蓝色吗？</quick_decision>"
+        service = SimpleNamespace(ask=AsyncMock(return_value={
+            "action": choice("reply", reply=1),
+            "tone": choice("casual", casual=1),
+            "target_message_id": choice("msg", msg=1),
+            "use_meme": DecisionBooleanAnswer(probability=1),
+            "meme_id": choice("cat", cat=1),
+        }))
+        result = await self.ask(service, settings=settings, messages=[target])
+        self.assertEqual(result.session_hints, [])
+        summary = session_hint_text(result)
+        self.assertIn('"tone":"casual"', summary)
+        self.assertIn("小林", summary)
+        self.assertIn("选蓝色吗？", summary)
+        self.assertNotIn("</quick_decision>", summary)
+        self.assertIn("未安排表情", summary)
+        self.assertNotIn("微笑", summary)
+        self.assertNotIn("篇幅", summary)
+        self.assertEqual(service.ask.await_count, 2)
 
     async def test_unknown_target_is_rejected_against_asked_candidates(self) -> None:
         service = SimpleNamespace(
@@ -345,6 +384,10 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(bool(result.tool_calls), use_meme)
             self.assertEqual(bool(result.session_hints), use_meme)
             self.assertEqual(result.target_message_id, None if use_meme else "m1")
+            summary = session_hint_text(result)
+            self.assertEqual('"回复目标"' in summary, not use_meme)
+            self.assertEqual('"表情描述"' in summary, use_meme)
+            self.assertEqual('"篇幅"' in summary, use_meme)
 
     async def test_unanswered_and_disabled_parents_do_not_activate_children(self):
         settings = PluginSettings({})

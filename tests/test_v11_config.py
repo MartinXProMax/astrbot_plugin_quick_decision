@@ -612,7 +612,10 @@ class DecisionConfigTests(unittest.TestCase):
         self.assertIsNone(result.length)
         self.assertEqual(result.custom_answers, {})
         self.assertEqual(result.session_hints, [])
-        self.assertIsNone(session_hint_text(result))
+        hint = session_hint_text(result)
+        self.assertIn('"动作":"回复"', hint)
+        self.assertNotIn("篇幅", hint)
+        self.assertNotIn("已选答案", hint)
 
         settings_with_length = PluginSettings({})
         skipped = _parse_answers(

@@ -55,6 +55,7 @@ class DecisionSpec:
     tools: dict[str | bool, str] = field(default_factory=dict)
     is_root: bool = True
     branches: dict[str, str] = field(default_factory=dict)
+    candidate_descriptions: dict[str, str] = field(default_factory=dict)
 
 
 def _select_option(
@@ -339,6 +340,7 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
             )
         elif role == "meme":
             dynamic = {m["id"]: m["description"] for m in memes}
+        spec.candidate_descriptions = dynamic
         criteria = {}
         for opt in item.options:
             if role == "action" and opt.id == ("reply" if proactive else "proactive"):
@@ -430,8 +432,10 @@ def _assemble_result(specs, outcomes, *, scene):
             result.action = normalize_action(value)
         elif spec.binding == "target" and outcome.status == "ok" and value != "latest":
             result.target_message_id = value
+            result.target_summary = spec.candidate_descriptions.get(value, "")
         elif spec.binding == "meme" and outcome.status == "ok" and value != "none":
             role_answers["meme"] = value
+            result.meme_description = spec.candidate_descriptions.get(value, "")
         if not outcome.has_answer:
             continue
         if spec.binding == "answer":
