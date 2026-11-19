@@ -443,6 +443,7 @@ class PluginSettings:
         private = data.get("private") or {}
         self.enabled = _as_bool(data.get("enabled"), True)
         self.dry_run = _as_bool(data.get("dry_run"), False)
+        self.decision_mode = "random" if data.get("decision_mode") == "random" else "model"
         self.decision_provider_id = str(data.get("decision_provider_id") or "").strip()
         self.vision_provider_id = str(data.get("vision_provider_id") or "").strip()
         self.choice_threshold = _as_float(data.get("choice_threshold"), 0.5)

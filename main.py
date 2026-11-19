@@ -391,6 +391,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "umo": profile.umo,
                 "scene": result.scene,
+                "decision_mode": result.decision_mode,
                 "action": result.action,
                 "length": result.length,
                 "custom_answers": result.custom_answers,
@@ -585,17 +586,22 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         lines = [
             f"快速决策：{'启用' if settings.enabled else '关闭'}",
             f"试运行：{'是' if settings.dry_run else '否'}",
-            "判断提供商："
-            + (settings.decision_provider_id or "（默认，需先在 WebUI 配置）"),
+            "决策模式：" + ("纯随机" if settings.decision_mode == "random" else "模型判断"),
             "表情包来源："
             + (
                 f"meme_manager {status.plugin_version or ''}，{status.candidate_count} 张可用"
                 if (status := self.meme_adapter.status()).available
                 else (status.message or "不可用，仅发文字")
             ),
-            f"判断阈值：{settings.choice_threshold}",
-            f"判断选项温度：{settings.choice_temperature}",
         ]
+        if settings.decision_mode == "model":
+            lines.extend(
+                [
+                    "判断提供商：" + (settings.decision_provider_id or "（默认，需先在 WebUI 配置）"),
+                    f"判断阈值：{settings.choice_threshold}",
+                    f"判断选项温度：{settings.choice_temperature}",
+                ]
+            )
         runtime = self.sessions.get(event.unified_msg_origin)
         result = runtime.last_decision if runtime else None
         if result:

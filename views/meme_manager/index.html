@@ -12,7 +12,7 @@
         <div class="masthead-text">
           <h1 id="heading">快速决策</h1>
           <p class="lede" id="subtitle">
-            每条消息都先交给判断模型，由它决定要不要说话、回哪一条、配不配表情。这里设置判断模型额外参考的背景和问题。
+            设置是否发言、回复目标和配图规则，可用模型判断或按权重抽取。
           </p>
         </div>
         <div class="masthead-side">
@@ -53,6 +53,17 @@
 
           <section class="block">
             <div class="block-head">
+              <h2><label for="decision-mode">决策模式</label></h2>
+            </div>
+            <select id="decision-mode" aria-describedby="decision-mode-help">
+              <option value="model">模型判断</option>
+              <option value="random">纯随机（按权重）</option>
+            </select>
+            <p class="hint" id="decision-mode-help">纯随机跳过判断模型，只按选项权重抽取。温度和判断阈值只用于模型判断。需要发言时，正文仍由会话模型生成。</p>
+          </section>
+
+          <section class="block">
+            <div class="block-head">
               <h2><label for="custom-context">判断模型的背景信息</label></h2>
               <span class="route route-judge">只给判断模型</span>
             </div>
@@ -73,7 +84,7 @@
             </div>
             <div id="config-warning" class="banner banner-danger" role="alert" hidden></div>
             <p class="hint">为每个问题选择用途，可为答案添加当轮提示或调用工具。发送表情使用「选择表情」问题的结果，同一轮最多发送一次。</p>
-            <p class="hint">选项权重默认 1，调高会更偏向该项，设为 0 则不选它。温度在插件设置中调整，适用于选择题和未勾选插件阈值的是否题。</p>
+            <p class="hint">选项权重默认 1，调高会更偏向该项，设为 0 则不选它。</p>
             <ol id="questions" class="questions"></ol>
 
             <div class="questions-foot">

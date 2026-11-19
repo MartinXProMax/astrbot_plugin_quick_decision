@@ -195,6 +195,7 @@ function collectQuestionsFromForm() {
 
 function snapshot() {
   return JSON.stringify({
+    mode: $("decision-mode").value,
     context: $("custom-context").value.trim(),
     questions: collectQuestionsFromForm(),
   });
@@ -375,7 +376,7 @@ function renderQuestion(question, qIndex) {
   });
   const body = h("div", { class: "q-body" }, selectRole, instructions);
   body.append(h("label", null, h("input", {type: "checkbox", checked: question.use_threshold,
-    onchange: e => { question.use_threshold = e.target.checked; }}), " 使用插件判断阈值"));
+    onchange: e => { question.use_threshold = e.target.checked; }}), " 使用插件判断阈值（仅模型判断）"));
   if (question.role === "action") {
     for (const [key, label] of [["proactive_instructions", "冷场时的判断标准"], ["proactive_none_criteria", "冷场时保持沉默的标准"]]) {
       body.append(h("label", {class: "q-instr"}, label, h("textarea", {value: question[key], rows: 1,
@@ -388,7 +389,7 @@ function renderQuestion(question, qIndex) {
     "* 代表当轮每一个候选项，可用 {描述} 引用消息摘要或表情描述。"));
   if (question.type === "boolean") {
     body.append(h("p", {class: "hint"},
-      "勾选插件阈值时，两侧权重均为 1 才按阈值判断。任一权重不为 1 时，忽略阈值并选择加权概率最高的一侧。两种情况下都不按温度抽样。"));
+      "模型判断勾选插件阈值时，两侧权重均为 1 才按阈值判断。调整权重后选择加权概率较高的一侧。这两种情况都不按温度抽样。"));
     body.append(renderBooleanLanes(question));
   } else {
     body.append(renderChoiceLanes(question, qIndex));
@@ -656,6 +657,7 @@ function updateContextCount() {
 }
 
 function fillForm(saved) {
+  $("decision-mode").value = saved.mode;
   $("custom-context").value = saved.context;
   updateContextCount();
   state.questions = saved.questions.map(normalizeQuestion);
@@ -669,6 +671,7 @@ function applyConfig(data, fallbackQuestions) {
   state.tools = data.tools;
   const questions = data.decision_questions ?? fallbackQuestions;
   state.saved = {
+    mode: data.decision_mode === "random" ? "random" : "model",
     context: data.decision_custom_context || "",
     questions: JSON.parse(JSON.stringify(questions)),
   };
@@ -693,6 +696,7 @@ async function loadDecisionConfig() {
 async function saveDecisionConfig() {
   const payload = {
     version: 2,
+    decision_mode: $("decision-mode").value,
     decision_custom_context: $("custom-context").value,
     decision_questions: collectQuestionsFromForm(),
   };
@@ -829,20 +833,21 @@ function probabilityBar(label, value, series) {
   );
 }
 
-function renderProbabilityChart(id, answer) {
-  const rows = probabilityRows(answer);
+function renderProbabilityChart(id, answer, isRandom) {
+  const rows = probabilityRows(answer, isRandom);
   const title = h("h4", null, id);
   if (!rows.length) {
-    const note = answer?.note === "private_passive_default_reply" ? "私聊固定回复，无模型概率。" : "未记录可用的概率分布。";
+    const note = answer?.note === "private_passive_default_reply" ? "私聊固定回复，本题无抽样。" : "未记录可用的概率分布。";
     return h("section", { class: "prob-question" }, title, h("p", { class: "hint" }, note));
   }
-  const isBoolean = !answer.probabilities;
+  const isBoolean = answer.question_type === "boolean" || !answer.probabilities;
   const optionName = (key) => isBoolean ? (key === "true" ? "是" : "否") : key;
   const selected = answer.selected_choice ?? answer.choice;
   const info = [];
   if (Number.isFinite(answer.selection_temperature)) info.push(`温度 ${answer.selection_temperature}`);
   if (selected != null) {
-    info.push(`${Object.hasOwn(answer, "selected_choice") ? "调整后选中" : "模型原选"} ${optionName(selected)}`);
+    const label = isRandom ? "抽中" : Object.hasOwn(answer, "selected_choice") ? "调整后选中" : "模型原选";
+    info.push(`${label} ${optionName(selected)}`);
     const chance = answer.selection_probabilities?.[selected];
     if (Number.isFinite(chance)) info.push(`实际抽中概率 ${percent.format(chance)}`);
   }
@@ -852,7 +857,7 @@ function renderProbabilityChart(id, answer) {
     rows.map(({ key, original, weight, weighted }) => h("div", { class: "prob-option" },
       h("div", { class: "prob-option-name" }, h("b", null, optionName(key)),
         Number.isFinite(weight) && weight !== 1 ? h("small", null, `权重 ×${weight}`) : null),
-      probabilityBar("原始", original, "original"),
+      probabilityBar(isRandom ? "等权基准" : "原始", original, "original"),
       probabilityBar("加权后", weighted, "weighted"),
     )),
   );
@@ -860,6 +865,7 @@ function renderProbabilityChart(id, answer) {
 
 function renderLog(item) {
   const action = normalizeAction(item.action);
+  const isRandom = item.decision_mode === "random";
   const time = splitTime(item.time);
   const answers = Object.entries(item.answers || item.custom_answers || {});
   if (!answers.length && item.length) answers.push(["length", item.length]);
@@ -870,6 +876,7 @@ function renderLog(item) {
     { class: "log-main" },
     h("span", { class: "log-action" }, ACTION_LABELS[action] || item.action || "未知"),
     h("span", { class: "tag" }, SCENE_LABELS[item.scene] || item.scene || "未知场景"),
+    isRandom ? h("span", { class: "tag" }, "纯随机") : null,
     item.use_meme
       ? h("span", { class: "tag", title: "配图" }, icon("image"), item.meme_id || "配图")
       : null,
@@ -913,8 +920,10 @@ function renderLog(item) {
     if (!detail.open) return;
     detail.removeEventListener("toggle", showCharts);
     detail.append(
-      h("p", { class: "hint" }, "加权后按本轮选项权重归一化，温度在此后生效。"),
-      ...Object.entries(raw).map(([id, answer]) => renderProbabilityChart(id, answer)),
+      h("p", { class: "hint" }, isRandom
+        ? "等权基准表示每个候选的初始机会相同。加权后即为实际抽中概率。"
+        : "加权后按本轮选项权重归一化，温度在此后生效。"),
+      ...Object.entries(raw).map(([id, answer]) => renderProbabilityChart(id, answer, isRandom)),
       h("details", { class: "prob-raw" }, h("summary", null, "查看原始数据"),
         h("pre", { class: "log-raw" }, JSON.stringify(raw, null, 2))),
     );

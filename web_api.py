@@ -51,6 +51,7 @@ class WebApiMixin:
     def _decision_config_payload(self, warning: str | None = None) -> dict:
         settings = self.settings
         return {
+            "decision_mode": settings.decision_mode,
             "decision_custom_context": settings.decision_custom_context,
             "version": 2,
             "default_questions": [q.to_dict() for q in default_questions()],
@@ -71,6 +72,9 @@ class WebApiMixin:
         payload = await request.json(default={})
         if not isinstance(payload, dict):
             return error_response("请求体必须是 JSON 对象", status_code=400)
+        mode = payload.get("decision_mode", self.settings.decision_mode)
+        if mode not in ("model", "random"):
+            return error_response("请选择模型判断或纯随机", status_code=400)
         custom_context = str(payload.get("decision_custom_context") or "").strip()
         questions, error = load_questions(
             {
@@ -85,6 +89,7 @@ class WebApiMixin:
         config = getattr(self, "config", None)
         if config is None or not hasattr(config, "save_config"):
             return error_response("当前环境无法写入官方插件配置", status_code=500)
+        config["decision_mode"] = mode
         config["decision_custom_context"] = custom_context
         config["decision_questions"] = json.dumps(
             {"version": 2, "questions": [q.to_dict() for q in questions]},
@@ -96,5 +101,5 @@ class WebApiMixin:
             await save()
         else:
             config.save_config()
-        logger.info("已更新判断模型自定义上下文和判断问题配置")
+        logger.info("已更新判断配置")
         return json_response(self._decision_config_payload(warning=None))

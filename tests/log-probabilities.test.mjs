@@ -19,6 +19,18 @@ test("旧是否题可恢复两侧概率，零权重选项仍可对照", () => {
   assert.deepEqual(weighted.map(r => r.weighted), [1, 0]);
 });
 
+test("纯随机显示等权基准和实际抽中概率，包括零权重选项", () => {
+  const rows = probabilityRows({
+    question_type: "boolean",
+    probabilities: { true: 0.5, false: 0.5 },
+    option_weights: { true: 0, false: 1 },
+    selection_probabilities: { true: 0, false: 1 },
+  }, true);
+  assert.deepEqual(rows.map(r => [r.key, r.original, r.weighted]), [
+    ["true", 0.5, 0], ["false", 0.5, 1],
+  ]);
+});
+
 test("没有分布时不生成虚构的百分比", () => {
   for (const raw of [{}, { choice: "reply", note: "private_passive_default_reply" }, { probability: null }]) {
     assert.deepEqual(probabilityRows(raw), []);

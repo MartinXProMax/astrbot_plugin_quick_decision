@@ -1,4 +1,4 @@
-"""调用官方判断提供商，并解析为业务决策。"""
+"""通过模型判断或按权重抽取，生成业务决策。"""
 
 from __future__ import annotations
 
@@ -158,6 +158,42 @@ def _evaluate_answers(
         spec.id: _evaluate_answer(spec, answers.get(spec.id, _MISSING))
         for spec in ordered
     }
+
+
+def _evaluate_random(spec: DecisionSpec) -> DecisionOutcome:
+    if spec.question is None:
+        return _evaluate_answer(spec, _MISSING)
+    weights = {
+        key: weight
+        for key, weight in spec.option_weights.items()
+        if spec.binding != "action" or key != "join"
+    }
+    probabilities = dict.fromkeys(weights, 1.0 / len(weights))
+    total = sum(weights.values())
+    distribution = {key: weight / total for key, weight in weights.items()} if total else {}
+    eligible = {key: chance for key, chance in distribution.items() if chance > 0}
+    selected = (
+        random.choices(list(eligible), weights=list(eligible.values()), k=1)[0]
+        if eligible
+        else None
+    )
+    outcome = DecisionOutcome(
+        value=spec.default,
+        probabilities=probabilities,
+        selection_probabilities=distribution,
+        raw={
+            "question_type": spec.kind,
+            "probabilities": probabilities,
+            "option_weights": weights,
+            "selected_choice": selected,
+            "selection_probabilities": distribution,
+        },
+    )
+    if selected is None:
+        outcome.status, outcome.reason = "fallback", "no_selectable_option"
+    else:
+        outcome.value = selected == "true" if spec.kind == "boolean" else selected
+    return outcome
 
 
 async def evaluate_specs(
@@ -393,26 +429,29 @@ async def ask_decision(
     at_or_quoted: bool,
     memes: list[dict[str, str]],
 ) -> DecisionResult:
-    """一次 ask() 问完本轮需要的问题。失败时返回带 error 的结果。"""
+    """按当前模式评估本轮问题。失败时返回带 error 的结果。"""
     started = time.monotonic()
     if settings.decision_questions_warning:
         logger.warning("判断问题配置：%s", settings.decision_questions_warning)
-    state = build_state(
-        scene=scene,
-        is_private=is_private,
-        messages=messages,
-        at_or_quoted=at_or_quoted,
-        memes=memes,
-        custom_context=settings.decision_custom_context,
-    )
     specs = _build_specs(settings.decision_questions, scene, messages, memes, settings)
     try:
-        outcomes = await evaluate_specs(
-            context.decision,
-            specs,
-            state=state,
-            provider_id=settings.decision_provider_id,
-        )
+        if settings.decision_mode == "random":
+            outcomes = {spec.id: _evaluate_random(spec) for spec in specs}
+        else:
+            state = build_state(
+                scene=scene,
+                is_private=is_private,
+                messages=messages,
+                at_or_quoted=at_or_quoted,
+                memes=memes,
+                custom_context=settings.decision_custom_context,
+            )
+            outcomes = await evaluate_specs(
+                context.decision,
+                specs,
+                state=state,
+                provider_id=settings.decision_provider_id,
+            )
         result = _assemble_result(specs, outcomes, scene=scene)
     except Exception as exc:  # noqa: BLE001
         error = str(exc) or type(exc).__name__
@@ -436,4 +475,5 @@ async def ask_decision(
         )
     result.duration_ms = int((time.monotonic() - started) * 1000)
     result.dry_run = settings.dry_run
+    result.decision_mode = settings.decision_mode
     return result

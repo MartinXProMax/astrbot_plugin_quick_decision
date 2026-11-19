@@ -14,6 +14,7 @@ from astrbot.api.provider import DecisionError
 from astrbot_plugin_quick_decision.config_util import (
     PluginSettings,
     default_decision_questions,
+    default_questions,
     dump_decision_questions,
 )
 from astrbot_plugin_quick_decision.decision_engine import (
@@ -68,6 +69,88 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
             if memes is not None
             else [{"id": "cat", "description": "微笑"}],
         )
+
+    async def test_random_mode_uses_weights_without_provider_temperature_or_threshold(self):
+        questions = default_questions()
+        action, target, length, use_meme, meme = questions
+        next(o for o in action.options if o.id == "none").weight = 0
+        length.options[0].weight, length.options[1].weight = 3, 1
+        use_meme.true_weight, use_meme.false_weight = 1, 0
+        target.options[0].session_hint = "只在回复目标题实际作答时注入"
+        meme.options[0].session_hint = "只在表情候选题实际作答时注入"
+
+        saved = {"version": 2, "questions": [q.to_dict() for q in questions]}
+        for temperature in (0, 2):
+            with self.subTest(temperature=temperature):
+                # Draw above the 75% boundary so the less likely option wins.
+                with patch("random._inst.random", return_value=0.9):
+                    result = await ask_decision(
+                        SimpleNamespace(),
+                        settings=PluginSettings({
+                            "decision_mode": "random",
+                            "choice_temperature": temperature,
+                            "choice_threshold": 1.0,
+                            "decision_questions": saved,
+                        }),
+                        scene="group_passive",
+                        is_private=False,
+                        messages=[message("")],
+                        at_or_quoted=False,
+                        memes=[],
+                    )
+                self.assertFalse(result.failed)
+                self.assertEqual(result.decision_mode, "random")
+                self.assertEqual(result.action, "reply")
+                self.assertEqual(
+                    result.raw["action"]["selection_probabilities"], {"none": 0, "reply": 1}
+                )
+                length_log = result.raw["length"]
+                self.assertAlmostEqual(length_log["selection_probabilities"]["short"], 0.75)
+                self.assertEqual(length_log["probabilities"], {"short": 0.5, "long": 0.5})
+                self.assertNotIn("selection_temperature", length_log)
+                self.assertEqual(result.length, "long")
+                self.assertIs(result.answers["use_meme"], True)
+                self.assertEqual(result.tool_calls["send_meme"].status, "skipped")
+                for question in (target, meme):
+                    self.assertEqual(result.outcomes[question.id].reason, "not_asked")
+                    self.assertNotIn(question.options[0].session_hint, result.session_hints)
+
+    async def test_random_mode_preserves_fixed_private_reply_and_dynamic_candidate_weights(self):
+        questions = default_questions()
+        action, target, _, use_meme, meme = questions
+        next(o for o in action.options if o.id == "reply").weight = 0
+        target.options[0].weight = 0
+        use_meme.false_weight = 0
+        meme.options[0].weight, meme.options[1].weight = 0, 3
+        # An old alias should not become another random candidate.
+        settings = PluginSettings({
+            "decision_mode": "random",
+            "decision_questions": {"version": 2, "questions": [q.to_dict() for q in questions]},
+        })
+        service = SimpleNamespace(ask=AsyncMock())
+        for scene in ("group_passive", "private_passive"):
+            with self.subTest(scene=scene):
+                result = await self.ask(
+                    service,
+                    settings=settings,
+                    scene=scene,
+                    memes=[{"id": "cat", "description": "微笑"}, {"id": "dog", "description": "点头"}],
+                )
+                self.assertFalse(result.failed)
+                self.assertEqual(
+                    result.raw["meme_id"]["selection_probabilities"],
+                    {"none": 0, "cat": 0.5, "dog": 0.5},
+                )
+                if scene == "group_passive":
+                    self.assertEqual(result.action, "none")
+                    self.assertEqual(result.target_message_id, "m1")
+                    self.assertNotIn("join", result.raw["action"]["probabilities"])
+                else:
+                    self.assertEqual(result.action, "reply")
+                    self.assertIsNone(result.target_message_id)
+                    self.assertEqual(result.raw["action"]["note"], "private_passive_default_reply")
+                    self.assertIn(result.tool_calls["send_meme"].args["meme_id"], {"cat", "dog"})
+        service.ask.assert_not_awaited()
 
     async def test_one_batch_preserves_question_and_sampling_order(self) -> None:
         configured = default_decision_questions() + [

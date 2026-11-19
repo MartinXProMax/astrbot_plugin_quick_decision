@@ -621,6 +621,37 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             asked.update(_build_questions(scene, messages, [{"id": "cat", "description": "猫"}]))
         self.assertEqual(asked, ids)
 
+    async def test_web_saves_random_mode_and_preserves_it_for_old_clients(self) -> None:
+        from astrbot_plugin_quick_decision import web_api
+
+        class Config(dict):
+            save_config_async = AsyncMock()
+            save_config = save_config_async
+
+        self.plugin.config = Config(self.plugin.config)
+        payload = self.plugin._decision_config_payload()
+        self.assertEqual(payload["decision_mode"], "model")
+        payload["decision_mode"] = "random"
+        request = SimpleNamespace(method="POST", json=AsyncMock(return_value=payload))
+
+        with (
+            patch.object(web_api, "request", request),
+            patch.object(web_api, "json_response", side_effect=lambda value: value),
+        ):
+            saved = await self.plugin.web_decision_config()
+            self.assertEqual(saved["decision_mode"], "random")
+            self.assertEqual(self.plugin.config["decision_mode"], "random")
+            request.method = "GET"
+            self.assertEqual((await self.plugin.web_decision_config())["decision_mode"], "random")
+            request.method = "POST"
+            payload.pop("decision_mode")
+            self.assertEqual((await self.plugin.web_decision_config())["decision_mode"], "random")
+            payload["decision_mode"] = []
+            with patch.object(web_api, "error_response") as error:
+                await self.plugin.web_decision_config()
+                error.assert_called_once_with("请选择模型判断或纯随机", status_code=400)
+        self.assertEqual(self.plugin.config.save_config_async.await_count, 2)
+
     async def test_private_unmerged_keeps_default_official_path(self) -> None:
         event = FakeEvent(
             umo="aiocqhttp:FriendMessage:1",
