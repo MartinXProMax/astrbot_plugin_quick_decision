@@ -273,8 +273,14 @@ def _parse_one_question(
         or (role != "answer" and qtype != "choice")
     ):
         return None, f"问题 {question_id} 的用途与题型不匹配"
+    stage = "pre_reply" if legacy else item.get("stage", "pre_reply")
+    if stage not in ("pre_reply", "post_reply"):
+        return None, f"问题 {question_id} 的判断阶段无效"
+    if stage == "post_reply" and role != "answer":
+        return None, f"输出后的问题 {question_id} 只支持记录答案"
     common = {
         "role": role,
+        "stage": stage,
         "use_threshold": not legacy and _as_bool(item.get("use_threshold"), False),
         "branches": {} if legacy else item.get("branches", {}),
     }
@@ -423,7 +429,7 @@ def parse_decision_questions(
 
 
 def _validate_branches(questions: list[DecisionQuestion]) -> str | None:
-    ids = {q.id for q in questions}
+    by_id = {q.id: q for q in questions}
     graph = TopologicalSorter()
     for question in questions:
         if question.branches == {}:
@@ -436,8 +442,10 @@ def _validate_branches(questions: list[DecisionQuestion]) -> str | None:
         for option, target in question.branches.items():
             if option not in options:
                 return f"问题 {question.id} 的分支选项不存在：{option}"
-            if not isinstance(target, str) or target not in ids:
+            if not isinstance(target, str) or target not in by_id:
                 return f"问题 {question.id} 的选项 {option} 指向不存在的后继问题：{target}"
+            if question.stage == "post_reply" and by_id[target].stage == "pre_reply":
+                return f"输出后的问题 {question.id} 不能指向输出前的问题 {target}"
             graph.add(target, question.id)
     try:
         graph.prepare()

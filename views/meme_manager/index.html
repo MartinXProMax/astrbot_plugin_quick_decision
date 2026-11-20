@@ -53,13 +53,21 @@
 
           <section class="block">
             <div class="block-head">
-              <h2><label for="decision-mode">决策模式</label></h2>
+              <h2 id="mode-heading">决策模式</h2>
             </div>
-            <select id="decision-mode" aria-describedby="decision-mode-help">
-              <option value="model">模型判断</option>
-              <option value="random">纯随机（按权重）</option>
-            </select>
-            <p class="hint" id="decision-mode-help">纯随机跳过判断模型，只按选项权重抽取。温度和判断阈值只用于模型判断。需要发言时，正文仍由会话模型生成。</p>
+            <div class="mode-cards" role="radiogroup" aria-labelledby="mode-heading">
+              <label class="mode-card">
+                <input type="radio" name="decision-mode" value="model" checked />
+                <span class="mode-title">模型判断</span>
+                <span class="mode-desc">判断模型读完上下文后回答每个问题，再按权重、温度和判断阈值选定答案。</span>
+              </label>
+              <label class="mode-card">
+                <input type="radio" name="decision-mode" value="random" />
+                <span class="mode-title">纯随机（按权重）</span>
+                <span class="mode-desc">跳过判断模型，只按选项权重抽取。温度和判断阈值不生效。</span>
+              </label>
+            </div>
+            <p class="hint">两种模式下，需要发言时正文都由会话模型生成。</p>
           </section>
 
           <section class="block">
@@ -83,19 +91,40 @@
               </div>
             </div>
             <div id="config-warning" class="banner banner-danger" role="alert" hidden></div>
-            <p class="hint">在选项的「后继问题」中选择下一题。没有前置选项的问题从本轮开始就参与判断，后继问题只在对应选项被选中时参与。</p>
-            <p class="hint">选项权重默认 1，调高会更偏向该项，设为 0 则不选它。</p>
-            <details id="workflow" class="tips" hidden>
-              <summary>查看判断树</summary>
-              <ul id="workflow-tree"></ul>
+            <p class="hint">判断模型按顺序回答每个问题。权重默认 1，调高会更偏向该项，设为 0 则不选它；会话提示也按问题顺序拼接。</p>
+
+            <details id="flow" class="flow" open hidden>
+              <summary>
+                <span class="flow-title">判断流程</span>
+                <span class="flow-sub">从入口问题开始，选中设置了「接着问」的答案才会进入下一题。点击问题可跳到编辑处。</span>
+              </summary>
+              <div id="flow-body" class="flow-body"></div>
             </details>
+
+            <div class="questions-bar">
+              <p id="question-stats" class="questions-stats"></p>
+              <button id="toggle-all" type="button" class="btn btn-text">全部展开</button>
+            </div>
             <ol id="questions" class="questions"></ol>
 
             <div class="questions-foot">
-              <button id="add-question" type="button" class="btn btn-outline">
-                <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
-                添加问题
-              </button>
+              <details id="add-menu" class="menu">
+                <summary class="btn btn-outline">
+                  <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+                  添加问题
+                </summary>
+                <div class="menu-list" role="menu">
+                  <button type="button" role="menuitem" data-template="choice">
+                    <b>选择题</b><span>让判断模型在几个选项中选一个，例如语气、话题</span>
+                  </button>
+                  <button type="button" role="menuitem" data-template="boolean">
+                    <b>是否题</b><span>只回答是或否，例如「要不要追问一句」</span>
+                  </button>
+                  <button type="button" role="menuitem" data-template="post">
+                    <b>回复后检查</b><span>会话模型写完回复后，检查正文是否符合要求并记录答案</span>
+                  </button>
+                </div>
+              </details>
               <button id="restore-default" type="button" class="btn btn-text">恢复默认问题</button>
             </div>
           </section>
@@ -104,7 +133,7 @@
             <p id="config-msg" class="savebar-msg" role="status">已与插件配置一致</p>
             <div class="savebar-actions">
               <button id="discard" type="button" class="btn btn-ghost" hidden>撤销更改</button>
-              <button id="save-config" type="button" class="btn btn-primary">保存判断配置</button>
+              <button id="save-config" type="button" class="btn btn-primary" title="Ctrl + S">保存判断配置</button>
             </div>
           </div>
         </div>
@@ -123,7 +152,17 @@
                 条
               </label>
             </div>
-            <ol id="logs" class="log-list" aria-live="polite"></ol>
+            <div class="log-toolbar">
+              <div id="log-filter" class="seg" role="group" aria-label="按结果筛选">
+                <button type="button" data-filter="all" aria-pressed="true">全部</button>
+                <button type="button" data-filter="speak" aria-pressed="false">发言</button>
+                <button type="button" data-filter="silent" aria-pressed="false">沉默</button>
+                <button type="button" data-filter="issue" aria-pressed="false">失败或降级</button>
+              </div>
+              <input id="log-search" type="search" placeholder="搜索会话、问题、答案或错误" aria-label="搜索决策日志" autocomplete="off" />
+            </div>
+            <p id="log-count" class="log-count" aria-live="polite"></p>
+            <ol id="logs" class="log-list"></ol>
             <p id="logs-empty" class="empty" hidden>还没有决策记录。机器人收到消息并完成一次判断后，结果会出现在这里。</p>
           </section>
         </div>

@@ -88,6 +88,7 @@ def _install_astrbot_stubs() -> None:
     provider.DecisionBooleanAnswer = DecisionBooleanAnswer
     provider.DecisionError = DecisionError
     provider.ProviderRequest = type("ProviderRequest", (), {})
+    provider.LLMResponse = type("LLMResponse", (), {})
 
     class TextPart:
         def __init__(self, text: str = "") -> None:

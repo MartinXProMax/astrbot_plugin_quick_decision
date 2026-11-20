@@ -23,6 +23,7 @@ from astrbot_plugin_quick_decision.decision_engine import (
     _parse_answers,
     _question_info,
     ask_decision,
+    evaluate_post_reply,
     evaluate_specs,
 )
 from astrbot_plugin_quick_decision.models import (
@@ -73,6 +74,56 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
             if memes is not None
             else [{"id": "cat", "description": "微笑"}],
         )
+
+    async def test_post_workflow_receives_reply_and_only_selected_answers(self):
+        first = DecisionQuestion(id="gate", type="boolean", instructions="检查回复？",
+                                 branches={"true": "matches"})
+        check = DecisionQuestion(id="matches", type="boolean", instructions="符合要求？",
+                                 stage="post_reply", branches={"true": "rating", "false": "why"})
+        rating = default_questions()[2]
+        rating.id, rating.stage = "rating", "post_reply"
+        why = DecisionQuestion(id="why", type="boolean", instructions="需要解释？", stage="post_reply")
+        settings = PluginSettings({"decision_provider_id": "judge", "decision_questions": {
+            "version": 2, "questions": [q.to_dict() for q in (first, check, rating, why)]}})
+        service = SimpleNamespace(ask=AsyncMock(side_effect=[
+            {"gate": DecisionBooleanAnswer(probability=1)},
+            {"matches": DecisionBooleanAnswer(probability=1)},
+            {"rating": choice("short", short=1)},
+            {"gate": DecisionBooleanAnswer(probability=0)},
+        ]))
+        result = await self.ask(service, scene="private_passive", settings=settings)
+        self.assertEqual(list(service.ask.await_args.args[0]), ["gate"])
+        self.assertNotIn("assistant_reply", service.ask.await_args.kwargs["state"])
+        report = await evaluate_post_reply(SimpleNamespace(decision=service), result.post_plan,
+                                           "就一句话。", result.answers)
+        self.assertEqual(report["answers"], {"matches": True, "rating": "short"})
+        self.assertEqual(report["outcomes"]["why"]["reason"], "branch_not_selected")
+        self.assertEqual(set(report["raw"]), {"matches", "rating"})
+        for call, question, previous in zip(service.ask.await_args_list[1:], ["matches", "rating"],
+                                             [{"gate": True}, {"gate": True, "matches": True}], strict=True):
+            self.assertEqual(list(call.args[0]), [question])
+            state = call.kwargs["state"]
+            self.assertEqual(call.kwargs["provider_id"], "judge")
+            self.assertEqual(state["stage"], "post_reply")
+            self.assertEqual(state["assistant_reply"], "就一句话。")
+            self.assertEqual(state["previous_answers"], previous)
+        self.assertEqual(result.session_hints, [])
+        skipped = await self.ask(service, scene="private_passive", settings=settings)
+        self.assertIsNone(skipped.post_plan)
+
+    async def test_post_random_without_provider_and_skipped_without_reply(self):
+        post = {"id": "check", "stage": "post_reply", "type": "boolean",
+                "instructions": "记录结果", "true_weight": 0, "false_weight": 1}
+        config = {"decision_mode": "random", "decision_questions": {"version": 2, "questions": [post]}}
+        for scene, dry_run in [("private_passive", False), ("group_passive", False), ("private_passive", True)]:
+            settings = PluginSettings({**config, "dry_run": dry_run})
+            result = await self.ask(None, scene=scene, settings=settings)
+            if scene == "group_passive" or dry_run:
+                self.assertIsNone(result.post_plan)
+                continue
+            report = await evaluate_post_reply(None, result.post_plan, "你好", result.answers)
+            self.assertEqual(report["answers"], {"check": False})
+            self.assertEqual(report["raw"]["check"]["selection_probabilities"], {"true": 0, "false": 1})
 
     async def test_random_mode_uses_weights_without_provider_temperature_or_threshold(self):
         questions = default_questions()

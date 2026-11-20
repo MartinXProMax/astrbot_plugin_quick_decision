@@ -79,6 +79,7 @@ def _install_main_stubs() -> None:
 
         event_message_type = _deco
         on_llm_request = _deco
+        on_llm_response = _deco
         on_decorating_result = _deco
         after_message_sent = _deco
         on_astrbot_loaded = _deco
@@ -610,6 +611,7 @@ def _make_plugin(tmp: str, *, config=None, conv_mgr=None):
         ),
     )
     plugin._silence_task = None
+    plugin._post_tasks = set()
     plugin._generate_calls: list = []
     plugin._send_calls: list = []
     return plugin, main_mod
@@ -735,6 +737,79 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(runtime.pending_pipeline)
         self.assertTrue(runtime.deciding)
         self.assertEqual(self.decision_calls, 1)
+
+    async def test_old_editor_cannot_erase_post_reply_stage(self):
+        from astrbot_plugin_quick_decision import web_api
+
+        class Config(dict):
+            save_config = AsyncMock()
+            save_config_async = save_config
+
+        self.plugin.config = Config(self.plugin.config)
+        payload = self.plugin._decision_config_payload()
+        payload["version"] = 4
+        length = next(q for q in payload["decision_questions"] if q["id"] == "length")
+        length["stage"] = "post_reply"
+        request = SimpleNamespace(method="POST", json=AsyncMock(return_value=payload))
+        with (
+            patch.object(web_api, "request", request),
+            patch.object(web_api, "json_response", side_effect=lambda value: value),
+            patch.object(web_api, "error_response", side_effect=lambda msg, status_code: status_code),
+        ):
+            self.assertEqual((await self.plugin.web_decision_config())["version"], 4)
+            del length["stage"]
+            for version in (2, 3):
+                payload["version"] = version
+                self.assertEqual(await self.plugin.web_decision_config(), 409)
+            self.plugin.config.save_config_async.assert_awaited_once()
+            reloaded = self.plugin.settings.decision_questions
+            self.assertEqual(next(q.stage for q in reloaded if q.id == "length"), "post_reply")
+
+    async def test_official_final_text_schedules_one_post_workflow_for_original_round(self):
+        from astrbot.api.provider import DecisionBooleanAnswer
+
+        self.main_mod.ask_decision = self._orig_ask
+        post = {"id": "check", "stage": "post_reply", "type": "boolean", "instructions": "达标？"}
+        self.plugin.config["decision_questions"] = {"version": 2, "questions": [
+            dict(post, branches={"true": "extra"}), dict(post, id="extra"),
+        ]}
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def judge(questions, *, state):
+            if "extra" in questions:
+                raise TimeoutError("判断超时")
+            started.set()
+            await release.wait()
+            return {"check": DecisionBooleanAnswer(probability=1)}
+
+        ask = AsyncMock(side_effect=judge)
+        self.plugin.context.decision = SimpleNamespace(ask=ask)
+        event = FakeEvent(text="你好", is_private=True, at_or_wake=True)
+        await self.plugin.on_chat_message(event)
+        result = event.get_extra("quick_decision")
+        response = dict(role="assistant", is_chunk=False, tools_call_name=[], completion_text="完整回复")
+        for fields in ({"is_chunk": True}, {"tools_call_name": ["search"]}, {"role": "err"},
+                       {"completion_text": "   "}):
+            await self.plugin.on_llm_response(event, SimpleNamespace(**(response | fields)))
+        self.assertFalse(self.plugin._post_tasks)
+        final = SimpleNamespace(**response)
+        await asyncio.wait_for(self.plugin.on_llm_response(event, final), timeout=1)
+        await self.plugin.on_llm_response(event, final)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        self.assertEqual(len(self.plugin._post_tasks), 1)
+        await self.plugin.sessions.append_log({"round_id": "next"})
+        release.set()
+        await asyncio.gather(*self.plugin._post_tasks)
+        next_round, original = self.plugin.sessions.recent_logs()
+        self.assertNotIn("post_decision", next_round)
+        self.assertEqual(original["round_id"], result.round_id)
+        post_log = original["post_decision"]
+        self.assertEqual(post_log["answers"], {"check": True})
+        self.assertEqual(post_log["outcomes"]["extra"]["reason"], "batch_error")
+        self.assertEqual(post_log["error"], "判断超时")
+        self.assertFalse(result.failed)
+        self.assertEqual(final.completion_text, "完整回复")
+        self.assertEqual(ask.await_count, 2)
 
     async def test_group_interrupt_yields_request_llm_without_stop(self) -> None:
         event = FakeEvent(
@@ -1081,6 +1156,39 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(send_calls), 1)
         self.assertIsNone(send_calls[0].get("event"))
         self.main_mod.send_decision_message = self._orig_send
+
+    async def test_proactive_sends_before_post_decision_finishes(self):
+        from astrbot.api.provider import DecisionChoiceAnswer
+
+        self.main_mod.ask_decision = self._orig_ask
+        gate = next(q for q in self.plugin._decision_config_payload()["decision_questions"] if q["role"] == "action")
+        post = {"id": "check", "type": "boolean", "stage": "post_reply", "instructions": "在问候吗？"}
+        self.plugin.config["decision_questions"] = {"version": 2, "questions": [gate, post]}
+        judging = asyncio.Event()
+
+        async def judge(questions, *, state):
+            if "check" in questions:
+                self.assertEqual(state["assistant_reply"], "早上好")
+                judging.set()
+                await asyncio.Future()
+            return {"action": DecisionChoiceAnswer(choice="proactive", probability=1,
+                                                    probabilities={"proactive": 1}, confidence=1)}
+
+        ask = AsyncMock(side_effect=judge)
+        self.plugin.context.decision = SimpleNamespace(ask=ask)
+        runtime = self.plugin.sessions.ensure(SessionProfile("room", False))
+        with (
+            patch.object(self.main_mod, "generate_text", AsyncMock(return_value="早上好")),
+            patch.object(self.main_mod, "send_decision_message", AsyncMock(return_value=True)) as send,
+        ):
+            await asyncio.wait_for(self.plugin._run_proactive(runtime), timeout=1)
+            self.assertEqual(send.await_args.kwargs["text"], "早上好")
+        await asyncio.wait_for(judging.wait(), timeout=1)
+        task, = self.plugin._post_tasks
+        await self.plugin.terminate()
+        self.assertTrue(task.cancelled())
+        self.assertFalse(self.plugin._post_tasks)
+        self.assertEqual(ask.await_count, 2)
 
 
 class MemeAfterSegmentsTests(unittest.IsolatedAsyncioTestCase):

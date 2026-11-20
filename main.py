@@ -11,11 +11,11 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Plain
 from astrbot.api.platform import MessageType
-from astrbot.api.provider import ProviderRequest
+from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
 from .config_util import PluginSettings
-from .decision_engine import ask_decision
+from .decision_engine import ask_decision, evaluate_post_reply
 from .decision_tools import skip_tools
 from .event_utils import (
     event_has_command_handler,
@@ -66,6 +66,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             self.data_dir, log_limit=self.settings.decision_log_limit
         )
         self._silence_task: asyncio.Task[None] | None = None
+        self._post_tasks: set[asyncio.Task[None]] = set()
         self.register_plugin_web_apis()
 
     @property
@@ -103,6 +104,9 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 await self._silence_task
             except asyncio.CancelledError:
                 pass
+        for task in self._post_tasks:
+            task.cancel()
+        await asyncio.gather(*self._post_tasks, return_exceptions=True)
         logger.info("快速决策插件已卸载。")
 
     # --- 消息监听与决策 ---
@@ -338,6 +342,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if not text:
             logger.warning("聊天模型没有返回文本，取消发送：%s", profile.umo)
             return
+        self._schedule_post_decision(result, text)
         from .official_segment import platform_name_from_event
 
         sent_texts: list[str] = []
@@ -500,6 +505,34 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             return
         apply_session_hints(req, decision)
         event.set_extra("_qd_hints_applied", True)
+
+    def _schedule_post_decision(self, decision: DecisionResult, text: str) -> None:
+        plan = decision.post_plan
+        if plan is None or not text.strip():
+            return
+        decision.post_plan = None
+        settings = self.settings
+        if not settings.enabled or settings.dry_run:
+            return
+
+        async def judge_and_log():
+            try:
+                report = await evaluate_post_reply(self.context, plan, text, decision.answers)
+                await self.sessions.update_round_log(decision.round_id, post_decision=report)
+            except Exception:
+                logger.exception("无法记录本轮输出后判断：%s", decision.round_id)
+
+        task = asyncio.create_task(judge_and_log())
+        self._post_tasks.add(task)
+        task.add_done_callback(self._post_tasks.discard)
+
+    @filter.on_llm_response()
+    async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
+        decision = self._pipeline_decision(event)
+        if decision is None or decision.post_plan is None:
+            return
+        if resp and resp.role == "assistant" and not resp.is_chunk and not resp.tools_call_name:
+            self._schedule_post_decision(decision, resp.completion_text or "")
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):

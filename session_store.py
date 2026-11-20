@@ -160,6 +160,9 @@ class SessionStore:
                 return
 
     async def update_tool_log(self, round_id: str, calls: list[dict]) -> None:
+        await self.update_round_log(round_id, tool_calls=calls)
+
+    async def update_round_log(self, round_id: str, **fields) -> None:
         async with self._log_lock:
             try:
                 lines = self.log_path.read_text(encoding="utf-8").splitlines()
@@ -169,7 +172,7 @@ class SessionStore:
                     except ValueError:
                         continue
                     if isinstance(row, dict) and row.get("round_id") == round_id:
-                        row["tool_calls"] = calls
+                        row.update(fields)
                         lines[i] = json.dumps(row, ensure_ascii=False)
                         tmp = self.log_path.with_suffix(".jsonl.tmp")
                         tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")

@@ -50,16 +50,20 @@ class WebApiMixin:
 
     def _decision_config_payload(self, warning: str | None = None) -> dict:
         settings = self.settings
+        questions = settings.decision_questions
+        version = 2
+        if any(q.stage == "post_reply" for q in questions):
+            version = 4
+        elif any(q.branches for q in questions):
+            version = 3
         return {
             "decision_mode": settings.decision_mode,
             "decision_custom_context": settings.decision_custom_context,
-            "version": 3 if any(q.branches for q in settings.decision_questions) else 2,
+            "version": version,
             "default_questions": [q.to_dict() for q in default_questions()],
             "roles": QUESTION_ROLES,
             "tools": {key: label for key, (label, _, _) in TOOLS.items()},
-            "decision_questions": [
-                item.to_dict() for item in settings.decision_questions
-            ],
+            "decision_questions": [item.to_dict() for item in questions],
             "warning": warning
             if warning is not None
             else settings.decision_questions_warning,
@@ -77,8 +81,10 @@ class WebApiMixin:
         if mode not in ("model", "random"):
             return error_response("请选择模型判断或纯随机", status_code=400)
         version = payload.get("version")
-        if type(version) is not int or version not in (2, 3):
+        if type(version) is not int or version not in (2, 3, 4):
             return error_response("无法识别的编辑器版本，请刷新页面", status_code=400)
+        if version < 4 and any(q.stage == "post_reply" for q in settings.decision_questions):
+            return error_response("当前配置含有输出后问题，请刷新编辑页后再保存", status_code=409)
         if version == 2 and any(q.branches for q in settings.decision_questions):
             return error_response("当前配置含有后继问题，请刷新编辑页后再保存", status_code=409)
         custom_context = str(payload.get("decision_custom_context") or "").strip()

@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
+
+if TYPE_CHECKING:
+    from .decision_engine import PostDecisionPlan
 
 ActionType = Literal["none", "reply", "join", "proactive"]
 # join 仅为历史日志兼容，运行时与 reply 同义。
@@ -134,6 +137,7 @@ class DecisionQuestion:
     proactive_none_criteria: str = ""
     ask_private: bool = False
     branches: dict[str, str] = field(default_factory=dict)
+    stage: Literal["pre_reply", "post_reply"] = "pre_reply"
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -155,6 +159,8 @@ class DecisionQuestion:
             )
         if self.branches:
             data["branches"] = dict(self.branches)
+        if self.stage == "post_reply":
+            data["stage"] = self.stage
         return data
 
 
@@ -208,6 +214,7 @@ class DecisionResult:
     decision_mode: Literal["model", "random"] = "model"
     target_summary: str = ""
     meme_description: str = ""
+    post_plan: PostDecisionPlan | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.use_meme and self.meme_id and not self.tool_calls:

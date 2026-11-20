@@ -56,6 +56,14 @@ class DecisionSpec:
     is_root: bool = True
     branches: dict[str, str] = field(default_factory=dict)
     candidate_descriptions: dict[str, str] = field(default_factory=dict)
+    stage: str = "pre_reply"
+
+
+@dataclass
+class PostDecisionPlan:
+    specs: list[DecisionSpec]
+    state: dict[str, Any] | None
+    provider_id: str
 
 
 def _select_option(
@@ -267,13 +275,13 @@ def _question_info(context, umo, scene, last_activity):
 
 
 def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
-                 context=None, umo="", last_activity=None):
+                 context=None, umo="", last_activity=None, stage="pre_reply"):
     specs = []
     proactive = scene.endswith("_proactive")
     info = None
     children = {target for item in configured for target in item.branches.values()}
     for item in configured:
-        if not item.enabled:
+        if not item.enabled or (stage is not None and item.stage != stage):
             continue
         role = item.role
         fixed = role == "action" and scene == "private_passive" and not item.ask_private
@@ -292,6 +300,7 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
             default=default,
             is_root=item.id not in children,
             branches=dict(item.branches),
+            stage=item.stage,
             threshold=settings.choice_threshold
             if item.use_threshold
             else (0.5 if item.type == "boolean" else 0.0),
@@ -376,6 +385,19 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
     return specs
 
 
+def _successor(spec, outcome):
+    if not spec.branches or not outcome.has_answer:
+        return None
+    key = outcome.value
+    if spec.kind == "boolean":
+        key = "true" if key else "false"
+    elif spec.binding == "action":
+        key = normalize_action(key)
+    elif spec.binding in {"target", "meme"} and key != spec.default:
+        key = "*"
+    return spec.branches.get(key)
+
+
 def _workflow_batches(specs, outcomes):
     """每次交出已到达的一层；调用方写入该层实际结果后才安排后继。"""
     pending = {spec.id: spec for spec in specs if not spec.is_root}
@@ -386,20 +408,46 @@ def _workflow_batches(specs, outcomes):
         yield batch
         following = []
         for spec in batch:
-            outcome = outcomes[spec.id]
-            if not spec.branches or not outcome.has_answer:
-                continue
-            key = outcome.value
-            if spec.kind == "boolean":
-                key = "true" if key else "false"
-            elif spec.binding == "action":
-                key = normalize_action(key)
-            elif spec.binding in {"target", "meme"} and key != spec.default:
-                key = "*"
-            child = pending.pop(spec.branches.get(key), None)
+            child = pending.pop(_successor(spec, outcomes[spec.id]), None)
             if child is not None:
                 following.append(child)
         batch = following
+
+
+async def _evaluate_batch(context, batch, outcomes, state, provider_id):
+    if state is None:
+        return {spec.id: _evaluate_random(spec) for spec in batch}
+    if not batch[0].is_root:
+        previous = dict(state.get("previous_answers", {}))
+        previous.update({key: o.value for key, o in outcomes.items() if o.has_answer})
+        state = {**state, "previous_answers": previous}
+    return await evaluate_specs(context.decision, batch, state=state, provider_id=provider_id)
+
+
+async def evaluate_post_reply(context, plan: PostDecisionPlan, text: str, previous_answers: dict):
+    """使用生成前的快照评估回复，保留失败批次之前已经得到的答案。"""
+    state = plan.state
+    if state is not None:
+        state = {**state, "stage": "post_reply", "assistant_reply": text,
+                 "previous_answers": previous_answers}
+    outcomes = {}
+    report = {}
+    for batch in _workflow_batches(plan.specs, outcomes):
+        try:
+            outcomes.update(await _evaluate_batch(context, batch, outcomes, state, plan.provider_id))
+        except Exception as exc:
+            report["error"] = str(exc) or type(exc).__name__
+            for spec in batch:
+                outcomes[spec.id] = DecisionOutcome(None, status="fallback", reason="batch_error")
+            logger.warning("输出后判断失败：%s", report["error"])
+            break
+    report["answers"] = {key: o.value for key, o in outcomes.items() if o.has_answer}
+    report["outcomes"] = {
+        key: {"status": o.status, "reason": o.reason} for key, o in outcomes.items()
+        if not o.has_answer
+    }
+    report["raw"] = {key: o.raw for key, o in outcomes.items() if o.raw}
+    return report
 
 
 def _build_questions(scene, messages, memes, configured=None):
@@ -524,24 +572,22 @@ async def ask_decision(
                 memes=memes,
                 custom_context=settings.decision_custom_context,
             )
-        specs = _build_specs(
+        all_specs = _build_specs(
             settings.decision_questions, scene, messages, memes, settings,
-            context=context, umo=umo, last_activity=last_activity,
+            context=context, umo=umo, last_activity=last_activity, stage=None,
         )
+        specs = [s for s in all_specs if s.stage == "pre_reply"]
+        post_specs = [s for s in all_specs if s.stage == "post_reply"]
+        provider_id = settings.decision_provider_id
         for batch in _workflow_batches(specs, outcomes):
-            if state is None:
-                outcomes.update({spec.id: _evaluate_random(spec) for spec in batch})
-            else:
-                batch_state = state
-                if not batch[0].is_root:
-                    previous = {key: o.value for key, o in outcomes.items() if o.has_answer}
-                    batch_state = {**state, "previous_answers": previous}
-                evaluated = await evaluate_specs(
-                    context.decision, batch, state=batch_state,
-                    provider_id=settings.decision_provider_id,
-                )
-                outcomes.update(evaluated)
+            outcomes.update(await _evaluate_batch(context, batch, outcomes, state, provider_id))
         result = _assemble_result(specs, outcomes, scene=scene)
+        if post_specs and result.should_speak() and not settings.dry_run:
+            activated = {_successor(s, outcomes[s.id]) for s in specs}
+            for spec in post_specs:
+                spec.is_root = spec.is_root or spec.id in activated
+            if any(s.is_root for s in post_specs):
+                result.post_plan = PostDecisionPlan(post_specs, state, provider_id)
     except Exception as exc:  # noqa: BLE001
         error = str(exc) or type(exc).__name__
         if isinstance(exc, DecisionError):

@@ -170,6 +170,20 @@ class QuestionToolTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(load_questions(old, strict=True)[1])
         self.assertEqual(load_questions('{"version": 2, "questions": []}'), ([], None))
 
+    def test_post_question_stage_and_forward_links_are_validated(self):
+        saved = {"version": 2, "questions": self.questions}
+        self.gate["branches"] = {"reply": "length"}
+        self.length["stage"] = "post_reply"
+        questions, warning = load_questions(saved, strict=True)
+        self.assertIsNone(warning)
+        self.assertEqual([q.to_dict() for q in questions], self.questions)
+        self.length["branches"] = {"short": "illustration"}
+        self.assertIn("不能指向输出前", load_questions(saved, strict=True)[1])
+        self.gate["stage"] = "post_reply"
+        self.assertIn("只支持记录答案", load_questions(saved, strict=True)[1])
+        self.gate["stage"] = "unknown"
+        self.assertIn("阶段无效", load_questions(saved, strict=True)[1])
+
     def test_legacy_extra_fields_do_not_grant_new_roles_or_tools(self):
         old = dict(self.gate, id="tone")
         old["options"][1]["tool"] = "send_meme"
