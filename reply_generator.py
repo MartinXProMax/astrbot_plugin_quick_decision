@@ -28,7 +28,7 @@ def session_hint_text(decision: DecisionResult) -> str | None:
     if decision.should_speak() and not decision.dry_run:
         summary: dict[str, object] = {"动作": "冷场主动发言" if decision.action == "proactive" else "回复"}
         if decision.target_message_id:
-            summary["回复目标"] = (decision.target_summary or decision.target_message_id)[:160]
+            summary["回复目标"] = decision.target_summary or decision.target_message_id
         if decision.length:
             summary["篇幅"] = "简短" if decision.length == "short" else "详细"
         answers = {

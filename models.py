@@ -137,6 +137,7 @@ class DecisionQuestion:
     proactive_none_criteria: str = ""
     ask_private: bool = False
     branches: dict[str, str] = field(default_factory=dict)
+    triggers: list[dict] | None = None
     stage: Literal["pre_reply", "post_reply"] = "pre_reply"
     # None 继承插件默认模式，model/random 可覆盖单题。
     decision_mode: Literal["model", "random"] | None = None
@@ -153,7 +154,11 @@ class DecisionQuestion:
                 for suffix in ("session_hint", "weight", "tool"):
                     key = f"{side}_{suffix}"
                     data[key] = getattr(self, key)
-        if self.role == "action":
+        if self.triggers is not None:
+            data["triggers"] = [dict(t) for t in self.triggers]
+            if self.role == "action" and any(o.id == "reply" for o in self.options):
+                data["ask_private"] = self.ask_private
+        elif self.role == "action":
             data.update(
                 proactive_instructions=self.proactive_instructions,
                 ask_private=self.ask_private,
@@ -214,6 +219,7 @@ class DecisionResult:
     outcomes: dict[str, DecisionOutcome] = field(default_factory=dict)
 
     tool_calls: dict[str, ToolCall] = field(default_factory=dict)
+    batches: list[dict] = field(default_factory=list)
     round_id: str = ""
     decision_mode: Literal["model", "random", "mixed"] = "model"
     target_summary: str = ""

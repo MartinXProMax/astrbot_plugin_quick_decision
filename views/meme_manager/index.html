@@ -91,14 +91,19 @@
               </div>
             </div>
             <div id="config-warning" class="banner banner-danger" role="alert" hidden></div>
-            <p class="hint">判断模型按顺序回答每个问题。权重默认 1，调高会更偏向该项，设为 0 则不选它；会话提示也按问题顺序拼接。</p>
+            <p class="hint">先处理发言许可，再采用命中的后续答案。权重默认 1，调高会更偏向该项，设为 0 则不选它；会话提示也按问题顺序拼接。</p>
 
             <details id="flow" class="flow" open hidden>
               <summary>
                 <span class="flow-title">判断流程</span>
-                <span class="flow-sub">从入口问题开始，选中设置了「接着问」的答案才会进入下一题。点击问题可跳到编辑处。</span>
+                <span class="flow-sub">触发线显示哪个答案生效后可以采用后续判断。点击问题可跳到编辑处。</span>
               </summary>
               <div id="flow-body" class="flow-body"></div>
+              <details id="decision-preview"><summary>预览示例路径</summary>
+                <div class="settings-grid" id="preview-fields"></div>
+                <button id="run-preview" class="btn btn-outline" type="button">预览请求</button>
+                <div id="preview-result" aria-live="polite"></div>
+              </details>
             </details>
 
             <div class="questions-bar">

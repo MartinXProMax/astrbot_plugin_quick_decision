@@ -1226,6 +1226,25 @@ textarea.is-invalid {
   margin-bottom: -6px;
 }
 
+.q-triggers,
+#decision-preview[open] {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.q-triggers > .btn,
+#run-preview {
+  justify-self: start;
+}
+
+#decision-preview {
+  margin: 0.75rem 0;
+}
+
+#preview-result {
+  overflow-wrap: anywhere;
+}
+
 .q-prompt {
   display: grid;
   gap: 6px;

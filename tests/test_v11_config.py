@@ -547,10 +547,8 @@ class DecisionConfigTests(unittest.TestCase):
         self.assertIn("use_meme", questions)
         self.assertIn("meme_id", questions)
         self.assertNotIn("disabled_tone", questions)
-        self.assertEqual(
-            questions["use_meme"].instructions,
-            "这次回复是否适合配上一张表情包？没有合适的表情时应为否。",
-        )
+        self.assertIn("这次回复是否适合配上一张表情包", questions["use_meme"].instructions)
+        self.assertIn("正文发送成功后", questions["use_meme"].instructions)
 
     def test_parse_answers_collects_hints_and_length_compat(self) -> None:
         settings = PluginSettings(

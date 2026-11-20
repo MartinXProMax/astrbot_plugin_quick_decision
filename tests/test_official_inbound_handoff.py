@@ -651,7 +651,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
 
         payload = self.plugin._decision_config_payload()
         self.assertNotIn("builtin_questions", payload)
-        self.assertEqual(payload["version"], 3)
+        self.assertEqual(payload["version"], 5)
         self.assertIn("send_meme", payload["tools"])
         ids = {q["id"] for q in payload["decision_questions"]}
         messages = [BufferedMessage("msg1", "u1", "User", "user", "Hello")]
@@ -691,6 +691,23 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
                 error.assert_called_once_with("请选择模型判断或纯随机", status_code=400)
         self.assertEqual(self.plugin.config.save_config_async.await_count, 2)
 
+    async def test_failed_web_save_restores_previous_settings(self):
+        from astrbot_plugin_quick_decision import web_api
+
+        class Config(dict):
+            save_config = AsyncMock(side_effect=OSError("disk full"))
+            save_config_async = save_config
+
+        self.plugin.config = Config(self.plugin.config)
+        original = dict(self.plugin.config)
+        payload = dict(self.plugin._decision_config_payload(), decision_mode="random")
+        with (
+            patch.object(web_api, "request", SimpleNamespace(method="POST", json=AsyncMock(return_value=payload))),
+            patch.object(web_api, "error_response", side_effect=lambda message, status_code: status_code),
+        ):
+            self.assertEqual(await self.plugin.web_decision_config(), 500)
+        self.assertEqual(dict(self.plugin.config), original)
+
     async def test_old_editor_cannot_erase_saved_branches(self) -> None:
         from astrbot_plugin_quick_decision import web_api
 
@@ -709,15 +726,15 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin.web_decision_config()
             saved = self.plugin.config["decision_questions"]
             for q in payload["decision_questions"]:
-                q.pop("branches", None)
+                q.pop("triggers", None)
             payload["version"] = 2
             self.assertEqual(await self.plugin.web_decision_config(), 409)
             self.assertEqual(self.plugin.config["decision_questions"], saved)
             self.plugin.config.save_config_async.assert_awaited_once()
             payload["version"] = 3
-            self.assertEqual((await self.plugin.web_decision_config())["version"], 2)
+            self.assertEqual(await self.plugin.web_decision_config(), 409)
             payload["version"] = 2
-            self.assertEqual((await self.plugin.web_decision_config())["version"], 2)
+            self.assertEqual(await self.plugin.web_decision_config(), 409)
 
     async def test_private_unmerged_keeps_default_official_path(self) -> None:
         event = FakeEvent(
@@ -747,16 +764,18 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
 
         self.plugin.config = Config(self.plugin.config)
         payload = self.plugin._decision_config_payload()
-        payload["version"] = 4
+        payload["version"] = 5
         length = next(q for q in payload["decision_questions"] if q["id"] == "length")
         length["stage"] = "post_reply"
+        for t in length["triggers"]:
+            t.pop("ask_with_parent", None)
         request = SimpleNamespace(method="POST", json=AsyncMock(return_value=payload))
         with (
             patch.object(web_api, "request", request),
             patch.object(web_api, "json_response", side_effect=lambda value: value),
             patch.object(web_api, "error_response", side_effect=lambda msg, status_code: status_code),
         ):
-            self.assertEqual((await self.plugin.web_decision_config())["version"], 4)
+            self.assertEqual((await self.plugin.web_decision_config())["version"], 5)
             del length["stage"]
             for version in (2, 3):
                 payload["version"] = version
@@ -774,7 +793,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
 
         self.plugin.config = Config(self.plugin.config)
         payload = self.plugin._decision_config_payload()
-        payload["version"] = 4
+        payload["version"] = 5
         question = next(q for q in payload["decision_questions"] if q["id"] == "length")
         question["decision_mode"] = "random"
         request = SimpleNamespace(method="POST", json=AsyncMock(return_value=payload))
@@ -784,7 +803,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             patch.object(web_api, "error_response", side_effect=lambda msg, status_code: status_code),
         ):
             saved = await self.plugin.web_decision_config()
-            self.assertEqual(saved["version"], 4)
+            self.assertEqual(saved["version"], 5)
             for q in payload["decision_questions"]:
                 q.pop("decision_mode", None)
             payload["version"] = 3
@@ -793,10 +812,12 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_official_final_text_schedules_one_post_workflow_for_original_round(self):
         from astrbot.api.provider import DecisionBooleanAnswer
+        from astrbot_plugin_quick_decision.config_util import legacy_questions
 
         self.main_mod.ask_decision = self._orig_ask
         post = {"id": "check", "stage": "post_reply", "type": "boolean", "instructions": "达标？"}
         self.plugin.config["decision_questions"] = {"version": 2, "questions": [
+            legacy_questions()[0].to_dict(),
             dict(post, branches={"true": "extra"}), dict(post, id="extra"),
         ]}
         started, release = asyncio.Event(), asyncio.Event()
@@ -1004,24 +1025,25 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(runtime.last_decision.should_speak())
                 self.assertTrue(runtime.last_decision.outcomes)
 
-    async def test_private_silence_survives_a_later_workflow_timeout(self) -> None:
+    async def test_private_silence_never_enters_later_workflow(self) -> None:
         from astrbot.api.provider import DecisionChoiceAnswer
         from astrbot_plugin_quick_decision.decision_engine import ask_decision
 
         self.main_mod.ask_decision = ask_decision
         questions = self.plugin._decision_config_payload()["decision_questions"]
         action = next(q for q in questions if q["role"] == "action")
-        action.update(id="speak", ask_private=True, branches={"none": "length"})
-        self.plugin.config["decision_questions"] = {"version": 2, "questions": questions}
+        action["ask_private"] = True
+        self.plugin.config["decision_questions"] = {"version": 3, "questions": questions}
         self.plugin.context.decision = SimpleNamespace(ask=AsyncMock(side_effect=[
-            {"speak": DecisionChoiceAnswer(choice="none", probability=1,
+            {"action": DecisionChoiceAnswer(choice="none", probability=1,
                                           probabilities={"none": 1}, confidence=1)},
             TimeoutError("后继超时"),
         ]))
         ev = FakeEvent(umo="aiocqhttp:FriendMessage:silence", is_private=True, at_or_wake=True)
         await self.plugin.on_chat_message(ev)
         result = self.plugin.sessions.get(ev.unified_msg_origin).last_decision
-        self.assertEqual(result.error, "后继超时")
+        self.assertIsNone(result.error)
+        self.plugin.context.decision.ask.assert_awaited_once()
         self.assertEqual(result.action, "none")
         self.assertTrue(ev.is_stopped())
 
@@ -1127,11 +1149,11 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.main_mod.ask_decision = ask_decision
         self.plugin.context.get_config = lambda umo: {"timezone": "UTC"}
         questions = self.plugin._decision_config_payload()["decision_questions"]
-        gate = next(q for q in questions if q["role"] == "action")
-        gate.update(proactive_instructions="是否应该开口？", branches={"none": "length"})
+        gate = next(q for q in questions if q["id"] == "idle_action")
+        gate["instructions"] = "是否应该开口？"
         length = next(q for q in questions if q["id"] == "length")
         length["instructions"] = "现在是 {当前时间}，已沉默 {冷场时长}。"
-        self.plugin.config["decision_questions"] = {"version": 2, "questions": questions}
+        self.plugin.config["decision_questions"] = {"version": 3, "questions": questions}
         service = AsyncMock(return_value={
             gate["id"]: DecisionChoiceAnswer(choice="none", probability=1,
                                              probabilities={"none": 1}, confidence=1),
@@ -1144,14 +1166,13 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             runtime.last_bot_ts = now - 2301
         with patch("time.time", return_value=now):
             await self.plugin._check_silence()
-        self.assertEqual(service.await_count, 4)
-        for root, child in (service.await_args_list[:2], service.await_args_list[2:]):
+        self.assertEqual(service.await_count, 2)
+        for root in service.await_args_list:
             action_prompt = root.args[0][gate["id"]].instructions
             self.assertIn("当前时间：2025-01-01 00:00:00+00:00", action_prompt)
             self.assertIn("冷场时长：38 分 21 秒", action_prompt)
             self.assertNotIn("38 分", root.args[0]["use_meme"].instructions)
-            self.assertEqual(child.args[0]["length"].instructions,
-                             "现在是 2025-01-01 00:00:00+00:00，已沉默 38 分 21 秒。")
+            self.assertIn("现在是 2025-01-01 00:00:00+00:00，已沉默 38 分 21 秒。", root.args[0]["length"].instructions)
 
     async def test_proactive_still_uses_self_generate(self) -> None:
         generate_calls = []
@@ -1187,9 +1208,10 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         from astrbot.api.provider import DecisionChoiceAnswer
 
         self.main_mod.ask_decision = self._orig_ask
-        gate = next(q for q in self.plugin._decision_config_payload()["decision_questions"] if q["role"] == "action")
+        gate = next(q for q in self.plugin._decision_config_payload()["decision_questions"] if q["id"] == "idle_action")
         post = {"id": "check", "type": "boolean", "stage": "post_reply", "instructions": "在问候吗？"}
-        self.plugin.config["decision_questions"] = {"version": 2, "questions": [gate, post]}
+        post["triggers"] = [{"event": "silence_elapsed"}]
+        self.plugin.config["decision_questions"] = {"version": 3, "questions": [gate, post]}
         judging = asyncio.Event()
 
         async def judge(questions, *, state):
@@ -1197,7 +1219,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(state["assistant_reply"], "早上好")
                 judging.set()
                 await asyncio.Future()
-            return {"action": DecisionChoiceAnswer(choice="proactive", probability=1,
+            return {"idle_action": DecisionChoiceAnswer(choice="proactive", probability=1,
                                                     probabilities={"proactive": 1}, confidence=1)}
 
         ask = AsyncMock(side_effect=judge)

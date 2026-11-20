@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import math
 from graphlib import CycleError, TopologicalSorter
@@ -39,7 +40,7 @@ MEME_PROMPT = (
     "若需要配图，请根据描述选择最合适的一张表情包；不合适则选 none。"
     "只根据描述选择，不要假设你能看到原图。"
 )
-TARGET_DEFAULT = {"latest": "针对最近一条消息回复"}
+TARGET_DEFAULT = {"latest": "沿用会话上下文，自然参与当前话题"}
 MEME_DEFAULT = {"none": "不配表情包"}
 
 
@@ -74,7 +75,7 @@ def default_decision_questions() -> list[DecisionQuestion]:
     ]
 
 
-def default_questions(legacy=None) -> list[DecisionQuestion]:
+def legacy_questions(legacy=None) -> list[DecisionQuestion]:
     extra = default_decision_questions() if legacy is None else legacy
     action_options = {
         **ACTION_CRITERIA_GROUP,
@@ -122,6 +123,88 @@ def default_questions(legacy=None) -> list[DecisionQuestion]:
             ],
         ),
     ]
+
+
+EVENTS = {"message_received": "收到消息", "silence_elapsed": "达到冷场条件"}
+SPEAK_OPTION = {"message_received": "reply", "silence_elapsed": "proactive"}
+OPTION_EFFECTS = {
+    "action": {"none": "结束本轮，丢弃提前取得的后续答案", "reply": "允许生成回复，继续处理命中的后续题",
+               "proactive": "允许根据近期会话生成冷场发言，继续处理命中的后续题"},
+    "target": {"latest": "沿用当前话题，不锁定具体消息",
+               "*": "将选中消息的发送人和原文交给会话模型，引用遵循群聊发送设置"},
+    "meme": {"none": "不选择表情", "*": "选定本轮表情，已安排发送工具时在正文发送成功后尝试发送"},
+    "answer": {"*": "记录该答案并交给会话模型"},
+    "post_reply": {"*": "将答案记录到本轮回复后判断日志"},
+}
+
+
+def migrate_questions(old):
+    """原独立题仍可提前提问，原显式分支继续等待父题。"""
+    questions = deepcopy(old)
+    by_id = {q.id: q for q in questions}
+    links = [(q.id, option, child) for q in questions for option, child in q.branches.items()]
+    children = {child for _, _, child in links}
+    gates = {}
+    warnings = []
+    migrated = []
+    for q in questions:
+        q.branches = {}
+        q.triggers = []
+        if q.role != "action":
+            migrated.append(q)
+            continue
+        cold = deepcopy(q)
+        cold.id = "idle_" + q.id
+        while cold.id in by_id:
+            cold.id += "_2"
+        by_id[cold.id] = cold
+        cold.instructions = q.proactive_instructions or q.instructions
+        cold.options = [o for o in cold.options if o.id != "reply"]
+        for option in cold.options:
+            if option.id == "none" and q.proactive_none_criteria:
+                option.criteria = q.proactive_none_criteria
+        cold.ask_private = False
+        q.options = [o for o in q.options if o.id != "proactive"]
+        if q.id in children:
+            warnings.append(f"旧发言题 {q.id} 有上游条件，已停用，请重新设置入口")
+            q.enabled = cold.enabled = False
+        for gate, event in ((q, "message_received"), (cold, "silence_elapsed")):
+            gate.triggers = [{"event": event}]
+            gate.proactive_instructions = gate.proactive_none_criteria = ""
+            silent = next(o for o in gate.options if o.id == "none")
+            if silent.tool or silent.session_hint:
+                warnings.append(f"{gate.id} 的沉默选项已停止执行提示和工具")
+                silent.tool = silent.session_hint = ""
+        gates[q.id] = cold.id
+        migrated.extend((q, cold))
+    for parent, option, child in links:
+        q = by_id[child]
+        if parent in gates and option == "none":
+            warnings.append(f"已断开沉默分支 {parent} → {child}，可重新设置生效条件")
+            continue
+        if q.role != "action":
+            source = gates[parent] if parent in gates and option == "proactive" else parent
+            q.triggers.append({"question": source, "option": option})
+    enabled_gates = {q.triggers[0]["event"]: q.id for q in migrated if q.role == "action" and q.enabled}
+    for q in migrated:
+        if q.role != "action" and q.id not in children:
+            for event in EVENTS:
+                if event == "silence_elapsed" and q.role == "target":
+                    continue
+                condition = ({"question": enabled_gates[event], "option": SPEAK_OPTION[event]}
+                             if event in enabled_gates else {"event": event})
+                if q.stage == "pre_reply":
+                    condition["ask_with_parent"] = True
+                q.triggers.append(condition)
+        if q.role == "target":
+            for option in q.options:
+                if option.id == "latest" and option.criteria == "针对最近一条消息回复":
+                    option.criteria = TARGET_DEFAULT["latest"]
+    return migrated, "；".join(warnings) or None
+
+
+def default_questions(legacy=None):
+    return migrate_questions(legacy_questions(legacy))[0]
 
 
 def dump_decision_questions(questions: list[DecisionQuestion]) -> str:
@@ -247,7 +330,7 @@ def _parse_choice_options(
 
 
 def _parse_one_question(
-    item: Any, *, index: int, seen_ids: set[str], strict: bool, legacy: bool
+    item: Any, *, index: int, seen_ids: set[str], strict: bool, legacy: bool, trigger_format: bool = False
 ) -> tuple[DecisionQuestion | None, str | None]:
     label = f"第 {index + 1} 个问题"
     if not isinstance(item, dict):
@@ -299,12 +382,17 @@ def _parse_one_question(
             "target": {"latest", "*"},
             "meme": {"none", "*"},
         }.get(role)
+        if trigger_format and role == "action":
+            ids = {o.id for o in options}
+            if ids not in ({"none", "reply"}, {"none", "proactive"}):
+                return None, f"发言题 {question_id} 需要沉默和对应的发言选项"
+            required = None
         if required and {o.id for o in options} != required:
             return (
                 None,
                 f"问题 {question_id} 的用途要求选项为 {', '.join(sorted(required))}",
             )
-        if role == "action" and any(
+        if not trigger_format and role == "action" and any(
             not any(o.weight > 0 for o in options if o.id in ("none", active))
             for active in ("reply", "proactive")
         ):
@@ -376,7 +464,7 @@ def _coerce_questions_payload(value: Any) -> tuple[list[Any] | None, str | None]
 
 
 def parse_decision_questions(
-    value: Any, *, strict: bool = False, legacy: bool = True
+    value: Any, *, strict: bool = False, legacy: bool = True, trigger_format: bool = False
 ) -> tuple[list[DecisionQuestion], str | None]:
     """解析自定义判断问题。
 
@@ -403,9 +491,13 @@ def parse_decision_questions(
     active_roles: dict[str, str] = {}
     for index, item in enumerate(payload):
         question, item_error = _parse_one_question(
-            item, index=index, seen_ids=seen_ids, strict=strict, legacy=legacy
+            item, index=index, seen_ids=seen_ids, strict=strict, legacy=legacy, trigger_format=trigger_format
         )
-        if question is not None and question.enabled and question.role != "answer":
+        if question is not None and trigger_format:
+            if "branches" in item or not isinstance(item.get("triggers"), list):
+                return [], f"问题 {question.id} 需要明确的 triggers 数组"
+            question.triggers = item["triggers"]
+        if question is not None and question.enabled and question.role != "answer" and not (trigger_format and question.role == "action"):
             if question.role in active_roles:
                 item_error = (
                     f"问题 {question.id} 与 {active_roles[question.role]} 用途冲突，"
@@ -428,7 +520,7 @@ def parse_decision_questions(
         if not questions and payload and legacy:
             return default_decision_questions(), warning + "，已回退到默认长短问题"
         return questions, warning
-    branch_error = _validate_branches(questions)
+    branch_error = _validate_triggers(questions) if trigger_format else _validate_branches(questions)
     return ([], branch_error) if branch_error else (questions, None)
 
 
@@ -458,8 +550,62 @@ def _validate_branches(questions: list[DecisionQuestion]) -> str | None:
     return None
 
 
+def _validate_triggers(questions):
+    by_id = {q.id: q for q in questions}
+    graph = TopologicalSorter()
+    gates = {}
+    for q in questions:
+        seen = set()
+        if q.role == "action" and (len(q.triggers) != 1 or not isinstance(q.triggers[0], dict)
+                                   or "event" not in q.triggers[0]):
+            return f"控制发言题 {q.id} 需要一个事件入口"
+        for t in q.triggers:
+            if not isinstance(t, dict) or type(t.get("ask_with_parent", False)) is not bool:
+                return f"问题 {q.id} 的生效条件或提问时机无效"
+            early = t.get("ask_with_parent", False)
+            if "event" in t:
+                event = t["event"]
+                if set(t) - {"event", "ask_with_parent"} or not isinstance(event, str) or event not in EVENTS:
+                    return f"问题 {q.id} 的事件无效"
+                key = (event,)
+                if early and (q.role == "action" or q.stage == "post_reply"):
+                    return f"问题 {q.id} 不能随发言入口提前提问"
+                if q.role == "action":
+                    if SPEAK_OPTION[event] not in {o.id for o in q.options}:
+                        return f"问题 {q.id} 的发言选项与事件不匹配"
+                    if q.enabled and event in gates:
+                        return f"事件「{EVENTS[event]}」已有启用的发言题 {gates[event]}"
+                    if q.enabled:
+                        gates[event] = q.id
+                    silent = next(o for o in q.options if o.id == "none")
+                    if silent.tool or silent.session_hint:
+                        return f"问题 {q.id} 的沉默选项不能绑定提示或工具"
+            else:
+                parent_id, option = t.get("question"), t.get("option")
+                if not isinstance(parent_id, str) or not isinstance(option, str) or set(t) - {"question","option","ask_with_parent"}:
+                    return f"问题 {q.id} 的上游条件无效"
+                parent = by_id.get(parent_id)
+                if parent is None:
+                    return f"问题 {q.id} 的上游 {parent_id} 不存在"
+                options = {o.id for o in parent.options} if parent.type == "choice" else {"true","false"}
+                if option not in options or (parent.role == "action" and option == "none"):
+                    return f"问题 {q.id} 的上游选项不存在或为沉默"
+                if parent.stage != q.stage and (parent.stage == "post_reply" or early):
+                    return f"问题 {q.id} 的触发条件与回复阶段冲突"
+                key = (parent_id, option)
+                graph.add(q.id, parent_id)
+            if key in seen:
+                return f"问题 {q.id} 有重复生效条件"
+            seen.add(key)
+    try:
+        graph.prepare()
+    except CycleError as exc:
+        return "生效条件形成循环：" + " → ".join(exc.args[1])
+    return None
+
+
 def load_questions(value, *, strict=False):
-    """旧数组仅存附加题；版本 2 保存完整列表，空列表也有效。"""
+    """读取旧附加题数组、版本 2 分支或版本 3 触发条件。"""
     if not strict and (value is None or (isinstance(value, str) and not value.strip())):
         return default_questions(), None
     if isinstance(value, str) and value.strip():
@@ -472,11 +618,15 @@ def load_questions(value, *, strict=False):
     if isinstance(value, dict) and "version" in value:
         if (
             type(value.get("version")) is not int
-            or value["version"] != 2
+            or value["version"] not in (2, 3)
             or not isinstance(value.get("questions"), list)
         ):
             return [], "无法识别的问题配置版本或格式"
-        return parse_decision_questions(value["questions"], strict=strict, legacy=False)
+        if value["version"] == 3:
+            return parse_decision_questions(value["questions"], strict=True, legacy=False, trigger_format=True)
+        old, warning = parse_decision_questions(value["questions"], strict=strict, legacy=False)
+        questions, migrated_warning = migrate_questions(old)
+        return questions, "；".join(w for w in (warning, migrated_warning) if w) or None
     legacy, warning = parse_decision_questions(value, strict=strict)
     if warning and strict:
         return [], warning

@@ -117,7 +117,7 @@ class ActionNoneReplyTests(unittest.TestCase):
 
     def test_proactive_questions_unchanged(self) -> None:
         questions = _build_questions("group_proactive", _sample_messages(), [])
-        self.assertEqual(set(questions["action"].criteria), {"none", "proactive"})
+        self.assertEqual(set(questions["idle_action"].criteria), {"none", "proactive"})
         self.assertEqual(set(ACTION_CRITERIA_PROACTIVE), {"none", "proactive"})
         self.assertNotIn("target_message_id", questions)
 

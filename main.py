@@ -394,6 +394,8 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 "round_id": result.round_id,
                 "tool_calls": [asdict(c) for c in result.tool_calls.values()],
                 "answers": result.answers,
+                "batches": result.batches,
+                "outcomes": {key: o.reason for key, o in result.outcomes.items() if not o.has_answer},
                 "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "umo": profile.umo,
                 "scene": result.scene,

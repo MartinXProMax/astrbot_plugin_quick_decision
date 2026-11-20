@@ -13,6 +13,7 @@ from astrbot_plugin_quick_decision.config_util import (
     PluginSettings,
     default_decision_questions,
     default_questions,
+    legacy_questions,
     load_questions,
 )
 from astrbot_plugin_quick_decision.decision_engine import ask_decision
@@ -28,7 +29,7 @@ def choice(key):
 
 class QuestionToolTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.questions = [q.to_dict() for q in default_questions(default_decision_questions())]
+        self.questions = [q.to_dict() for q in legacy_questions(default_decision_questions())]
         self.gate, _, self.length, self.trigger, self.picture = self.questions
         self.gate.update(id="speak", ask_private=True, instructions="现在要回吗？")
         self.picture["id"] = "illustration"
@@ -62,7 +63,7 @@ class QuestionToolTests(unittest.IsolatedAsyncioTestCase):
         )
         asked = ask.call_args.args[0]
         self.assertEqual(asked["speak"].instructions, "现在要回吗？")
-        self.assertEqual(asked["illustration"].criteria["cat"], "点头")
+        self.assertIn("点头", asked["illustration"].criteria["cat"])
         call = result.tool_calls["send_meme"]
         self.assertEqual(call.sources, ["length=short", "use_meme=false"])
         self.assertEqual(call.args, {"meme_id": "cat"})
@@ -100,12 +101,15 @@ class QuestionToolTests(unittest.IsolatedAsyncioTestCase):
                 ctx = SimpleNamespace(send_message=AsyncMock())
                 await run_tools(ctx, umo="room", resolver=None, decision=result)
                 ctx.send_message.assert_not_awaited()
-                self.assertEqual(result.tool_calls["send_meme"].status, "skipped")
+                if gate == "none":
+                    self.assertFalse(result.tool_calls)
+                else:
+                    self.assertEqual(result.tool_calls["send_meme"].status, "skipped")
 
     async def test_deleted_questions_stay_deleted_after_reload(self):
         self.questions.clear()
         for scene, expected in [
-            ("private_passive", "reply"),
+            ("private_passive", "none"),
             ("group_passive", "none"),
             ("group_proactive", "none"),
         ]:
@@ -113,7 +117,7 @@ class QuestionToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.action, expected)
             self.assertFalse(result.tool_calls)
             ask.assert_not_awaited()
-        self.assertEqual(len(load_questions("[]")[0]), 4)
+        self.assertEqual(len(load_questions("[]")[0]), 5)
 
     def test_reject_unknown_tools_and_ambiguous_role_before_save(self):
         self.questions.append(dict(self.picture, id="other"))
@@ -135,6 +139,7 @@ class QuestionToolTests(unittest.IsolatedAsyncioTestCase):
         saved = {"version": 2, "questions": self.questions}
         questions, warning = load_questions(saved)
         expected_ids = [q["id"] for q in self.questions if q is not duplicate]
+        expected_ids.insert(expected_ids.index("speak") + 1, "idle_speak")
         self.assertEqual([q.id for q in questions], expected_ids)
         self.assertIn("duplicate_picture", warning)
         self.assertIn("illustration", warning)
@@ -146,7 +151,8 @@ class QuestionToolTests(unittest.IsolatedAsyncioTestCase):
         saved = {"version": 2, "questions": self.questions}
         questions, warning = load_questions(saved, strict=True)
         self.assertIsNone(warning)
-        self.assertEqual([q.to_dict() for q in questions], self.questions)
+        upgraded = {"version": 3, "questions": [q.to_dict() for q in questions]}
+        self.assertEqual(load_questions(upgraded, strict=True), (questions, None))
         for branches, message in [
             ({"true": "missing"}, "不存在"),
             ({"other": "length"}, "选项不存在"),
@@ -176,7 +182,8 @@ class QuestionToolTests(unittest.IsolatedAsyncioTestCase):
         self.length["stage"] = "post_reply"
         questions, warning = load_questions(saved, strict=True)
         self.assertIsNone(warning)
-        self.assertEqual([q.to_dict() for q in questions], self.questions)
+        upgraded = {"version": 3, "questions": [q.to_dict() for q in questions]}
+        self.assertEqual(load_questions(upgraded, strict=True), (questions, None))
         self.length["branches"] = {"short": "illustration"}
         self.assertIn("不能指向输出前", load_questions(saved, strict=True)[1])
         self.gate["stage"] = "post_reply"
@@ -189,11 +196,36 @@ class QuestionToolTests(unittest.IsolatedAsyncioTestCase):
         old["options"][1]["tool"] = "send_meme"
         questions, warning = load_questions([old])
         self.assertIsNone(warning)
-        self.assertEqual([q.id for q in questions if q.role == "action"], ["action"])
+        self.assertEqual([q.id for q in questions if q.role == "action"], ["action", "idle_action"])
         tone = next(q for q in questions if q.id == "tone")
         self.assertEqual(tone.role, "answer")
         self.assertFalse(tone.use_threshold)
         self.assertFalse(any(o.tool for o in tone.options))
+
+    def test_v3_invalid_triggers_fail_as_a_unit(self):
+        base = [q.to_dict() for q in default_questions()]
+        for condition in ({"event": "unknown"}, {"question": "action", "option": "none"},
+                          {"question": "missing", "option": "short"}, {"question": "length", "option": "short"},
+                          {"event": "message_received", "ask_with_parent": 1}, {"event": []}):
+            with self.subTest(condition=condition):
+                edited = [dict(q, triggers=[condition]) if q["id"] == "length" else q for q in base]
+                questions, error = load_questions({"version": 3, "questions": edited})
+                self.assertEqual(questions, [])
+                self.assertTrue(error)
+        duplicate = dict(base[0], id="second_gate")
+        self.assertIn("已有", load_questions({"version": 3, "questions": [*base, duplicate]})[1])
+
+    def test_migrate_renamed_gate_collision_and_conflicting_silence_edge(self):
+        self.gate["branches"] = {"none": "length", "proactive": "illustration"}
+        self.gate["proactive_instructions"] = "冷场问这个"
+        self.questions.append({"id": "idle_speak", "type": "boolean", "instructions": "另一个问题"})
+        migrated, warning = load_questions({"version": 2, "questions": self.questions})
+        q = {item.id: item for item in migrated}
+        self.assertIn("沉默", warning)
+        self.assertEqual(q["length"].triggers, [])
+        self.assertEqual(q["idle_speak_2"].instructions, "冷场问这个")
+        self.assertEqual(q["illustration"].triggers, [{"question":"idle_speak_2", "option":"proactive"}])
+        self.assertEqual(load_questions({"version": 3, "questions":[item.to_dict() for item in migrated]})[1], None)
 
     async def test_tool_receipt_updates_only_its_original_round(self):
         with tempfile.TemporaryDirectory() as tmp:
