@@ -14,7 +14,7 @@ from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import TextPart
 
 from .decision_tools import meme_chain, run_tools, send_chain, skip_tools
-from .models import DecisionResult, normalize_action
+from .models import DecisionResult
 
 try:
     from astrbot.core.platform.astr_message_event import streaming_response_event
@@ -38,17 +38,15 @@ def session_hint_text(decision: DecisionResult) -> str | None:
     hints = [str(item).strip() for item in decision.session_hints if str(item).strip()]
     if decision.should_speak() and not decision.dry_run:
         summary: dict[str, object] = {"动作": "冷场主动发言" if decision.action == "proactive" else "回复"}
-        if decision.target_message_id:
-            summary["回复目标"] = decision.target_summary or decision.target_message_id
-        if decision.length:
+        if decision.target_summary:
+            summary["回复目标"] = decision.target_summary
+        if decision.context_fields:
+            summary["本轮资料"] = decision.context_fields
+        elif decision.length:
             summary["篇幅"] = "简短" if decision.length == "short" else "详细"
-        answers = {
-            key: value for key, value in decision.custom_answers.items()
-            if key != "length" or not decision.length
-        }
-        if answers:
-            summary["已选答案"] = answers
-        call = decision.tool_calls.get("send_meme")
+        if decision.custom_answers:
+            summary["已选答案"] = decision.custom_answers
+        call = next((c for c in decision.tool_calls.values() if c.when == "after_send" and c.status == "planned"), None)
         if call and call.status == "planned" and call.args.get("meme_id"):
             summary["配图"] = "正文发送成功后，插件会尝试另发一张表情"
             if decision.meme_description:
@@ -86,7 +84,7 @@ def build_send_chain(
     if (
         quote_target
         and decision.target_message_id
-        and normalize_action(decision.action) == "reply"
+        and decision.should_speak()
     ):
         try:
             chain.chain.append(Reply(id=decision.target_message_id))
@@ -118,6 +116,9 @@ def take_event_decision(event) -> DecisionResult | None:
 
 def official_text_was_sent(event) -> bool:
     """尽所知判断官方本轮文字是否已发出。全部失败时 aiocqhttp 不会置位 _has_send_oper。"""
+    receipt = event.get_extra("_qd_text_receipt") if hasattr(event, "get_extra") else None
+    if receipt is not None:
+        return receipt
     if getattr(event, "_has_send_oper", None) is False:
         return False
     get_result = getattr(event, "get_result", None)
@@ -169,17 +170,22 @@ def strip_reply_components(chain: list | None) -> None:
     chain[:] = [comp for comp in chain if not _is_reply_component(comp)]
 
 
+def active_event_runner(event):
+    runner = _ACTIVE_AGENT_RUNNERS.get(event.unified_msg_origin)
+    if runner is not None and runner.run_context.context.event is event:
+        return runner
+    return None
+
+
 def official_generation_failed(event) -> bool:
     if event.get_extra("_qd_llm_error") or event.get_extra("_third_party_runner_error"):
         return True
     # 内置 runner 收到 role=err 时会直接返回普通文字，跳过 on_llm_response。
-    runner = _ACTIVE_AGENT_RUNNERS.get(event.unified_msg_origin)
-    if runner is not None and runner.run_context.context.event is event:
-        return getattr(runner.get_final_llm_resp(), "role", None) == "err"
-    return False
+    runner = active_event_runner(event)
+    return runner is not None and getattr(runner.get_final_llm_resp(), "role", None) == "err"
 
 
-def install_group_quote_guard(event, decision: DecisionResult, *, on_stream_end=None) -> None:
+def install_group_quote_guard(event, decision: DecisionResult, *, on_stream_end=None, private=False) -> None:
     """只改写本轮模型输出的最终发送链，包括官方缓存或实时分段的流式正文。"""
     original = event.send
     # after_message_sent 会消费一次性的工具计划，同一事件的下一份模型结果仍需使用引用策略。
@@ -187,6 +193,20 @@ def install_group_quote_guard(event, decision: DecisionResult, *, on_stream_end=
     last_result = None
     quoted = False
     stream_text = []
+
+    async def deliver(payload, streaming, args, kwargs):
+        try:
+            receipt = await original(payload, *args, **kwargs)
+        except Exception:
+            decision.text_sent = False
+            raise
+        if receipt is False:
+            decision.text_sent = False
+        elif streaming:
+            stream_text.extend(c.text for c in payload.chain if isinstance(c, Plain) and c.text)
+        elif any(isinstance(c, Plain) and (c.text or "").strip() for c in payload.chain):
+            event.set_extra("_qd_text_receipt", True)
+        return receipt
 
     async def send(message, *args, **kwargs):
         nonlocal quoted, last_result
@@ -206,6 +226,8 @@ def install_group_quote_guard(event, decision: DecisionResult, *, on_stream_end=
                 return await original(message, *args, **kwargs)
             if result is not last_result:
                 last_result, quoted = result, False
+        if private and not decision.target_message_id:
+            return await deliver(message, streaming, args, kwargs)
         parts = [c for c in chain if not _is_reply_component(c)]
         target = decision.target_message_id if decision.target_quote_mode != "none" else None
         # aiocqhttp 遇到文件或合并转发会逐组件发包。引用必须与同一段正文一起送达。
@@ -222,12 +244,9 @@ def install_group_quote_guard(event, decision: DecisionResult, *, on_stream_end=
             )
             payload = copy(message)
             payload.chain = [Reply(id=target), *chunk] if attach else chunk
-            receipt = await original(payload, *args, **kwargs)
-            if receipt is not False:
-                if attach:
-                    quoted = True
-                if streaming:
-                    stream_text.extend(c.text for c in chunk if isinstance(c, Plain) and c.text)
+            receipt = await deliver(payload, streaming, args, kwargs)
+            if attach and receipt is not False:
+                quoted = True
         return receipt
 
     event.send = send
@@ -242,12 +261,14 @@ def install_group_quote_guard(event, decision: DecisionResult, *, on_stream_end=
             return await original_stream(*args, **kwargs)
         complete = False
         quoted = False
+        event.set_extra("_qd_streaming", True)
         try:
             result = await original_stream(*args, **kwargs)
-            complete = (result is not False and not official_generation_failed(event)
+            complete = (result is not False and decision.text_sent is not False and not official_generation_failed(event)
                         and not event.get_extra("agent_user_aborted"))
             return result
         finally:
+            event.set_extra("_qd_streaming", False)
             # AstrBot 的流式路径直接返回，不调用 after_message_sent。
             if event.send is send:
                 event.send = original
@@ -279,28 +300,26 @@ async def after_official_text_sent(
         return False
     if text_sent is None:
         text_sent = official_text_was_sent(event)
-    if not text_sent:
-        skip_tools(decision, "正文未确认发送")
+    decision.text_sent = bool(text_sent) and decision.text_sent is not False
+    if not decision.text_sent:
+        skip_tools(decision, "正文未确认发送", when="after_send")
         return False
-    if not any(call.status == "planned" for call in decision.tool_calls.values()):
-        return False
-    from .official_segment import OfficialSegmenter, platform_name_from_event
+    from .official_segment import platform_name_from_event
+    return await send_followup_tools(context, event.unified_msg_origin, resolver, decision,
+                                     platform_name_from_event(event), segmenter=segmenter, sleeper=sleeper)
 
-    if segmenter is None:
-        segmenter = await OfficialSegmenter.from_context(
-            context,
-            umo=getattr(event, "unified_msg_origin", None),
-            sleeper=sleeper,
-        )
-    platform_name = platform_name_from_event(event)
-    if segmenter.should_delay(is_llm_result=True, platform_name=platform_name):
-        await segmenter.sleep(await segmenter.interval_for_image())
-    return await run_tools(
-        context,
-        umo=event.unified_msg_origin,
-        resolver=resolver,
-        decision=decision,
-    )
+
+async def send_followup_tools(context, umo, resolver, decision, platform_name, *, segmenter=None, sleeper=None):
+    from .official_segment import OfficialSegmenter
+
+    async with decision.followup_lock:
+        if not any(c.status == "planned" and c.when == "after_send" for c in decision.tool_calls.values()):
+            return False
+        if segmenter is None:
+            segmenter = await OfficialSegmenter.from_context(context, umo=umo, sleeper=sleeper)
+        if segmenter.should_delay(is_llm_result=True, platform_name=platform_name):
+            await segmenter.sleep(await segmenter.interval_for_image())
+        return await run_tools(context, umo=umo, resolver=resolver, decision=decision)
 
 
 def _history_as_contexts(history_raw: str | list | None) -> list[dict]:
@@ -452,17 +471,9 @@ async def send_decision_message(
                 sent_texts.append(seg)
         else:
             all_text_ok = False
-    if not any_text_sent or not all_text_ok:
-        skip_tools(decision, "正文未全部发送")
+    decision.text_sent = any_text_sent and all_text_ok
+    if not decision.text_sent:
+        skip_tools(decision, "正文未全部发送", when="after_send")
         return any_text_sent
-    if not any(call.status == "planned" for call in decision.tool_calls.values()):
-        return True
-    if delay:
-        await segmenter.sleep(await segmenter.interval_for_image())
-    await run_tools(
-        context,
-        umo=umo,
-        resolver=resolver,
-        decision=decision,
-    )
+    await send_followup_tools(context, umo, resolver, decision, platform_name, segmenter=segmenter)
     return True

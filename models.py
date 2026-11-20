@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -143,6 +144,14 @@ class DecisionQuestion:
     stage: Literal["pre_reply", "post_reply"] = "pre_reply"
     # None 继承插件默认模式，model/random 可覆盖单题。
     decision_mode: Literal["model", "random"] | None = None
+    # None 表示读入旧编辑器格式，空字典表示一道无动作的普通题。
+    actions: dict[str, list[dict]] | None = None
+    candidate_source: str = "options"
+    requires_candidates: str = ""
+    private_default: str = ""
+    default_option: str = ""
+    aliases: dict[str, str] = field(default_factory=dict)
+    scenes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -172,6 +181,19 @@ class DecisionQuestion:
             data["stage"] = self.stage
         if self.decision_mode is not None:
             data["decision_mode"] = self.decision_mode
+        if self.actions is not None:
+            data.pop("role")
+            data["actions"] = self.actions
+            for key in ("private_default", "default_option", "aliases", "requires_candidates", "scenes"):
+                if getattr(self, key):
+                    data[key] = getattr(self, key)
+            if self.candidate_source != "options":
+                data["candidate_source"] = self.candidate_source
+            if self.type == "choice":
+                data["options"] = [dict(id=o.id, criteria=o.criteria, weight=o.weight) for o in self.options]
+            else:
+                for key in ("true_tool", "false_tool", "true_session_hint", "false_session_hint"):
+                    data.pop(key)
         return data
 
 
@@ -182,6 +204,7 @@ class ToolCall:
     args: dict[str, str] = field(default_factory=dict)
     status: str = "planned"
     reason: str = ""
+    when: str = "after_send"
 
 
 @dataclass
@@ -228,6 +251,10 @@ class DecisionResult:
     target_quote_mode: str = "first"
     meme_description: str = ""
     post_plan: PostDecisionPlan | None = field(default=None, repr=False, compare=False)
+    text_sent: bool | None = None
+    followup_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
+    reply_sources: list[str] = field(default_factory=list)
+    context_fields: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.use_meme and self.meme_id and not self.tool_calls:

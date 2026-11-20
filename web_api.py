@@ -12,6 +12,7 @@ from .config_util import EVENTS, OPTION_EFFECTS, PluginSettings, default_questio
 from .decision_engine import preview_workflow
 from .decision_tools import TOOLS
 from .models import QUESTION_ROLES
+from .workflow_actions import ACTIONS, SOURCES, WORKFLOW_EVENTS, migrate_actions
 
 PLUGIN_NAME = "astrbot_plugin_quick_decision"
 
@@ -51,10 +52,10 @@ class WebApiMixin:
             }
         )
 
-    def _decision_config_payload(self, warning: str | None = None) -> dict:
+    def _decision_config_payload(self, warning: str | None = None, *, version=6) -> dict:
         settings = self.settings
         questions = settings.decision_questions
-        return {
+        payload = {
             "decision_mode": settings.decision_mode,
             "decision_custom_context": settings.decision_custom_context,
             "version": 6,
@@ -62,12 +63,22 @@ class WebApiMixin:
             "effects": OPTION_EFFECTS,
             "default_questions": [q.to_dict() for q in default_questions()],
             "roles": QUESTION_ROLES,
-            "tools": {key: label for key, (label, _, _) in TOOLS.items()},
+            "tools": TOOLS,
             "decision_questions": [item.to_dict() for item in questions],
             "warning": warning
             if warning is not None
             else settings.decision_questions_warning,
         }
+        if version == 7 or settings.workflow_version == 5:
+            questions, migration_warning = migrate_actions(questions)
+            defaults, _ = migrate_actions(default_questions())
+            for obsolete in ("roles", "effects", "tools"):
+                payload.pop(obsolete)
+            payload.update(version=7, workflow_version=5, events=WORKFLOW_EVENTS, actions=ACTIONS,
+                           candidate_sources=SOURCES, decision_questions=[q.to_dict() for q in questions],
+                           default_questions=[q.to_dict() for q in defaults],
+                           warning="；".join(w for w in (payload["warning"], migration_warning) if w) or None)
+        return payload
 
     async def web_decision_preview(self):
         payload = await request.json(default={})
@@ -82,15 +93,19 @@ class WebApiMixin:
         if mode not in ("model", "random"):
             return error_response("决策模式无效", status_code=400)
         settings = PluginSettings({"decision_mode": mode})
+        version = payload.get("version", 6)
+        if version not in (6, 7):
+            return error_response("预览配置版本无效", status_code=400)
         settings.decision_questions, error = load_questions(
-            {"version": 4, "questions": payload.get("decision_questions")}, strict=True)
+            {"version": 5 if version == 7 else 4, "questions": payload.get("decision_questions")}, strict=True)
         if error:
             return error_response(error, status_code=400)
         return json_response(preview_workflow(settings, payload["scene"], choices))
 
     async def web_decision_config(self):
         if request.method == "GET":
-            return json_response(self._decision_config_payload())
+            version = getattr(request, "query", {}).get("version")
+            return json_response(self._decision_config_payload(version=7 if str(version) == "7" else 6))
 
         payload = await request.json(default={})
         if not isinstance(payload, dict):
@@ -100,15 +115,26 @@ class WebApiMixin:
         if mode not in ("model", "random"):
             return error_response("请选择模型判断或纯随机", status_code=400)
         version = payload.get("version")
-        if type(version) is not int or version not in (2, 3, 4, 5, 6):
+        if type(version) is not int or version not in (2, 3, 4, 5, 6, 7):
             return error_response("无法识别的编辑器版本，请刷新页面", status_code=400)
         if version < 6:
             return error_response("当前判断使用生效条件，请刷新编辑页后再保存", status_code=409)
+        if version == 6 and settings.workflow_version == 5:
+            return error_response("当前配置使用选项动作，需要支持版本 7 的编辑器", status_code=409)
         custom_context = str(payload.get("decision_custom_context") or "").strip()
+        edited = payload.get("decision_questions")
+        if version == 7 and isinstance(edited, list) and all(isinstance(q, dict) for q in edited):
+            old_ids = {q.id for q in settings.decision_questions}
+            deleted = old_ids.difference(q["id"] for q in edited if isinstance(q.get("id"), str))
+            if deleted:
+                for q in edited:
+                    if isinstance(q.get("triggers"), list):
+                        q["triggers"] = [t for t in q["triggers"] if not (
+                            isinstance(t, dict) and isinstance(t.get("question"), str) and t["question"] in deleted)]
         questions, error = load_questions(
             {
-                "version": 4,
-                "questions": payload.get("decision_questions"),
+                "version": 5 if version == 7 else 4,
+                "questions": edited,
             },
             strict=True,
         )
@@ -122,13 +148,15 @@ class WebApiMixin:
             "decision_mode": mode,
             "decision_custom_context": custom_context,
             "decision_questions": json.dumps(
-                {"version": 4, "questions": [q.to_dict() for q in questions]},
+                {"version": 5 if version == 7 else 4, "questions": [q.to_dict() for q in questions]},
                 ensure_ascii=False, indent=2,
             ),
         }
         if not hasattr(self, "_decision_save_lock"):
             self._decision_save_lock = asyncio.Lock()
         async with self._decision_save_lock:
+            if version < 7 and self.settings.workflow_version == 5:
+                return error_response("当前配置使用选项动作，需要支持版本 7 的编辑器", status_code=409)
             missing = object()
             previous = {key: config.get(key, missing) for key in changes}
             try:

@@ -36,33 +36,28 @@ async def send_meme(context, umo, resolver, args):
     return "executed", ""
 
 
-def meme_args(answers):
-    return {"meme_id": answers["meme"]} if answers.get("meme") else None
+# 旧编辑器的工具目录。
+TOOLS = {"send_meme": "发送本轮选中的表情"}
 
 
-# 展示名称、从本轮结果解析参数、执行函数。
-TOOLS = {"send_meme": ("发送本轮选中的表情", meme_args, send_meme)}
-
-
-def skip_tools(decision, reason):
+def skip_tools(decision, reason, *, when=None):
     for call in decision.tool_calls.values():
-        if call.status == "planned":
+        if call.status == "planned" and (when is None or call.when == when):
             call.status, call.reason = "skipped", reason
 
 
-async def run_tools(context, *, umo, resolver, decision):
-    if decision.dry_run or not decision.should_speak():
-        skip_tools(decision, "试运行或本轮不发言")
+async def run_tools(context, *, umo, resolver, decision, when="after_send"):
+    if decision.dry_run or decision.failed or (when == "after_send" and not decision.should_speak()):
+        skip_tools(decision, "试运行或缺少所需的正文", when=when)
         return False
     sent = False
-    for call in decision.tool_calls.values():
-        if call.status != "planned":
+    for call in list(decision.tool_calls.values()):
+        if call.status != "planned" or call.when != when:
             continue
         # 在第一次 await 前领取，钩子重入时不能再次发送。
         call.status = "running"
         try:
-            _, _, handler = TOOLS[call.name]
-            call.status, call.reason = await handler(context, umo, resolver, call.args)
+            call.status, call.reason = await send_meme(context, umo, resolver, call.args)
         except asyncio.CancelledError:
             call.status, call.reason = "interrupted", "发送已中断，送达结果未确认"
             raise

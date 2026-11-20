@@ -142,7 +142,30 @@ cp -a astrbot_plugin_quick_decision /AstrBot/data/plugins/
 | `decision_custom_context` | `text` | `""` | 判断模型专属自定义上下文（如机器人身份、群聊背景），仅进入判断模型 |
 | `decision_questions` | `text` | 默认问题 JSON | 判断问题列表配置（推荐在 WebUI 插件详情页「判断配置」中可视化编辑） |
 
-### 生效条件和提问时机
+### 自定义选项动作
+
+在 AstrBot 配置项 `decision_questions` 中可直接填写版本 5 的完整 JSON。下面是从空配置重建发言判断的最小示例。删除 `join_chat` 后，`is_question` 仍会在收到消息时独立运行。
+
+```json
+{
+  "version": 5,
+  "questions": [
+    {
+      "id": "join_chat", "type": "boolean", "instructions": "现在适合加入讨论吗？",
+      "triggers": [{"event": "message_received"}],
+      "actions": {"true": [{"tool": "request_reply"}]}
+    },
+    {
+      "id": "is_question", "type": "boolean", "instructions": "有人在提问吗？",
+      "triggers": [{"event": "message_received"}]
+    }
+  ]
+}
+```
+
+让后继题随发言题同批提问，在后继题填写 `"triggers": [{"question": "join_chat", "option": "true", "ask_with_parent": true}]`。只有上游选项实际命中才采用预答。冷场入口可订阅 `silence_elapsed`，后判断设置 `stage: "post_reply"` 并订阅 `reply_generated`，或依赖一个已生效的选项。完整动作参数、迁移行为和前端接口见[选项动作设计与接口](docs/decision-actions-redesign.md)。
+
+### 旧版编辑器的生效条件和提问时机
 
 在「判断配置」点击「添加问题」。选择“收到消息”“达到冷场条件”或某个上游选项作为生效条件。两种事件各自使用一道发言题。当前事件没有启用的发言题时保持沉默，包括私聊。私聊默认回复通过已启用的消息入口固定放行。
 

@@ -16,7 +16,7 @@ from astrbot.api.star import Context, Star
 
 from .config_util import PluginSettings
 from .decision_engine import ask_decision, evaluate_post_reply
-from .decision_tools import skip_tools
+from .decision_tools import run_tools, skip_tools
 from .event_utils import (
     event_has_command_handler,
     event_profile,
@@ -39,15 +39,19 @@ from .official_handoff import (
     should_use_default_official_agent,
     suppress_default_official_agent,
 )
+from .official_segment import platform_name_from_event
 from .plugin_paths import load_plugin_data_dir
 from .reply_generator import (
+    active_event_runner,
     after_official_text_sent,
     apply_session_hints,
     generate_text,
     install_group_quote_guard,
     official_generation_failed,
+    official_text_was_sent,
     prepare_official_result_chain,
     send_decision_message,
+    send_followup_tools,
 )
 from .session_store import SessionStore
 from .web_api import WebApiMixin
@@ -156,8 +160,6 @@ class QuickDecisionPlugin(Star, WebApiMixin):
 
         runtime = self.sessions.ensure(profile)
         at_or_quoted, scene = self._resolve_passive_scene(event, profile)
-        if scene is None:
-            return
 
         # 决策进行中若仍有新消息，最多再判断两次，保证只发出一轮回复。
         result: DecisionResult | None = None
@@ -194,23 +196,26 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             event.stop_event()
             return
 
+        if not settings.dry_run:
+            await run_tools(self.context, umo=profile.umo, resolver=self.meme_adapter, decision=result, when="on_match")
         if not result.should_speak():
             await self._log_decision(profile, result)
             event.stop_event()
             return
 
+        official_would_run = bool(event.is_at_or_wake_command)
         if (
             scene == "group_passive"
             and not at_or_quoted
-            and self.sessions.in_cooldown(profile.umo, settings.cooldown_seconds)
+            and not official_would_run
+            and (not settings.group_enable_interrupt or self.sessions.in_cooldown(profile.umo, settings.cooldown_seconds))
         ):
-            skip_tools(result, "会话冷却中")
+            skip_tools(result, "群聊插话已关闭或会话冷却中")
             await self._log_decision(profile, result)
             logger.info("会话处于冷却中，跳过群聊插话：%s", profile.umo)
             event.stop_event()
             return
 
-        official_would_run = bool(event.is_at_or_wake_command)
         merged = self._has_merged_messages(
             event, runtime, first_message_id, first_timestamp
         )
@@ -263,14 +268,13 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         result.official_llm = True
         await self._log_decision(profile, result)
         event.set_extra("quick_decision", result)
-        if not profile.is_private:
-            install_group_quote_guard(event, result, on_stream_end=self._finish_official_send)
+        install_group_quote_guard(event, result, on_stream_end=self._finish_official_send, private=profile.is_private)
         begin_official_pipeline(runtime, result)
         return request
 
     def _resolve_passive_scene(
         self, event: AstrMessageEvent, profile: SessionProfile
-    ) -> tuple[bool, SceneType | None]:
+    ) -> tuple[bool, SceneType]:
         recent = self.sessions.recent_messages(
             profile.umo, self.settings.context_message_limit
         )
@@ -285,8 +289,6 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             at_or_quoted = is_at or is_quote
         if profile.is_private:
             return at_or_quoted, "private_passive"
-        if not at_or_quoted and not self.settings.group_enable_interrupt:
-            return at_or_quoted, None
         return at_or_quoted, "group_passive"
 
     def _has_merged_messages(
@@ -345,8 +347,8 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if not text:
             logger.warning("聊天模型没有返回文本，取消发送：%s", profile.umo)
             return
-        self._schedule_post_decision(result, text)
-        from .official_segment import platform_name_from_event
+        platform_name = platform_name_from_event(event)
+        self._schedule_post_decision(result, text, profile.umo, platform_name)
 
         sent_texts: list[str] = []
         sent = await send_decision_message(
@@ -356,7 +358,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             resolver=self.meme_adapter,
             decision=result,
             dry_run=False,
-            platform_name=platform_name_from_event(event),
+            platform_name=platform_name,
             sent_texts=sent_texts,
         )
         if sent and sent_texts:
@@ -365,7 +367,8 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 self.sessions.mark_proactive(profile.umo)
 
     def _meme_candidates(self, settings):
-        if any(q.enabled and q.role == "meme" for q in settings.decision_questions):
+        if any(q.enabled and (q.candidate_source == "memes" or q.requires_candidates == "memes" or q.role == "meme")
+               for q in settings.decision_questions):
             return self.meme_adapter.described_catalog()
         return []
 
@@ -388,7 +391,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         self, profile: SessionProfile, result: DecisionResult
     ) -> None:
         if not result.should_speak():
-            skip_tools(result, "本轮不发言")
+            skip_tools(result, "本轮不发言", when="after_send")
         if not result.round_id:
             result.round_id = uuid4().hex
         await self.sessions.append_log(
@@ -403,6 +406,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 "scene": result.scene,
                 "decision_mode": result.decision_mode,
                 "action": result.action,
+                "reply_sources": result.reply_sources,
                 "length": result.length,
                 "custom_answers": result.custom_answers,
                 "session_hints": result.session_hints,
@@ -440,19 +444,9 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             profile = runtime.profile
             if runtime.deciding or not runtime.last_user_ts:
                 continue
-            if not settings.proactive_enabled(profile.is_private):
-                continue
             if self.sessions.silence_already_evaluated(profile.umo):
                 continue
             if now - runtime.last_activity < settings.silence_seconds(profile.is_private):
-                continue
-            if self.sessions.in_cooldown(profile.umo, settings.cooldown_seconds):
-                continue
-            if not self.sessions.can_proactive(
-                profile.umo, settings.hourly_proactive_limit(profile.is_private)
-            ):
-                self.sessions.mark_silence_evaluated(profile.umo)
-                logger.info("已达每小时主动上限，跳过本轮冷场评估：%s", profile.umo)
                 continue
             runtime.deciding = True
             try:
@@ -483,8 +477,15 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         )
         result.dry_run = settings.dry_run
         runtime.last_decision = result
+        if not settings.dry_run and not result.failed:
+            await run_tools(self.context, umo=profile.umo, resolver=self.meme_adapter, decision=result, when="on_match")
+        limited = (not settings.proactive_enabled(profile.is_private)
+                   or self.sessions.in_cooldown(profile.umo, settings.cooldown_seconds)
+                   or not self.sessions.can_proactive(profile.umo, settings.hourly_proactive_limit(profile.is_private)))
+        if limited:
+            skip_tools(result, "冷场发言已关闭、冷却中或已达次数上限", when="after_send")
         await self._log_decision(profile, result)
-        if result.failed or result.action != "proactive":
+        if limited or result.failed or result.action != "proactive":
             return
         if settings.dry_run:
             logger.info("试运行：冷场判断为可以主动开口，但不会发送：%s", profile.umo)
@@ -510,7 +511,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         apply_session_hints(req, decision)
         event.set_extra("_qd_hints_applied", True)
 
-    def _schedule_post_decision(self, decision: DecisionResult, text: str) -> None:
+    def _schedule_post_decision(self, decision: DecisionResult, text: str, umo: str, platform_name: str) -> None:
         plan = decision.post_plan
         if plan is None or not text.strip():
             return
@@ -521,8 +522,18 @@ class QuickDecisionPlugin(Star, WebApiMixin):
 
         async def judge_and_log():
             try:
-                report = await evaluate_post_reply(self.context, plan, text, decision.answers)
+                report = await evaluate_post_reply(self.context, plan, text, decision.answers, decision=decision)
                 await self.sessions.update_round_log(decision.round_id, post_decision=report)
+                if decision.tool_calls:
+                    if self.settings.dry_run or not self.settings.enabled:
+                        skip_tools(decision, "试运行或插件停用")
+                    else:
+                        await run_tools(self.context, umo=umo, resolver=self.meme_adapter, decision=decision, when="on_match")
+                        if decision.text_sent is True:
+                            await send_followup_tools(self.context, umo, self.meme_adapter, decision, platform_name)
+                        elif decision.text_sent is False:
+                            skip_tools(decision, "正文未确认发送", when="after_send")
+                    await self._update_tool_log(decision)
             except Exception:
                 logger.exception("无法记录本轮输出后判断：%s", decision.round_id)
 
@@ -538,10 +549,20 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if resp and resp.role == "err":
             event.set_extra("_qd_llm_error", True)
             return
-        if decision.post_plan is None:
+        if event.get_extra("_qd_streaming"):
             return
         if resp and resp.role == "assistant" and not resp.is_chunk and not resp.tools_call_name:
-            self._schedule_post_decision(decision, resp.completion_text or "")
+            self._schedule_post_decision(decision, resp.completion_text or "", event.unified_msg_origin,
+                                         platform_name_from_event(event))
+            # skills_like 的工具重查可先发送最终文字，再调用 on_llm_response。
+            prior = event.get_extra("_qd_intermediate_receipt")
+            if prior and prior[0] == resp.completion_text:
+                await self._finish_official_send(event, stream_text=prior[0], complete=prior[1])
+
+    @filter.on_using_llm_tool()
+    async def on_using_llm_tool(self, event, tool, tool_args):
+        if self._pipeline_decision(event):
+            event.set_extra("_qd_intermediate_receipt", None)
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
@@ -551,6 +572,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         result = event.get_result()
         if result is None:
             return
+        if getattr(result, "is_llm_result", lambda: False)() and not event.get_extra("_qd_streaming"):
+            decision.text_sent = None
+            event.set_extra("_qd_text_receipt", False)
+            event.set_extra("_qd_undecorated_text", "".join(c.text for c in result.chain if isinstance(c, Plain)))
         is_private = event.is_private_chat()
         settings = self.settings
         if not prepare_official_result_chain(
@@ -572,6 +597,13 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         # 先根据本事件上的决策记状态并清 pending，再交给钩子发独立表情。
         # 表情发送会消费 extra，重复进入或其它事件不会再发图。
         decision = event.get_extra("quick_decision")
+        if isinstance(decision, DecisionResult) and stream_text is None:
+            runner = active_event_runner(event)
+            if runner and not runner.done():
+                if getattr(runner, "tool_schema_mode", None) == "skills_like":
+                    event.set_extra("_qd_intermediate_receipt", (event.get_extra("_qd_undecorated_text"),
+                                    decision.text_sent is not False and official_text_was_sent(event)))
+                return
         if isinstance(decision, DecisionResult) and stream_text is None and official_generation_failed(event):
             stream_text, complete = "", False
         runtime = self.sessions.get(event.unified_msg_origin)
@@ -587,7 +619,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             if text:
                 self._record_bot_text(runtime.profile, text)
                 if stream_text is not None and complete:
-                    self._schedule_post_decision(decision, text)
+                    self._schedule_post_decision(decision, text, event.unified_msg_origin, platform_name_from_event(event))
             elif stream_text is None:
                 self.sessions.mark_bot_sent(runtime.profile.umo)
             release_official_pipeline(runtime)
@@ -610,7 +642,13 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         await self._finish_tool_log(decision, reason)
 
     async def _finish_tool_log(self, result, reason="正文未确认发送"):
-        skip_tools(result, reason)
+        if result.text_sent is None:
+            result.text_sent = False
+        if not result.text_sent:
+            skip_tools(result, reason, when="after_send")
+        await self._update_tool_log(result)
+
+    async def _update_tool_log(self, result):
         if result.round_id and result.tool_calls:
             await self.sessions.update_tool_log(
                 result.round_id, [asdict(c) for c in result.tool_calls.values()]

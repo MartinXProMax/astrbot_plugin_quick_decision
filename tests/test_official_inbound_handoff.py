@@ -81,6 +81,7 @@ def _install_main_stubs() -> None:
         event_message_type = _deco
         on_llm_request = _deco
         on_llm_response = _deco
+        on_using_llm_tool = _deco
         on_decorating_result = _deco
         after_message_sent = _deco
         on_astrbot_loaded = _deco
@@ -932,6 +933,111 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.completion_text, "完整回复")
         self.assertEqual(ask.await_count, 2)
 
+    async def test_new_editor_reads_migrates_previews_and_deletes_a_parent(self):
+        from astrbot_plugin_quick_decision import web_api
+        class Config(dict):
+            save_config_async = AsyncMock()
+            save_config = save_config_async
+        self.plugin.config = Config(self.plugin.config)
+        request = SimpleNamespace(method="GET", query={"version": "7"}, json=AsyncMock())
+        with (patch.object(web_api, "request", request),
+              patch.object(web_api, "json_response", side_effect=lambda body: body),
+              patch.object(web_api, "error_response", side_effect=lambda msg, status_code: status_code)):
+            initial = await self.plugin.web_decision_config()
+            self.assertEqual(initial["version"], 7)
+            self.assertTrue(all("role" not in q for q in initial["default_questions"]))
+            self.assertEqual(set(initial["actions"]), {"request_reply", "add_context", "quote_message", "send_meme"})
+            request.method = "POST"
+            request.json.return_value = initial
+            saved = await self.plugin.web_decision_config()
+            self.assertEqual(saved["decision_questions"], initial["decision_questions"])
+            sample = dict(saved, scene="group_passive",
+                          answers={"action": "reply", "address_message": "true", "target_message_id": "*"})
+            request.json.return_value = sample
+            preview = await self.plugin.web_decision_preview()
+            self.assertEqual(preview["quote"], "sample_message")
+            self.assertEqual(preview["reply_sources"], ["action=reply"])
+            saved["decision_questions"] = [q for q in saved["decision_questions"] if q["id"] != "action"]
+            request.json.return_value = saved
+            updated = await self.plugin.web_decision_config()
+            orphan = next(q for q in updated["decision_questions"] if q["id"] == "address_message")
+            self.assertEqual(orphan["triggers"], [])
+            request.json.return_value = {"version": 6, "decision_questions": []}
+            self.assertEqual(await self.plugin.web_decision_config(), 409)
+            self.assertEqual(self.plugin.config.save_config_async.await_count, 2)
+
+    async def test_v5_independent_picture_without_speech_when_interrupt_disabled(self):
+        from astrbot.api.provider import DecisionChoiceAnswer
+        self.main_mod.ask_decision = self._orig_ask
+        self.plugin.config["group"]["enable_interrupt"] = False
+        self.plugin.config["decision_questions"] = {"version": 5, "questions": [{
+            "id": "react", "type": "choice", "instructions": "选表情",
+            "triggers": [{"event": "message_received"}], "candidate_source": "memes",
+            "options": [{"id": "*", "criteria": "{描述}"}, {"id": "skip", "criteria": "跳过"}],
+            "actions": {"*": [{"tool": "send_meme"}]},
+        }]}
+        self.plugin.meme_adapter.described_catalog = lambda: [{"id": "cat", "description": "猫"}]
+        ask = AsyncMock(return_value={"react": DecisionChoiceAnswer(choice="cat", probability=1,
+                                                                    probabilities={"cat": 1}, confidence=1)})
+        self.plugin.context.decision = SimpleNamespace(ask=ask)
+        self.plugin.context.send_message = AsyncMock(return_value=True)
+        event = FakeEvent(text="有意思")
+        with patch("astrbot_plugin_quick_decision.decision_tools.meme_chain", return_value=SimpleNamespace(chain=["cat"])):
+            await self.plugin.on_chat_message(event)
+        ask.assert_awaited_once()
+        self.plugin.context.send_message.assert_awaited_once()
+        self.assertTrue(event.is_stopped())
+        self.assertIsNone(event.get_extra("quick_decision"))
+        log, = self.plugin.sessions.recent_logs()
+        self.assertEqual((log["action"], log["tool_calls"][0]["status"]), ("none", "executed"))
+
+    async def test_post_picture_joins_confirmed_send_in_either_order(self):
+        from astrbot.api.provider import DecisionChoiceAnswer
+        self.main_mod.ask_decision = self._orig_ask
+        self.plugin.config["decision_questions"] = {"version": 5, "questions": [
+            {"id": "start", "type": "boolean", "instructions": "开口？", "private_default": "false",
+             "triggers": [{"event": "message_received"}], "actions": {"false": [{"tool": "request_reply"}]}},
+            {"id": "picture", "type": "choice", "instructions": "选图", "stage": "post_reply",
+             "triggers": [{"event": "reply_generated"}], "candidate_source": "memes",
+             "options": [{"id": "*", "criteria": "{描述}"}, {"id": "skip", "criteria": "跳过"}],
+             "actions": {"*": [{"tool": "send_meme", "when": "after_send"}]}}]}
+        self.plugin.meme_adapter.described_catalog = lambda: [{"id": "cat", "description": "猫"}]
+        self.plugin.context.decision = SimpleNamespace(ask=AsyncMock(return_value={
+            "picture": DecisionChoiceAnswer(choice="cat", probability=1, probabilities={"cat": 1}, confidence=1)}))
+        for index, (post_first, confirmed) in enumerate(((True, True), (False, True), (False, False), (True, False))):
+            segmenter = SimpleNamespace(should_delay=lambda **_: True, interval_for_image=AsyncMock(return_value=2),
+                                        sleep=AsyncMock())
+            with (self.subTest(post_first=post_first, confirmed=confirmed),
+                  patch("astrbot_plugin_quick_decision.decision_tools.meme_chain", return_value=SimpleNamespace(chain=["cat"])),
+                  patch("astrbot_plugin_quick_decision.official_segment.OfficialSegmenter.from_context", return_value=segmenter)):
+                send = self.plugin.context.send_message = AsyncMock(return_value=True)
+                event = FakeEvent(umo=f"room{index}", text="hi", is_private=True, at_or_wake=True)
+                await self.plugin.on_chat_message(event)
+                decision = event.get_extra("quick_decision")
+                self.assertEqual(decision.reply_sources, ["start=false"])
+                text = self.main_mod.Plain("最终正文")
+                event.set_result(SimpleNamespace(chain=[text], is_llm_result=lambda: True))
+                await self.plugin.on_llm_response(event, SimpleNamespace(role="assistant", is_chunk=False,
+                                                  tools_call_name=[], completion_text=text.text))
+                if post_first:
+                    await asyncio.gather(*self.plugin._post_tasks)
+                    send.assert_not_awaited()
+                event._has_send_oper = confirmed
+                await self.plugin.after_message_sent(event)
+                await asyncio.gather(*self.plugin._post_tasks)
+                await self.plugin.after_message_sent(event)
+                self.assertEqual(send.await_count, int(confirmed))
+                self.assertEqual(segmenter.sleep.await_count, int(confirmed))
+                self.assertEqual(decision.tool_calls["send_meme"].status, "executed" if confirmed else "skipped")
+
+    async def test_wake_prefix_uses_default_agent_with_interrupts_disabled(self):
+        self.plugin.config["group"]["enable_interrupt"] = False
+        event = FakeEvent(text="小助手 帮忙看看", at_or_wake=True)
+        self.assertIsNone(await self.plugin.on_chat_message(event))
+        self.assertFalse(event.is_stopped())
+        self.assertTrue(event.get_extra("quick_decision").official_llm)
+        self.assertFalse(event.call_llm)
+
     async def test_group_interrupt_yields_request_llm_without_stop(self) -> None:
         event = FakeEvent(
             text="插句话",
@@ -1205,6 +1311,89 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         await event.send(SimpleNamespace(chain=[Reply(id="new"), next_answer]))
         self.assertEqual(event._sends[-1].chain[0].id, "old")
         await self.plugin.after_message_sent(event)
+
+    async def test_tool_preamble_waits_for_final_text_and_post_judgment(self):
+        from astrbot_plugin_quick_decision import reply_generator as replies
+        for requery_sent_first in (False, True):
+            event = FakeEvent(umo=f"room-{requery_sent_first}", text="hi", at_or_wake=True)
+            runner = SimpleNamespace(run_context=SimpleNamespace(context=SimpleNamespace(event=event)),
+                                     tool_schema_mode="skills_like", done=lambda: False, get_final_llm_resp=lambda: None)
+            decision = DecisionResult(action="reply", use_meme=True, meme_id="cat", post_plan=object())
+            self.main_mod.ask_decision = AsyncMock(return_value=decision)
+            send = self.plugin.context.send_message = AsyncMock(return_value=True)
+            with (self.subTest(requery_sent_first=requery_sent_first),
+                  patch.dict(replies._ACTIVE_AGENT_RUNNERS, {event.unified_msg_origin: runner}),
+                  patch.object(self.main_mod, "evaluate_post_reply", new_callable=AsyncMock, return_value={}) as judge,
+                  patch("astrbot_plugin_quick_decision.decision_tools.meme_chain", return_value=SimpleNamespace(chain=["cat"]))):
+                await self.plugin.on_chat_message(event)
+                async def deliver(text):
+                    part = self.main_mod.Plain(text)
+                    event.set_result(SimpleNamespace(chain=[part], is_llm_result=lambda: True))
+                    await self.plugin.on_decorating_result(event)
+                    await event.send(SimpleNamespace(chain=[part]))
+                    await self.plugin.after_message_sent(event)
+                    event.set_result(None)
+                await deliver("查询中")
+                self.assertIs(event.get_extra("quick_decision"), decision)
+                send.assert_not_awaited()
+                judge.assert_not_awaited()
+                if requery_sent_first:
+                    await deliver("最终正文")
+                else:
+                    await self.plugin.on_using_llm_tool(event, None, {})
+                runner.done = lambda: True
+                await self.plugin.on_llm_response(event, SimpleNamespace(role="assistant", is_chunk=False,
+                                                  tools_call_name=[], completion_text="最终正文"))
+                if not requery_sent_first:
+                    await deliver("最终正文")
+                await asyncio.gather(*self.plugin._post_tasks)
+                self.assertIsNone(event.get_extra("quick_decision"))
+                send.assert_awaited_once()
+                self.assertEqual(judge.await_args.args[2], "最终正文")
+
+    async def test_partial_nonstream_reply_skips_after_send_tools(self):
+        for private in (True, False):
+            with self.subTest(private=private):
+                event = FakeEvent(umo=f"room-{private}", text="hi", is_private=private, at_or_wake=True)
+                decision = DecisionResult(action="reply", use_meme=True, meme_id="cat")
+                self.main_mod.ask_decision = AsyncMock(return_value=decision)
+                event.send = AsyncMock(side_effect=[True, OSError("second segment failed")])
+                self.plugin.context.send_message = AsyncMock()
+                await self.plugin.on_chat_message(event)
+                parts = [self.main_mod.Plain("第一段"), self.main_mod.Plain("第二段")]
+                event.set_result(SimpleNamespace(chain=parts, is_llm_result=lambda: True))
+                await event.send(SimpleNamespace(chain=parts[:1]))
+                event._has_send_oper = True
+                with self.assertRaises(OSError):
+                    await event.send(SimpleNamespace(chain=parts[1:]))
+                await self.plugin.after_message_sent(event)
+                self.assertFalse(decision.text_sent)
+                self.assertEqual(decision.tool_calls["send_meme"].reason, "正文未确认发送")
+                self.plugin.context.send_message.assert_not_awaited()
+
+    async def test_stream_partial_send_cannot_start_post_actions(self):
+        from astrbot_plugin_quick_decision import reply_generator as replies
+        marker = ContextVar("stream", default=None)
+        with patch.object(replies, "streaming_response_event", marker):
+            event = FakeEvent(text="hi", at_or_wake=True)
+            event.send = AsyncMock(side_effect=[True, False])
+            async def output():
+                await self.plugin.on_llm_response(event, SimpleNamespace(role="assistant", is_chunk=False,
+                                                  tools_call_name=[], completion_text="完整回复"))
+                for text in ("送出", "失败"):
+                    await event.send(SimpleNamespace(chain=[replies.Plain(text)]))
+            event.send_streaming = output
+            decision = DecisionResult(action="reply", use_meme=True, meme_id="cat", post_plan=object())
+            self.main_mod.ask_decision = AsyncMock(return_value=decision)
+            await self.plugin.on_chat_message(event)
+            token = marker.set(event)
+            try:
+                await event.send_streaming()
+            finally:
+                marker.reset(token)
+            self.assertFalse(self.plugin._post_tasks)
+            self.assertFalse(decision.text_sent)
+            self.assertEqual(decision.tool_calls["send_meme"].status, "skipped")
 
     async def test_stream_error_notice_never_counts_as_a_successful_reply(self):
         from astrbot_plugin_quick_decision import reply_generator as replies

@@ -9,6 +9,7 @@ from graphlib import CycleError, TopologicalSorter
 from typing import Any
 
 from .decision_tools import TOOLS
+from .workflow_actions import WORKFLOW_EVENTS, validate_actions
 from .models import (
     QUESTION_ROLES,
     DecisionQuestion,
@@ -498,7 +499,8 @@ def _coerce_questions_payload(value: Any) -> tuple[list[Any] | None, str | None]
 
 
 def parse_decision_questions(
-    value: Any, *, strict: bool = False, legacy: bool = True, trigger_format: bool = False
+    value: Any, *, strict: bool = False, legacy: bool = True, trigger_format: bool = False,
+    action_format: bool = False,
 ) -> tuple[list[DecisionQuestion], str | None]:
     """解析自定义判断问题。
 
@@ -531,6 +533,22 @@ def parse_decision_questions(
             if "branches" in item or not isinstance(item.get("triggers"), list):
                 return [], f"问题 {question.id} 需要明确的 triggers 数组"
             question.triggers = item["triggers"]
+            if action_format:
+                old_keys = {"role", "true_tool", "false_tool", "true_session_hint", "false_session_hint", "ask_private"}
+                if old_keys.intersection(item) or (question.type == "choice" and any(
+                    "tool" in opt or "session_hint" in opt for opt in item["options"]
+                )):
+                    return [], f"问题 {question.id} 应使用 actions 配置选项动作"
+                question.actions = item.get("actions", {})
+                if not isinstance(question.actions, dict):
+                    return [], f"问题 {question.id} 的 actions 应为对象"
+                for key in ("candidate_source", "default_option", "private_default", "requires_candidates"):
+                    if key in item:
+                        if not isinstance(item[key], str):
+                            return [], f"问题 {question.id} 的 {key} 应为字符串"
+                        setattr(question, key, item[key])
+                question.scenes = item.get("scenes", [])
+                question.aliases = item.get("aliases", {})
         if question is not None and question.enabled and question.role != "answer" and not (trigger_format and question.role == "action"):
             if question.role in active_roles:
                 item_error = (
@@ -554,7 +572,7 @@ def parse_decision_questions(
         if not questions and payload and legacy:
             return default_decision_questions(), warning + "，已回退到默认长短问题"
         return questions, warning
-    branch_error = _validate_triggers(questions) if trigger_format else _validate_branches(questions)
+    branch_error = _validate_triggers(questions, action_format) if trigger_format else _validate_branches(questions)
     return ([], branch_error) if branch_error else (questions, None)
 
 
@@ -584,12 +602,14 @@ def _validate_branches(questions: list[DecisionQuestion]) -> str | None:
     return None
 
 
-def _validate_triggers(questions):
+def _validate_triggers(questions, action_format=False):
     by_id = {q.id: q for q in questions}
     graph = TopologicalSorter()
     gates = {}
     for q in questions:
         seen = set()
+        if action_format and (error := validate_actions(q, by_id)):
+            return f"问题 {q.id}：{error}"
         if q.role == "action" and (len(q.triggers) != 1 or not isinstance(q.triggers[0], dict)
                                    or "event" not in q.triggers[0]):
             return f"控制发言题 {q.id} 需要一个事件入口"
@@ -599,8 +619,11 @@ def _validate_triggers(questions):
             early = t.get("ask_with_parent", False)
             if "event" in t:
                 event = t["event"]
-                if set(t) - {"event", "ask_with_parent"} or not isinstance(event, str) or event not in EVENTS:
+                events = WORKFLOW_EVENTS if action_format else EVENTS
+                if set(t) - {"event", "ask_with_parent"} or not isinstance(event, str) or event not in events:
                     return f"问题 {q.id} 的事件无效"
+                if action_format and (early or (event == "reply_generated") != (q.stage == "post_reply")):
+                    return f"问题 {q.id} 的事件与判断阶段或提问时机不符"
                 key = (event,)
                 if early and (q.role == "action" or q.stage == "post_reply"):
                     return f"问题 {q.id} 不能随发言入口提前提问"
@@ -652,13 +675,14 @@ def load_questions(value, *, strict=False):
     if isinstance(value, dict) and "version" in value:
         if (
             type(value.get("version")) is not int
-            or value["version"] not in (2, 3, 4)
+            or value["version"] not in (2, 3, 4, 5)
             or not isinstance(value.get("questions"), list)
         ):
             return [], "无法识别的问题配置版本或格式"
         if value["version"] >= 3:
-            questions, warning = parse_decision_questions(value["questions"], strict=True, legacy=False, trigger_format=True)
-            if warning or value["version"] == 4:
+            questions, warning = parse_decision_questions(value["questions"], strict=True, legacy=False, trigger_format=True,
+                                                         action_format=value["version"] == 5)
+            if warning or value["version"] >= 4:
                 return questions, warning
         else:
             old, warning = parse_decision_questions(value["questions"], strict=strict, legacy=False)
@@ -722,9 +746,16 @@ class PluginSettings:
         self.decision_custom_context = str(
             data.get("decision_custom_context") or ""
         ).strip()
-        self.decision_questions, self.decision_questions_warning = load_questions(
-            data.get("decision_questions")
-        )
+        graph = data.get("decision_questions")
+        if isinstance(graph, str):
+            try:
+                decoded = json.loads(graph)
+                if isinstance(decoded, (dict, list)):
+                    graph = decoded
+            except ValueError:
+                pass
+        self.workflow_version = graph.get("version") if isinstance(graph, dict) else None
+        self.decision_questions, self.decision_questions_warning = load_questions(graph)
 
     def silence_seconds(self, is_private: bool) -> int:
         return (
