@@ -195,6 +195,7 @@ function normalizeQuestion(raw) {
     instructions: String(raw?.instructions || ""),
     options: [],
     role: raw?.role || "answer",
+    decision_mode: raw?.decision_mode === "random" || raw?.decision_mode === "model" ? raw.decision_mode : "inherit",
     stage: raw?.stage || "pre_reply",
     use_threshold: !!raw?.use_threshold,
     ask_private: !!raw?.ask_private,
@@ -263,6 +264,7 @@ function collectQuestionsFromForm() {
 function serializeQuestion(question) {
   const common = {id: question.id.trim(), role: question.role, enabled: question.enabled,
     type: question.type, instructions: question.instructions, use_threshold: question.use_threshold};
+  if (question.decision_mode !== "inherit") common.decision_mode = question.decision_mode;
   if (question.stage === "post_reply") common.stage = question.stage;
   const branches = Object.fromEntries(branchLinks(question).map(([key, target]) => [key, target.id.trim()]));
   if (Object.keys(branches).length) common.branches = branches;
@@ -439,7 +441,8 @@ function weightShares(question) {
 
 function showsShares(question) {
   // 回复目标和表情的 * 会展开成多个候选，控制发言按场景只取部分选项，这几种不显示固定比例。
-  return getMode() === "random" && question.role === "answer";
+  return (question.decision_mode === "random" || (question.decision_mode === "inherit" && getMode() === "random"))
+    && question.role === "answer";
 }
 
 function shareText(share) {
@@ -708,6 +711,7 @@ function renderQuestion(question, qIndex) {
     h("span", { class: "q-name mono", dataset: { nameOf: qIndex } }, qName(question)),
     question.role !== "answer" && h("span", { class: "q-tag is-role" }, roleLabel(question)),
     h("span", { class: "q-tag" }, TYPE_LABELS[question.type]),
+    question.decision_mode !== "inherit" && h("span", { class: "q-tag" }, question.decision_mode === "random" ? "随机" : "模型"),
     question.stage === "post_reply" && h("span", { class: "q-tag is-post" }, "回复后"),
     !open && issue && h("span", { class: "q-tag is-issue", title: issue.message }, "待完善"),
     h("span", { class: "q-change", hidden: true }),
@@ -908,6 +912,14 @@ function renderSettings(question, qIndex) {
     updateDirty();
   }, { disabled: isAnswer ? {} : { post_reply: "只有「记录答案」可以在回复写完后判断" }, extra: "stage-seg" });
 
+  const modeSelect = fieldSelect("本题决策", {
+    inherit: "继承默认模式", model: "模型判断", random: "按权重随机",
+  }, question.decision_mode, (mode) => {
+    question.decision_mode = mode;
+    renderQuestions(`[data-q="${qIndex}"] [data-field="decision-mode"]`);
+    updateDirty();
+  }, { field: "decision-mode" });
+
   const thresholdNote = question.type === "boolean"
     ? "仅模型判断。两侧权重都是 1 时，「是」的概率达到阈值才判为是；调整权重后取加权概率较高的一侧。不按温度抽样。"
     : "仅模型判断。选中答案的原始概率低于插件判断阈值时，按没有选中处理。";
@@ -918,6 +930,7 @@ function renderSettings(question, qIndex) {
       roleSelect,
       h("div", { class: "setting" }, h("span", { class: "field-label" }, "题型"), typeSeg),
       h("div", { class: "setting" }, h("span", { class: "field-label" }, "判断时机"), stageSeg),
+      modeSelect,
     ),
     h("div", { class: "settings-switches" },
       switchField("使用插件判断阈值", question.use_threshold, (v) => { question.use_threshold = v; }, thresholdNote),
@@ -1401,6 +1414,7 @@ function renderProbabilityChart(id, answer, isRandom) {
 function renderLog(item) {
   const action = normalizeAction(item.action);
   const isRandom = item.decision_mode === "random";
+  const isMixed = item.decision_mode === "mixed";
   const time = splitTime(item.time);
   const answers = Object.entries(item.answers || item.custom_answers || {});
   if (!answers.length && item.length) answers.push(["length", item.length]);
@@ -1416,6 +1430,7 @@ function renderLog(item) {
     h("span", { class: "log-action" }, ACTION_LABELS[action] || item.action || "未知"),
     h("span", { class: "tag" }, SCENE_LABELS[item.scene] || item.scene || "未知场景"),
     isRandom ? h("span", { class: "tag" }, "纯随机") : null,
+    isMixed ? h("span", { class: "tag" }, "混合决策") : null,
     item.use_meme
       ? h("span", { class: "tag", title: "配图" }, icon("image"), item.meme_id || "配图")
       : null,
@@ -1472,7 +1487,9 @@ function renderLog(item) {
       h("p", { class: "hint" }, isRandom
         ? "等权基准表示每个候选的初始机会相同。加权后即为实际抽中概率。"
         : "加权后按本轮选项权重归一化，温度在此后生效。"),
-      ...Object.entries(raw).map(([id, answer]) => renderProbabilityChart(id, answer, isRandom)),
+      ...Object.entries(raw).map(([id, answer]) => renderProbabilityChart(
+        id, answer, isRandom || answer?.decision_mode === "random",
+      )),
       h("details", { class: "prob-raw" }, h("summary", null, "查看原始数据"),
         h("pre", { class: "log-raw" }, JSON.stringify(raw, null, 2))),
     );

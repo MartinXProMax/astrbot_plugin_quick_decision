@@ -276,6 +276,19 @@ class DecisionConfigTests(unittest.TestCase):
         for value in (float("nan"), float("inf"), "invalid", 10**400):
             self.assertEqual(PluginSettings({"choice_temperature": value}).choice_temperature, 0.0)
 
+    def test_question_can_override_default_decision_mode(self) -> None:
+        payload = [{
+            "id": "tone", "type": "choice", "instructions": "语气？",
+            "decision_mode": "random",
+            "options": [{"id": "soft", "criteria": "柔和"}, {"id": "direct", "criteria": "直接"}],
+        }]
+        questions, error = load_questions({"version": 2, "questions": payload}, strict=True)
+        self.assertIsNone(error)
+        self.assertEqual(questions[0].decision_mode, "random")
+        self.assertEqual(questions[0].to_dict()["decision_mode"], "random")
+        payload[0]["decision_mode"] = "invalid"
+        self.assertIn("决策模式无效", load_questions({"version": 2, "questions": payload}, strict=True)[1])
+
     def test_choice_temperature_can_select_a_lower_probability_option(self) -> None:
         settings = PluginSettings(
             {

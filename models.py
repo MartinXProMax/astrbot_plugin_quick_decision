@@ -138,6 +138,8 @@ class DecisionQuestion:
     ask_private: bool = False
     branches: dict[str, str] = field(default_factory=dict)
     stage: Literal["pre_reply", "post_reply"] = "pre_reply"
+    # None 继承插件默认模式，model/random 可覆盖单题。
+    decision_mode: Literal["model", "random"] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -161,6 +163,8 @@ class DecisionQuestion:
             data["branches"] = dict(self.branches)
         if self.stage == "post_reply":
             data["stage"] = self.stage
+        if self.decision_mode is not None:
+            data["decision_mode"] = self.decision_mode
         return data
 
 
@@ -211,7 +215,7 @@ class DecisionResult:
 
     tool_calls: dict[str, ToolCall] = field(default_factory=dict)
     round_id: str = ""
-    decision_mode: Literal["model", "random"] = "model"
+    decision_mode: Literal["model", "random", "mixed"] = "model"
     target_summary: str = ""
     meme_description: str = ""
     post_plan: PostDecisionPlan | None = field(default=None, repr=False, compare=False)

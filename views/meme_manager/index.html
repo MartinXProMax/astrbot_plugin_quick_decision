@@ -53,21 +53,21 @@
 
           <section class="block">
             <div class="block-head">
-              <h2 id="mode-heading">决策模式</h2>
+              <h2 id="mode-heading">默认决策模式</h2>
             </div>
             <div class="mode-cards" role="radiogroup" aria-labelledby="mode-heading">
               <label class="mode-card">
                 <input type="radio" name="decision-mode" value="model" checked />
                 <span class="mode-title">模型判断</span>
-                <span class="mode-desc">判断模型读完上下文后回答每个问题，再按权重、温度和判断阈值选定答案。</span>
+                <span class="mode-desc">没有单独设置模式的问题由判断模型回答，再按权重、温度和判断阈值选定答案。</span>
               </label>
               <label class="mode-card">
                 <input type="radio" name="decision-mode" value="random" />
-                <span class="mode-title">纯随机（按权重）</span>
-                <span class="mode-desc">跳过判断模型，只按选项权重抽取。温度和判断阈值不生效。</span>
+                <span class="mode-title">按权重随机</span>
+                <span class="mode-desc">没有单独设置模式的问题跳过判断模型，只按选项权重抽取。</span>
               </label>
             </div>
-            <p class="hint">两种模式下，需要发言时正文都由会话模型生成。</p>
+            <p class="hint">每道题可在问题设置中覆盖此默认值。需要发言时正文都由会话模型生成。</p>
           </section>
 
           <section class="block">

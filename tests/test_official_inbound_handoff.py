@@ -765,6 +765,32 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             reloaded = self.plugin.settings.decision_questions
             self.assertEqual(next(q.stage for q in reloaded if q.id == "length"), "post_reply")
 
+    async def test_question_mode_override_requires_new_editor(self):
+        from astrbot_plugin_quick_decision import web_api
+
+        class Config(dict):
+            save_config = AsyncMock()
+            save_config_async = save_config
+
+        self.plugin.config = Config(self.plugin.config)
+        payload = self.plugin._decision_config_payload()
+        payload["version"] = 4
+        question = next(q for q in payload["decision_questions"] if q["id"] == "length")
+        question["decision_mode"] = "random"
+        request = SimpleNamespace(method="POST", json=AsyncMock(return_value=payload))
+        with (
+            patch.object(web_api, "request", request),
+            patch.object(web_api, "json_response", side_effect=lambda value: value),
+            patch.object(web_api, "error_response", side_effect=lambda msg, status_code: status_code),
+        ):
+            saved = await self.plugin.web_decision_config()
+            self.assertEqual(saved["version"], 4)
+            for q in payload["decision_questions"]:
+                q.pop("decision_mode", None)
+            payload["version"] = 3
+            self.assertEqual(await self.plugin.web_decision_config(), 409)
+            self.assertEqual(self.plugin.config.save_config_async.await_count, 1)
+
     async def test_official_final_text_schedules_one_post_workflow_for_original_round(self):
         from astrbot.api.provider import DecisionBooleanAnswer
 

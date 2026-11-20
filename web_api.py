@@ -52,7 +52,7 @@ class WebApiMixin:
         settings = self.settings
         questions = settings.decision_questions
         version = 2
-        if any(q.stage == "post_reply" for q in questions):
+        if any(q.stage == "post_reply" or q.decision_mode is not None for q in questions):
             version = 4
         elif any(q.branches for q in questions):
             version = 3
@@ -83,8 +83,11 @@ class WebApiMixin:
         version = payload.get("version")
         if type(version) is not int or version not in (2, 3, 4):
             return error_response("无法识别的编辑器版本，请刷新页面", status_code=400)
-        if version < 4 and any(q.stage == "post_reply" for q in settings.decision_questions):
-            return error_response("当前配置含有输出后问题，请刷新编辑页后再保存", status_code=409)
+        if version < 4 and any(
+            q.stage == "post_reply" or q.decision_mode is not None
+            for q in settings.decision_questions
+        ):
+            return error_response("当前配置含有新版问题设置，请刷新编辑页后再保存", status_code=409)
         if version == 2 and any(q.branches for q in settings.decision_questions):
             return error_response("当前配置含有后继问题，请刷新编辑页后再保存", status_code=409)
         custom_context = str(payload.get("decision_custom_context") or "").strip()

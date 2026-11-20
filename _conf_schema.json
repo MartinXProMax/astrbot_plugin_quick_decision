@@ -12,16 +12,16 @@
     "default": false
   },
   "decision_mode": {
-    "description": "决策模式（model 为模型判断，random 为纯随机）",
+    "description": "默认决策模式（model 为模型判断，random 为按权重随机）",
     "type": "string",
-    "hint": "纯随机跳过判断模型，按各题的选项权重抽取。温度和判断阈值只用于模型判断。",
+    "hint": "作为没有单独设置模式的问题的默认值。每道题也可在插件详情页选择模型判断或按权重随机。",
     "options": ["model", "random"],
     "default": "model"
   },
   "decision_provider_id": {
     "description": "判断提供商 ID",
     "type": "string",
-    "hint": "仅模型判断模式使用。留空则使用默认判断提供商，请先在 WebUI「模型提供商 → 判断」中配置 System One。",
+    "hint": "仅模型判断题使用。留空则使用默认判断提供商，请先在 WebUI「模型提供商 → 判断」中配置 System One。",
     "default": ""
   },
   "vision_provider_id": {
@@ -94,7 +94,7 @@
       "enable_interrupt": {
         "description": "允许群聊插话",
         "type": "bool",
-        "hint": "即使未被 @ 或引用，也可以按当前决策模式决定是否参与话题。",
+        "hint": "即使未被 @ 或引用，也可以按当前默认决策模式决定是否参与话题。问题可单独覆盖模式。",
         "default": true
       },
       "direct_send": {
@@ -111,7 +111,7 @@
       "silence_seconds": {
         "description": "群聊冷场时长（秒）",
         "type": "int",
-        "hint": "达到该沉默时长后，按当前决策模式评估一次。默认 10 分钟。",
+        "hint": "达到该沉默时长后，按各问题设置的决策模式评估一次。默认 10 分钟。",
         "default": 600,
         "slider": {
           "min": 30,
@@ -145,7 +145,7 @@
       "silence_seconds": {
         "description": "私聊冷场时长（秒）",
         "type": "int",
-        "hint": "达到该沉默时长后，按当前决策模式评估一次。默认 30 分钟。",
+        "hint": "达到该沉默时长后，按各问题设置的决策模式评估一次。默认 30 分钟。",
         "default": 1800,
         "slider": {
           "min": 30,

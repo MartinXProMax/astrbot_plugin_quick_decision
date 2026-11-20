@@ -278,9 +278,13 @@ def _parse_one_question(
         return None, f"问题 {question_id} 的判断阶段无效"
     if stage == "post_reply" and role != "answer":
         return None, f"输出后的问题 {question_id} 只支持记录答案"
+    decision_mode = None if legacy else item.get("decision_mode")
+    if decision_mode is not None and decision_mode not in ("model", "random"):
+        return None, f"问题 {question_id} 的决策模式无效"
     common = {
         "role": role,
         "stage": stage,
+        "decision_mode": decision_mode,
         "use_threshold": not legacy and _as_bool(item.get("use_threshold"), False),
         "branches": {} if legacy else item.get("branches", {}),
     }

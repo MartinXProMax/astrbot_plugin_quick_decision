@@ -57,6 +57,7 @@ class DecisionSpec:
     branches: dict[str, str] = field(default_factory=dict)
     candidate_descriptions: dict[str, str] = field(default_factory=dict)
     stage: str = "pre_reply"
+    decision_mode: Literal["model", "random"] = "model"
 
 
 @dataclass
@@ -197,6 +198,7 @@ def _evaluate_random(spec: DecisionSpec) -> DecisionOutcome:
         probabilities=probabilities,
         selection_probabilities=distribution,
         raw={
+            "decision_mode": "random",
             "question_type": spec.kind,
             "probabilities": probabilities,
             "option_weights": weights,
@@ -301,6 +303,7 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
             is_root=item.id not in children,
             branches=dict(item.branches),
             stage=item.stage,
+            decision_mode=item.decision_mode or settings.decision_mode,
             threshold=settings.choice_threshold
             if item.use_threshold
             else (0.5 if item.type == "boolean" else 0.0),
@@ -321,7 +324,7 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
             for token in (_TIME_TOKEN, _SILENCE_TOKEN):
                 if token not in prompt:
                     prompt += f"\n{token[1:-1]}：{token}"
-        if settings.decision_mode == "model" and (_TIME_TOKEN in prompt or _SILENCE_TOKEN in prompt):
+        if spec.decision_mode == "model" and (_TIME_TOKEN in prompt or _SILENCE_TOKEN in prompt):
             if info is None:
                 info = _question_info(context, umo, scene, last_activity)
             for token, value in info.items():
@@ -415,13 +418,38 @@ def _workflow_batches(specs, outcomes):
 
 
 async def _evaluate_batch(context, batch, outcomes, state, provider_id):
-    if state is None:
-        return {spec.id: _evaluate_random(spec) for spec in batch}
-    if not batch[0].is_root:
-        previous = dict(state.get("previous_answers", {}))
-        previous.update({key: o.value for key, o in outcomes.items() if o.has_answer})
-        state = {**state, "previous_answers": previous}
-    return await evaluate_specs(context.decision, batch, state=state, provider_id=provider_id)
+    evaluated = {}
+    model_specs = [spec for spec in batch if spec.question is not None and spec.decision_mode == "model"]
+    for spec in batch:
+        if spec.question is None:
+            evaluated[spec.id] = _evaluate_answer(spec, _MISSING)
+        elif spec.decision_mode == "random":
+            evaluated[spec.id] = _evaluate_random(spec)
+    if model_specs:
+        if state is None:
+            raise DecisionError("模型判断题缺少判断上下文")
+        model_state = state
+        if not model_specs[0].is_root:
+            previous = dict(state.get("previous_answers", {}))
+            previous.update({key: o.value for key, o in outcomes.items() if o.has_answer})
+            model_state = {**state, "previous_answers": previous}
+        evaluated.update(await evaluate_specs(
+            context.decision, model_specs, state=model_state, provider_id=provider_id
+        ))
+        for spec in model_specs:
+            outcome = evaluated.get(spec.id)
+            if outcome is not None and outcome.raw:
+                outcome.raw.setdefault("decision_mode", "model")
+    return evaluated
+
+
+def _result_mode(specs, fallback):
+    modes = {spec.decision_mode for spec in specs if spec.question is not None}
+    if len(modes) == 1:
+        return next(iter(modes))
+    if len(modes) > 1:
+        return "mixed"
+    return fallback
 
 
 async def evaluate_post_reply(context, plan: PostDecisionPlan, text: str, previous_answers: dict):
@@ -563,7 +591,13 @@ async def ask_decision(
     batch = []
     state = None
     try:
-        if settings.decision_mode == "model":
+        all_specs = _build_specs(
+            settings.decision_questions, scene, messages, memes, settings,
+            context=context, umo=umo, last_activity=last_activity, stage=None,
+        )
+        specs = [s for s in all_specs if s.stage == "pre_reply"]
+        post_specs = [s for s in all_specs if s.stage == "post_reply"]
+        if any(spec.decision_mode == "model" for spec in all_specs):
             state = build_state(
                 scene=scene,
                 is_private=is_private,
@@ -572,12 +606,6 @@ async def ask_decision(
                 memes=memes,
                 custom_context=settings.decision_custom_context,
             )
-        all_specs = _build_specs(
-            settings.decision_questions, scene, messages, memes, settings,
-            context=context, umo=umo, last_activity=last_activity, stage=None,
-        )
-        specs = [s for s in all_specs if s.stage == "pre_reply"]
-        post_specs = [s for s in all_specs if s.stage == "post_reply"]
         provider_id = settings.decision_provider_id
         for batch in _workflow_batches(specs, outcomes):
             outcomes.update(await _evaluate_batch(context, batch, outcomes, state, provider_id))
@@ -613,5 +641,7 @@ async def ask_decision(
         )
     result.duration_ms = int((time.monotonic() - started) * 1000)
     result.dry_run = settings.dry_run
-    result.decision_mode = settings.decision_mode
+    result.decision_mode = _result_mode(
+        all_specs if "all_specs" in locals() else specs, settings.decision_mode
+    )
     return result

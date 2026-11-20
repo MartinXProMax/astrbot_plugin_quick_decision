@@ -170,6 +170,34 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(result.outcomes[question.id].reason, "not_asked")
                     self.assertNotIn(question.options[0].session_hint, result.session_hints)
 
+    async def test_question_random_override_mixes_with_model_questions(self):
+        questions = [
+            DecisionQuestion(id="random", type="boolean", instructions="随机题", decision_mode="random",
+                             true_weight=0, false_weight=1),
+            DecisionQuestion(id="model", type="boolean", instructions="模型题", decision_mode="model"),
+        ]
+        service = AsyncMock(return_value={"model": DecisionBooleanAnswer(probability=1)})
+        result = await self.ask(SimpleNamespace(ask=service), settings=PluginSettings({
+            "decision_mode": "random",
+            "decision_questions": {"version": 2, "questions": [q.to_dict() for q in questions]},
+        }))
+        service.assert_awaited_once()
+        self.assertEqual(list(service.call_args.args[0]), ["model"])
+        self.assertFalse(result.answers["random"])
+        self.assertTrue(result.answers["model"])
+        self.assertEqual(result.decision_mode, "mixed")
+
+        random_only = DecisionQuestion(
+            id="random_only", type="boolean", instructions="随机题", decision_mode="random",
+            true_weight=1, false_weight=0,
+        )
+        no_provider = AsyncMock()
+        result = await self.ask(SimpleNamespace(ask=no_provider), settings=PluginSettings({
+            "decision_questions": {"version": 2, "questions": [random_only.to_dict()]},
+        }))
+        no_provider.assert_not_awaited()
+        self.assertTrue(result.answers["random_only"])
+
     async def test_random_mode_preserves_fixed_private_reply_and_dynamic_candidate_weights(self):
         questions = default_questions()
         action, target, _, use_meme, meme = questions
