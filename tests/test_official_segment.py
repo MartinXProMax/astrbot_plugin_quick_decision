@@ -414,6 +414,19 @@ class OfficialSegmentTests(unittest.TestCase):
         self.assertEqual(_kinds(context.calls[1]), ["text"])
         self.assertEqual(_kinds(context.calls[2]), ["image"])
 
+    def test_configured_quote_modes_and_first_success(self):
+        segmenter = self._segmenter(FakeDecorate(split_words=["。"]))
+        for mode, failures, expected in (
+            ("all", set(), [True, True, True]), ("none", set(), [False] * 3),
+            ("first", {0}, [True, True, False]),
+        ):
+            with self.subTest(mode=mode):
+                context = _RecordingContext(return_false_on=failures)
+                _run(send_decision_message(context, umo="group:1", text="一。二。三", resolver=self.store,
+                                           decision=_decision(target_quote_mode=mode), dry_run=False,
+                                           segmenter=segmenter))
+                self.assertEqual(["reply" in _kinds(c) for c in context.calls[:3]], expected)
+
     def test_mid_segment_failure_does_not_resend_success_or_meme(self) -> None:
         segmenter = self._segmenter(FakeDecorate(split_words=["。"]))
         context = _RecordingContext(return_false_on={1})

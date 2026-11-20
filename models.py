@@ -75,6 +75,7 @@ class BufferedMessage:
     quote_sender_id: str = ""
     quote_text: str = ""
     timestamp: float = 0.0
+    sent_at: int | None = None
 
     def to_state_dict(self) -> dict[str, Any]:
         item: dict[str, Any] = {
@@ -102,6 +103,7 @@ QUESTION_ROLES = {
     "answer": "记录答案",
     "action": "控制发言",
     "target": "选择回复目标",
+    "target_gate": "判断是否针对单条消息",
     "meme": "选择表情",
 }
 
@@ -223,6 +225,7 @@ class DecisionResult:
     round_id: str = ""
     decision_mode: Literal["model", "random", "mixed"] = "model"
     target_summary: str = ""
+    target_quote_mode: str = "first"
     meme_description: str = ""
     post_plan: PostDecisionPlan | None = field(default=None, repr=False, compare=False)
 

@@ -89,13 +89,14 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
             for speaks, picture in ((False, False), (True, False), (True, True)):
                 with self.subTest(timings=timings, speaks=speaks, picture=picture):
                     action = "reply" if speaks else "none"
-                    values = {"action": choice(action, **{action: 1}), "length": choice("short", short=1),
+                    values = {"action": choice(action, **{action: 1}), "address_message": DecisionBooleanAnswer(probability=1),
+                              "length": choice("short", short=1),
                               "target_message_id": choice("m1", m1=1), "meme_id": choice("cat", cat=1),
                               "use_meme": DecisionBooleanAnswer(probability=float(picture))}
                     service = SimpleNamespace(ask=AsyncMock(return_value=values))
                     result = await self.ask(service, settings=settings)
                     preview = preview_workflow(settings, "group_passive", {
-                        "action": action, "length": "short", "target_message_id": "*",
+                        "action": action, "address_message": "true", "length": "short", "target_message_id": "*",
                         "meme_id": "*", "use_meme": str(picture).lower()})
                     actual = [list(call.args[0]) for call in service.ask.await_args_list]
                     self.assertEqual(actual, [b["asked"] for b in preview["batches"]])
@@ -108,10 +109,10 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
                     if pick_asked:
                         levels.add(int(not timings[2]) + int(not timings[3]))
                     self.assertEqual(len(actual), len(levels))
-                    total = 1 + sum(speaks or early for early in timings[:3]) + int(pick_asked)
+                    total = 2 + sum(speaks or early for early in timings[:3]) + int(pick_asked)
                     self.assertEqual(sum(map(len, actual)), total)
                     self.assertEqual(sum(len(b["discarded"]) for b in result.batches),
-                                     total - 1 - 3 * speaks - picture)
+                                     total - 1 - 4 * speaks - picture)
                     self.assertEqual(bool(result.tool_calls), picture)
                     self.assertEqual(bool(result.target_message_id), speaks)
                     self.assertEqual(bool(result.session_hints), speaks)
@@ -124,7 +125,8 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
         q["length"].triggers = [
             {"question": "use_meme", "option": "false", "ask_with_parent": True},
             {"question": "target_message_id", "option": "*"}]
-        first = {"action": choice("reply", reply=1), "length": choice("short", short=1),
+        first = {"action": choice("reply", reply=1), "address_message": DecisionBooleanAnswer(probability=1),
+                 "length": choice("short", short=1),
                  "use_meme": DecisionBooleanAnswer(probability=1), "target_message_id": choice("m1", m1=1)}
         second = {"length": choice("long", long=1), "meme_id": choice("none", none=1)}
         service = SimpleNamespace(ask=AsyncMock(side_effect=[first, second]))
@@ -140,13 +142,47 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
         async def reply(questions, *, state):
             self.assertIn("将选中消息的发送人和原文交给会话模型", questions["target_message_id"].criteria["m1"])
             target.text = "另一条消息"
-            return {"action": choice("reply", reply=1), "target_message_id": choice("m1", m1=1)}
+            return {"action": choice("reply", reply=1), "address_message": DecisionBooleanAnswer(probability=1),
+                    "target_message_id": choice("m1", m1=1)}
         result = await self.ask(SimpleNamespace(ask=reply), messages=[target])
         summary = session_hint_text(result)
         self.assertIn("前" * 250, summary)
         self.assertIn("末尾", summary)
         self.assertNotIn("另一条消息", summary)
         self.assertNotIn("</quick_decision>", summary)
+
+    async def test_target_gate_and_selector_use_one_clock_and_only_commit_a_valid_target(self):
+        old, recent = message("41"), message("42")
+        old.text = recent.text = "同文"
+        now = 1735689600
+        old.sent_at, recent.sent_at = now - 3610, now - 18
+        for allow, pick, expected in ((True, "42", "42"), (False, "42", None),
+                                      (True, "latest", None), (True, "absent", None)):
+            ask = AsyncMock(return_value={
+                "action": choice("reply", reply=1),
+                "address_message": DecisionBooleanAnswer(probability=float(allow)),
+                "target_message_id": choice(pick, **{pick: 1}),
+            })
+            ctx = SimpleNamespace(decision=SimpleNamespace(ask=ask), get_config=lambda _: {"timezone": "UTC"})
+            with self.subTest(allow=allow, pick=pick), patch("time.time", return_value=now):
+                result = await ask_decision(ctx, settings=PluginSettings({}), scene="group_passive",
+                                            is_private=False, messages=[old, recent], at_or_quoted=False,
+                                            memes=[], umo="group")
+                ask.assert_awaited_once()
+                questions = ask.await_args.args[0]
+                self.assertIn("2025-01-01 00:00:00+00:00", questions["address_message"].instructions)
+                label = ask.await_args.kwargs["state"]["recent_messages"][1]["sent_at"]
+                self.assertIn("2024-12-31 23:59:42+00:00（18 秒前）", label)
+                self.assertIn(label, questions["target_message_id"].criteria["42"])
+                self.assertIn("1 小时 0 分钟前", questions["target_message_id"].criteria["41"])
+                self.assertEqual(result.target_message_id, expected)
+                self.assertEqual(label in result.target_summary, bool(expected))
+
+    async def test_empty_candidates_skip_both_target_questions(self):
+        ask = AsyncMock(return_value={"action": choice("reply", reply=1)})
+        result = await self.ask(SimpleNamespace(ask=ask), messages=[message("")])
+        self.assertEqual(result.action, "reply")
+        self.assertFalse({"address_message", "target_message_id"} & ask.await_args.args[0].keys())
 
     async def test_private_gate_failure_and_silence_never_sample_children(self):
         settings = PluginSettings({})
@@ -336,6 +372,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
                 return_value={
                     "action": choice("reply", none=0.2, reply=0.8),
                     "target_message_id": choice("m1", latest=0.2, m1=0.8),
+                    "address_message": DecisionBooleanAnswer(probability=1),
                     "length": choice("short", short=0.7, long=0.3),
                     "followup": DecisionBooleanAnswer(probability=0.8),
                     "use_meme": DecisionBooleanAnswer(probability=0.8),
@@ -362,6 +399,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
             list(service.ask.call_args.args[0]),
             [
                 "action",
+                "address_message",
                 "target_message_id",
                 "length",
                 "followup",
@@ -420,6 +458,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
             return {
                 "action": choice("reply", none=0.2, reply=0.8),
                 "target_message_id": choice("m1", latest=0.2, m1=0.8),
+                "address_message": DecisionBooleanAnswer(probability=1),
                 "length": choice("short", short=0.7, long=0.3),
                 "use_meme": DecisionBooleanAnswer(probability=0.8),
                 "meme_id": choice("cat", none=0.2, cat=0.8),
@@ -442,7 +481,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.length, "long")
         self.assertEqual(result.session_hints, [configured[0].options[1].session_hint])
         summary = session_hint_text(result)
-        self.assertIn("回复 用户 的消息：m1", summary)
+        self.assertIn("回复 用户 · 发送时间未知：m1", summary)
         self.assertIn('"篇幅":"详细"', summary)
         self.assertIn('"表情描述":"微笑"', summary)
         self.assertNotIn("cat", summary)
@@ -464,6 +503,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
         service = SimpleNamespace(ask=AsyncMock(return_value={
             "action": choice("reply", reply=1),
             "tone": choice("casual", casual=1),
+            "address_message": DecisionBooleanAnswer(probability=1),
             "target_message_id": choice("msg", msg=1),
             "use_meme": DecisionBooleanAnswer(probability=1),
             "meme_id": choice("cat", cat=1),
@@ -486,6 +526,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
                 return_value={
                     "action": choice("reply", none=0.2, reply=0.8),
                     "target_message_id": choice("outside", latest=0.1, outside=0.9),
+                    "address_message": DecisionBooleanAnswer(probability=1),
                 }
             )
         )
@@ -556,7 +597,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unanswered_and_disabled_parents_do_not_activate_children(self):
         settings = PluginSettings({})
-        action, _, _, length, gate, meme = settings.decision_questions
+        action, _, _, _, length, gate, meme = settings.decision_questions
         for child in (length, gate):
             child.triggers = [{"question": action.id, "option": "reply"}]
         action.use_threshold = True
@@ -574,7 +615,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_random_workflow_deduplicates_shared_child_and_follows_fixed_reply(self):
         settings = PluginSettings({"decision_mode": "random"})
-        action, _, _, length, gate, meme = settings.decision_questions
+        action, _, _, _, length, gate, meme = settings.decision_questions
         meme.triggers.append({"question": action.id, "option": "reply"})
         gate.false_weight = 0
         meme.options[0].weight = 0
@@ -617,7 +658,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
             result.outcomes["action"].reason, "private_passive_default_reply"
         )
         for key in ("target_message_id", "meme_id"):
-            reason = "branch_not_selected" if key == "meme_id" else "not_asked"
+            reason = "branch_not_selected"
             self.assertEqual(
                 (result.outcomes[key].status, result.outcomes[key].reason),
                 ("skipped", reason),
@@ -689,6 +730,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
             return {
                 "action": choice("reply", none=0.2, reply=0.8),
                 "target_message_id": choice(mid, **{"latest": 0.2, mid: 0.8}),
+                "address_message": DecisionBooleanAnswer(probability=1),
                 "length": choice("short", short=0.8, long=0.2),
             }
 

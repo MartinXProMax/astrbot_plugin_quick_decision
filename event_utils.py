@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import At, AtAll, Image, Plain, Reply
@@ -95,6 +96,11 @@ def to_buffered_message(event: AstrMessageEvent) -> BufferedMessage:
         quote_text = (reply.message_str or reply.text or "").strip()
         if not quote_text:
             quote_text = _plain_text(reply.chain)
+    # aiocqhttp 的 message_obj.timestamp 是适配器处理时间，原事件 time 才是发送时间。
+    raw = getattr(event.message_obj, "raw_message", None)
+    sent_at = raw.get("time") if isinstance(raw, Mapping) else None
+    if type(sent_at) is not int or not 0 < sent_at <= time.time():
+        sent_at = None
     return BufferedMessage(
         message_id=str(getattr(event.message_obj, "message_id", "") or ""),
         sender_id=sender_id(event),
@@ -107,6 +113,7 @@ def to_buffered_message(event: AstrMessageEvent) -> BufferedMessage:
         quote_sender_id=quote_sender,
         quote_text=quote_text[:80],
         timestamp=event_timestamp(event),
+        sent_at=sent_at,
     )
 
 

@@ -400,7 +400,7 @@ class MemeFollowupTests(unittest.TestCase):
             text_only,
             dry_run=False,
             should_speak=True,
-            group_direct_send=True,
+            clear_group_reply=True,
             is_private=False,
         )
         self.assertTrue(kept)
@@ -413,7 +413,7 @@ class MemeFollowupTests(unittest.TestCase):
             private,
             dry_run=False,
             should_speak=True,
-            group_direct_send=True,
+            clear_group_reply=True,
             is_private=True,
         )
         self.assertTrue(any(isinstance(item, Reply) for item in private))

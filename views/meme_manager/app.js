@@ -29,7 +29,7 @@ const TYPE_LABELS = { choice: "选择题", boolean: "是否题" };
 // 专门用途的选项 ID 固定，旁边配一句人话说明。
 const FIXED_OPTION_LABELS = {
   action: { none: "保持沉默", reply: "发言", proactive: "冷场时主动开口" },
-  target: { latest: "沿用当前话题", "*": "每条候选消息" },
+  target: { latest: "没有合适的消息", "*": "每条候选消息" },
   meme: { none: "不配图", "*": "每张候选表情" },
 };
 
@@ -643,7 +643,7 @@ function previewFields() {
   }));
   for (const q of state.questions.filter(q => q.enabled)) {
     if (q.role === "action" && !q.triggers.some(t => t.event === (previewScene.endsWith("_proactive") ? "silence_elapsed" : "message_received"))) continue;
-    if (q.role === "target" && previewScene !== "group_passive") continue;
+    if (["target", "target_gate"].includes(q.role) && previewScene !== "group_passive") continue;
     if (q.role === "action" && previewScene === "private_passive" && !q.ask_private) continue;
     const options = Object.fromEntries(answerSlots(q).filter(s => s.owner[s.weightKey] > 0).map(s => [s.key, answerLabel(q,s.key)]));
     let key = previewChoices.get(q);
@@ -966,9 +966,9 @@ function renderSettings(question, qIndex) {
     question.role = value;
     if (value !== "answer") {
       const preset = state.defaults.find(q => q.role === value);
-      question.type = "choice";
+      question.type = preset.type;
       question.stage = "pre_reply";
-      question.options = preset.options.map(o => question.options.find(old => old.id === o.id) || {...o});
+      question.options = (preset.options || []).map(o => question.options.find(old => old.id === o.id) || {...o});
       if (value === "action") {
         setGateEvent(question, question.triggers.find(t => t.event)?.event || "message_received");
         const silent = question.options.find(o => o.id === "none");
@@ -976,6 +976,7 @@ function renderSettings(question, qIndex) {
       }
       for (const child of state.questions) {
         child.triggers = child.triggers.filter(t => t.parent !== question ||
+          (question.type === "boolean" && ["true", "false"].includes(t.option)) ||
           (question.options.includes(t.option) && !(value === "action" && t.option.id === "none")));
       }
     }
@@ -988,7 +989,8 @@ function renderSettings(question, qIndex) {
     if (type === "choice") ensureTwoOptions(question);
     renderQuestions(`[data-q="${qIndex}"] .type-seg [aria-pressed="true"]`);
     updateDirty();
-  }, { disabled: isAnswer ? {} : { boolean: "这个用途只支持选择题" }, extra: "type-seg" });
+  }, { disabled: isAnswer ? {} : question.role === "target_gate"
+    ? { choice: "这个用途使用是否题" } : { boolean: "这个用途只支持选择题" }, extra: "type-seg" });
 
   const stageSeg = segmented("判断时机", [["pre_reply", "回复前"], ["post_reply", "回复写完后"]], question.stage, (stage) => {
     question.stage = stage;
@@ -1029,6 +1031,7 @@ function renderSettings(question, qIndex) {
 
 function renderRoleNote(question) {
   const notes = {
+    target_gate: "只在群聊收到消息且有候选时判断。把选择目标接在“是”下面，可以与本题同批提问。",
     target: "只在群聊收到消息时判断。「*」会展开成本轮每条候选消息，选择标准里可以用 {描述} 引用消息摘要。",
     meme: "「*」会展开成图库里每张带描述的表情，选择标准里可以用 {描述} 引用表情描述。",
   };
@@ -1282,7 +1285,7 @@ function fillForm(saved) {
 }
 
 function applyConfig(data, fallbackQuestions) {
-  if (data.version !== 5 || !Array.isArray(data.default_questions)) throw new Error("请重载插件并刷新页面");
+  if (data.version !== 6 || !Array.isArray(data.default_questions)) throw new Error("请重载插件并刷新页面");
   state.defaults = data.default_questions;
   state.roles = data.roles;
   state.tools = data.tools;
@@ -1321,7 +1324,7 @@ async function saveDecisionConfig() {
     return;
   }
   const payload = {
-    version: 5,
+    version: 6,
     decision_mode: getMode(),
     decision_custom_context: $("custom-context").value,
     decision_questions: collectQuestionsFromForm(),

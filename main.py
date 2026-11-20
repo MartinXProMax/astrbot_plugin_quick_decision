@@ -45,6 +45,7 @@ from .reply_generator import (
     apply_session_hints,
     generate_text,
     install_group_quote_guard,
+    official_generation_failed,
     prepare_official_result_chain,
     send_decision_message,
 )
@@ -262,6 +263,8 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         result.official_llm = True
         await self._log_decision(profile, result)
         event.set_extra("quick_decision", result)
+        if not profile.is_private:
+            install_group_quote_guard(event, result, on_stream_end=self._finish_official_send)
         begin_official_pipeline(runtime, result)
         return request
 
@@ -353,7 +356,6 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             resolver=self.meme_adapter,
             decision=result,
             dry_run=False,
-            quote_target=self.settings.should_quote_target(profile.is_private),
             platform_name=platform_name_from_event(event),
             sent_texts=sent_texts,
         )
@@ -531,7 +533,12 @@ class QuickDecisionPlugin(Star, WebApiMixin):
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
         decision = self._pipeline_decision(event)
-        if decision is None or decision.post_plan is None:
+        if decision is None:
+            return
+        if resp and resp.role == "err":
+            event.set_extra("_qd_llm_error", True)
+            return
+        if decision.post_plan is None:
             return
         if resp and resp.role == "assistant" and not resp.is_chunk and not resp.tools_call_name:
             self._schedule_post_decision(decision, resp.completion_text or "")
@@ -550,26 +557,28 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             result.chain,
             dry_run=settings.dry_run,
             should_speak=decision.should_speak(),
-            group_direct_send=settings.group_direct_send,
+            clear_group_reply=getattr(result, "is_llm_result", lambda: False)(),
             is_private=is_private,
         ):
             event.stop_event()
             await self._cancel_official_round(event, decision, "已取消正文发送")
             return
-        if not is_private and (settings.group_direct_send or decision.target_message_id):
-            target = None if settings.group_direct_send else decision.target_message_id
-            install_group_quote_guard(event, target)
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent):
+        await self._finish_official_send(event)
+
+    async def _finish_official_send(self, event, *, stream_text=None, complete=True):
         # 先根据本事件上的决策记状态并清 pending，再交给钩子发独立表情。
         # 表情发送会消费 extra，重复进入或其它事件不会再发图。
         decision = event.get_extra("quick_decision")
+        if isinstance(decision, DecisionResult) and stream_text is None and official_generation_failed(event):
+            stream_text, complete = "", False
         runtime = self.sessions.get(event.unified_msg_origin)
         if runtime is not None and isinstance(decision, DecisionResult):
-            text = ""
+            text = stream_text or ""
             result = event.get_result()
-            if result and result.chain:
+            if stream_text is None and result and result.chain:
                 text = "".join(
                     getattr(comp, "text", "")
                     for comp in result.chain
@@ -577,7 +586,9 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 ).strip()
             if text:
                 self._record_bot_text(runtime.profile, text)
-            else:
+                if stream_text is not None and complete:
+                    self._schedule_post_decision(decision, text)
+            elif stream_text is None:
                 self.sessions.mark_bot_sent(runtime.profile.umo)
             release_official_pipeline(runtime)
         try:
@@ -586,6 +597,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 context=self.context,
                 resolver=self.meme_adapter,
                 dry_run=self.settings.dry_run,
+                text_sent=None if stream_text is None else complete and bool(stream_text.strip()),
             )
         finally:
             if isinstance(decision, DecisionResult):
@@ -593,6 +605,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
 
     async def _cancel_official_round(self, event, decision, reason):
         event.set_extra("quick_decision", None)
+        event.set_extra("_qd_quote_decision", None)
         release_official_pipeline(self.sessions.get(event.unified_msg_origin))
         await self._finish_tool_log(decision, reason)
 

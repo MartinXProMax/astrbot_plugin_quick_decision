@@ -343,8 +343,7 @@ class MemeAdapterTests(unittest.TestCase):
         self.assertEqual(settings.choice_threshold, 0.7)
         self.assertEqual(settings.cooldown_seconds, 300)
         self.assertEqual(settings.decision_custom_context, "机器人叫小狼")
-        self.assertTrue(settings.group_direct_send)
-        self.assertFalse(settings.should_quote_target(False))
+        self.assertEqual(settings.target_quote_mode, "first")
         questions = _build_questions(
             "group_passive",
             [],

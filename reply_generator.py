@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import copy
 from pathlib import Path
 from typing import Protocol
 
@@ -14,6 +15,16 @@ from astrbot.core.agent.message import TextPart
 
 from .decision_tools import meme_chain, run_tools, send_chain, skip_tools
 from .models import DecisionResult, normalize_action
+
+try:
+    from astrbot.core.platform.astr_message_event import streaming_response_event
+except ImportError:
+    streaming_response_event = None
+
+try:
+    from astrbot.core.pipeline.process_stage.follow_up import _ACTIVE_AGENT_RUNNERS
+except ImportError:
+    _ACTIVE_AGENT_RUNNERS = {}
 
 
 class ImageResolver(Protocol):
@@ -129,10 +140,10 @@ def prepare_official_result_chain(
     *,
     dry_run: bool,
     should_speak: bool,
-    group_direct_send: bool,
+    clear_group_reply: bool,
     is_private: bool,
 ) -> bool:
-    """整理官方即将发送的文字链：不附图；群聊 direct_send 时去掉引用。
+    """取消沉默或试运行的正文，群聊模型结果的引用留到最终发送时设置。
 
     Returns:
         False 表示应取消发送（试运行或不发言）。
@@ -140,7 +151,7 @@ def prepare_official_result_chain(
     if dry_run or not should_speak:
         chain.clear()
         return False
-    if group_direct_send and not is_private:
+    if clear_group_reply and not is_private:
         strip_reply_components(chain)
     return True
 
@@ -158,35 +169,93 @@ def strip_reply_components(chain: list | None) -> None:
     chain[:] = [comp for comp in chain if not _is_reply_component(comp)]
 
 
-def install_group_quote_guard(event, target_id: str | None = None) -> None:
-    """官方在装饰钩子之后加引用，在实际发送时处理最终的消息链。"""
-    if getattr(event, "_qd_group_quote_guard", False):
-        return
-    original = getattr(event, "send", None)
-    if not callable(original):
-        return
-    result = event.get_result()
+def official_generation_failed(event) -> bool:
+    if event.get_extra("_qd_llm_error") or event.get_extra("_third_party_runner_error"):
+        return True
+    # 内置 runner 收到 role=err 时会直接返回普通文字，跳过 on_llm_response。
+    runner = _ACTIVE_AGENT_RUNNERS.get(event.unified_msg_origin)
+    if runner is not None and runner.run_context.context.event is event:
+        return getattr(runner.get_final_llm_resp(), "role", None) == "err"
+    return False
+
+
+def install_group_quote_guard(event, decision: DecisionResult, *, on_stream_end=None) -> None:
+    """只改写本轮模型输出的最终发送链，包括官方缓存或实时分段的流式正文。"""
+    original = event.send
+    # after_message_sent 会消费一次性的工具计划，同一事件的下一份模型结果仍需使用引用策略。
+    event.set_extra("_qd_quote_decision", decision)
+    last_result = None
     quoted = False
+    stream_text = []
 
     async def send(message, *args, **kwargs):
-        nonlocal quoted
+        nonlocal quoted, last_result
         chain = getattr(message, "chain", None)
-        if target_id is None:
-            strip_reply_components(chain)
-        elif event.get_result() is result and chain and any(
-            isinstance(comp, Plain) and comp.text.strip() for comp in chain
-        ):
-            strip_reply_components(chain)
-            if not quoted:
-                chain.insert(0, Reply(id=target_id))
-                quoted = True
-        return await original(message, *args, **kwargs)
+        if not chain or event.get_extra("_qd_quote_decision") is not decision:
+            return await original(message, *args, **kwargs)
+        result = event.get_result()
+        streaming = streaming_response_event is not None and streaming_response_event.get(None) is event
+        if streaming:
+            if official_generation_failed(event):
+                return await original(message, *args, **kwargs)
+        else:
+            if not getattr(result, "is_llm_result", lambda: False)():
+                return await original(message, *args, **kwargs)
+            # 官方 derive 复用装饰后的组件。其他插件新建的消息即使同文也独立发送。
+            if not any(c is own for c in chain if not _is_reply_component(c) for own in result.chain):
+                return await original(message, *args, **kwargs)
+            if result is not last_result:
+                last_result, quoted = result, False
+        parts = [c for c in chain if not _is_reply_component(c)]
+        target = decision.target_message_id if decision.target_quote_mode != "none" else None
+        # aiocqhttp 遇到文件或合并转发会逐组件发包。引用必须与同一段正文一起送达。
+        split = (target and (not quoted or decision.target_quote_mode == "all")
+                 and any(isinstance(c, Plain) for c in parts)
+                 and any(type(c).__name__ in ("File", "Node", "Nodes") for c in parts))
+        chunks = ([c] for c in parts) if split else [parts]
+        receipt = None
+        for chunk in chunks:
+            if not chunk:
+                continue
+            attach = target and (decision.target_quote_mode == "all" or not quoted) and any(
+                isinstance(c, Plain) and (c.text or "").strip() for c in chunk
+            )
+            payload = copy(message)
+            payload.chain = [Reply(id=target), *chunk] if attach else chunk
+            receipt = await original(payload, *args, **kwargs)
+            if receipt is not False:
+                if attach:
+                    quoted = True
+                if streaming:
+                    stream_text.extend(c.text for c in chunk if isinstance(c, Plain) and c.text)
+        return receipt
 
-    try:
-        event.send = send
-        event._qd_group_quote_guard = True
-    except Exception:  # noqa: BLE001
-        logger.debug("当前事件不支持在发送时调整群聊引用")
+    event.send = send
+    original_stream = getattr(event, "send_streaming", None)
+    if on_stream_end is None or original_stream is None:
+        return
+
+    async def send_streaming(*args, **kwargs):
+        nonlocal quoted
+        if (event.get_extra("quick_decision") is not decision or streaming_response_event is None
+                or streaming_response_event.get(None) is not event):
+            return await original_stream(*args, **kwargs)
+        complete = False
+        quoted = False
+        try:
+            result = await original_stream(*args, **kwargs)
+            complete = (result is not False and not official_generation_failed(event)
+                        and not event.get_extra("agent_user_aborted"))
+            return result
+        finally:
+            # AstrBot 的流式路径直接返回，不调用 after_message_sent。
+            if event.send is send:
+                event.send = original
+            if event.send_streaming is send_streaming:
+                event.send_streaming = original_stream
+            await on_stream_end(event, stream_text="".join(stream_text), complete=complete)
+
+    event.send_streaming = send_streaming
 
 
 async def after_official_text_sent(
@@ -195,6 +264,7 @@ async def after_official_text_sent(
     context,
     resolver: ImageResolver,
     dry_run: bool = False,
+    text_sent: bool | None = None,
     segmenter=None,
     sleeper=None,
 ) -> bool:
@@ -207,7 +277,9 @@ async def after_official_text_sent(
         return False
     if dry_run or not decision.should_speak():
         return False
-    if not official_text_was_sent(event):
+    if text_sent is None:
+        text_sent = official_text_was_sent(event)
+    if not text_sent:
         skip_tools(decision, "正文未确认发送")
         return False
     if not any(call.status == "planned" for call in decision.tool_calls.values()):
@@ -359,16 +431,18 @@ async def send_decision_message(
     if not segments:
         return False
     delay = segmenter.should_delay(is_llm_result=True, platform_name=platform_name)
-    quote_this = quote_target
     all_text_ok = True
     any_text_sent = False
     for seg in segments:
+        if not seg.strip():
+            continue
         if delay:
             await segmenter.sleep(await segmenter.interval_for_plain(seg))
         text_chain = build_send_chain(
-            seg, resolver, decision, quote_target=quote_this
+            seg, resolver, decision,
+            quote_target=quote_target and decision.target_quote_mode != "none"
+            and (decision.target_quote_mode == "all" or not any_text_sent),
         )
-        quote_this = False
         if not text_chain.chain:
             all_text_ok = False
             continue

@@ -9,6 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
+from contextvars import ContextVar
 from itertools import product
 from pathlib import Path
 from types import SimpleNamespace
@@ -516,17 +517,21 @@ class DirectSendGuardTests(unittest.IsolatedAsyncioTestCase):
                 chain,
                 dry_run=False,
                 should_speak=True,
-                group_direct_send=True,
+                clear_group_reply=True,
                 is_private=False,
             )
         )
-        install_group_quote_guard(event)
+        decision = DecisionResult(action="reply")
+        event.set_extra("quick_decision", decision)
+        event.set_result(SimpleNamespace(chain=chain, is_llm_result=lambda: True))
+        install_group_quote_guard(event, decision)
         # 官方 ResultDecorateStage 在钩子之后插入引用。
         chain.insert(0, Reply(id="inbound-1"))
         payload = SimpleNamespace(chain=chain)
         await event.send(payload)
-        self.assertFalse(any(type(item).__name__ == "Reply" for item in payload.chain))
-        self.assertEqual(getattr(payload.chain[0], "text", None), "你好")
+        delivered = event._sends[0].chain
+        self.assertFalse(any(type(item).__name__ == "Reply" for item in delivered))
+        self.assertEqual(delivered[0].text, "你好")
 
     async def test_guard_not_used_when_direct_send_off(self) -> None:
         chain = [Reply(id="keep"), SimpleNamespace(text="hi")]
@@ -535,11 +540,80 @@ class DirectSendGuardTests(unittest.IsolatedAsyncioTestCase):
                 chain,
                 dry_run=False,
                 should_speak=True,
-                group_direct_send=False,
+                clear_group_reply=False,
                 is_private=False,
             )
         )
         self.assertTrue(any(type(item).__name__ == "Reply" for item in chain))
+
+    def test_onebot_send_time_is_independent_of_arrival(self):
+        from astrbot_plugin_quick_decision.event_utils import to_buffered_message
+        event = FakeEvent(timestamp=2000)
+        with patch("time.time", return_value=2000):
+            for raw, expected in (({"time": 1000}, 1000), ({}, None), (None, None),
+                                  ({"time": True}, None), ({"time": 2000000}, None),
+                                  ({"time": float("nan")}, None), ({"time": -1}, None)):
+                event.message_obj.raw_message = raw
+                buffered = to_buffered_message(event)
+                self.assertEqual((buffered.timestamp, buffered.sent_at), (2000, expected))
+
+    async def test_quote_modes_apply_only_to_segments_of_one_result(self):
+        from astrbot_plugin_quick_decision.reply_generator import Plain
+        for mode, expected in (("first", ["old", None, None]), ("all", ["old"] * 3),
+                               ("none", [None] * 3)):
+            with self.subTest(mode=mode):
+                event = FakeEvent()
+                decision = DecisionResult(action="reply", target_message_id="old", target_quote_mode=mode)
+                event.set_extra("quick_decision", decision)
+                install_group_quote_guard(event, decision)
+                pieces = [Plain("相同的正文") for _ in range(3)]
+                image = object()
+                event.set_result(SimpleNamespace(chain=[image, *pieces], is_llm_result=lambda: True))
+                await event.send(SimpleNamespace(chain=[Reply("incoming"), image]))
+                await event.send(SimpleNamespace(chain=[Reply("tool"), Plain("相同的正文")]))
+                for piece in pieces:
+                    await event.send(SimpleNamespace(chain=[Reply("incoming"), piece]))
+                # 模型独立生成的另一份结果重新计算首段。
+                independent = Plain("新的回复")
+                event.set_result(SimpleNamespace(chain=[independent], is_llm_result=lambda: True))
+                await event.send(SimpleNamespace(chain=[independent]))
+                self.assertEqual([getattr(m.chain[0], "id", None) for m in event._sends],
+                                 [None, "tool", *expected, expected[0]])
+
+    async def test_stream_delivery_skips_tool_sends_and_preserves_first_after_failure(self):
+        from astrbot_plugin_quick_decision import reply_generator as replies
+        event = FakeEvent()
+        decision = DecisionResult(action="reply", target_message_id="old")
+        event.set_extra("quick_decision", decision)
+        event.set_result(SimpleNamespace(chain=[], is_llm_result=lambda: False))
+        marker = ContextVar("stream", default=None)
+        send = AsyncMock(side_effect=[True, OSError("failed"), True, True])
+        event.send = send
+        install_group_quote_guard(event, decision)
+        with patch.object(replies, "streaming_response_event", marker):
+            await event.send(SimpleNamespace(chain=[Reply("tool"), replies.Plain("工具")]))
+            marker.set(event)
+            with self.assertRaises(OSError):
+                await event.send(SimpleNamespace(chain=[replies.Plain("失败")]))
+            for word in ("首段", "后段"):
+                await event.send(SimpleNamespace(chain=[replies.Plain(word)]))
+        self.assertEqual([getattr(c.args[0].chain[0], "id", None) for c in send.await_args_list],
+                         ["tool", "old", "old", None])
+
+    async def test_mixed_file_payload_keeps_quote_and_text_together(self):
+        from astrbot_plugin_quick_decision.reply_generator import Plain
+        class File:
+            pass
+        event = FakeEvent()
+        decision = DecisionResult(action="reply", target_message_id="old", target_quote_mode="all")
+        event.set_extra("quick_decision", decision)
+        install_group_quote_guard(event, decision)
+        parts = [Plain("甲"), File(), Plain("乙")]
+        event.set_result(SimpleNamespace(chain=parts, is_llm_result=lambda: True))
+        await event.send(SimpleNamespace(chain=[Reply("incoming"), *parts]))
+        self.assertEqual([m.chain[-1] for m in event._sends], parts)
+        self.assertEqual([len(m.chain) for m in event._sends], [2, 1, 2])
+        self.assertEqual([event._sends[i].chain[0].id for i in (0, 2)], ["old", "old"])
 
 
 class PipelineBusyTests(unittest.TestCase):
@@ -651,7 +725,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
 
         payload = self.plugin._decision_config_payload()
         self.assertNotIn("builtin_questions", payload)
-        self.assertEqual(payload["version"], 5)
+        self.assertEqual(payload["version"], 6)
         self.assertIn("send_meme", payload["tools"])
         ids = {q["id"] for q in payload["decision_questions"]}
         messages = [BufferedMessage("msg1", "u1", "User", "user", "Hello")]
@@ -764,7 +838,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
 
         self.plugin.config = Config(self.plugin.config)
         payload = self.plugin._decision_config_payload()
-        payload["version"] = 5
+        payload["version"] = 6
         length = next(q for q in payload["decision_questions"] if q["id"] == "length")
         length["stage"] = "post_reply"
         for t in length["triggers"]:
@@ -775,7 +849,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             patch.object(web_api, "json_response", side_effect=lambda value: value),
             patch.object(web_api, "error_response", side_effect=lambda msg, status_code: status_code),
         ):
-            self.assertEqual((await self.plugin.web_decision_config())["version"], 5)
+            self.assertEqual((await self.plugin.web_decision_config())["version"], 6)
             del length["stage"]
             for version in (2, 3):
                 payload["version"] = version
@@ -793,7 +867,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
 
         self.plugin.config = Config(self.plugin.config)
         payload = self.plugin._decision_config_payload()
-        payload["version"] = 5
+        payload["version"] = 6
         question = next(q for q in payload["decision_questions"] if q["id"] == "length")
         question["decision_mode"] = "random"
         request = SimpleNamespace(method="POST", json=AsyncMock(return_value=payload))
@@ -803,7 +877,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             patch.object(web_api, "error_response", side_effect=lambda msg, status_code: status_code),
         ):
             saved = await self.plugin.web_decision_config()
-            self.assertEqual(saved["version"], 5)
+            self.assertEqual(saved["version"], 6)
             for q in payload["decision_questions"]:
                 q.pop("decision_mode", None)
             payload["version"] = 3
@@ -1110,20 +1184,93 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("送达结果未确认", receipt["reason"])
 
     async def test_selected_target_quotes_only_first_group_text_segment(self) -> None:
-        self.plugin.config["group"]["direct_send"] = False
         event = FakeEvent(message_id="new", text="最新消息", at_or_wake=True)
         self.main_mod.ask_decision = AsyncMock(
             return_value=DecisionResult(action="reply", target_message_id="old")
         )
         await self.plugin.on_chat_message(event)
         pieces = [self.main_mod.Plain("第一段"), self.main_mod.Plain("第二段")]
-        event.set_result(SimpleNamespace(chain=pieces[:]))
+        event.set_result(SimpleNamespace(chain=pieces[:], is_llm_result=lambda: True))
         await self.plugin.on_decorating_result(event)
         await event.send(SimpleNamespace(chain=[Reply(id="new"), pieces[0]]))
         await event.send(SimpleNamespace(chain=[pieces[1]]))
         quotes = [c.id for msg in event._sends for c in msg.chain if hasattr(c, "id")]
         self.assertEqual(quotes, ["old"])
         self.assertEqual(event._sends[0].chain[0].id, "old")
+        await self.plugin.after_message_sent(event)
+        self.assertIsNone(event.get_extra("quick_decision"))
+        next_answer = self.main_mod.Plain("工具执行后的另一份模型回复")
+        event.set_result(SimpleNamespace(chain=[next_answer], is_llm_result=lambda: True))
+        await self.plugin.on_decorating_result(event)
+        await event.send(SimpleNamespace(chain=[Reply(id="new"), next_answer]))
+        self.assertEqual(event._sends[-1].chain[0].id, "old")
+        await self.plugin.after_message_sent(event)
+
+    async def test_stream_error_notice_never_counts_as_a_successful_reply(self):
+        from astrbot_plugin_quick_decision import reply_generator as replies
+        marker = ContextVar("stream", default=None)
+        for source in ("hook", "third_party", "builtin"):
+            with self.subTest(source=source), patch.object(replies, "streaming_response_event", marker):
+                event = FakeEvent(umo=f"aiocqhttp:GroupMessage:{source}", at_or_wake=True, text="hi")
+                runner = SimpleNamespace(run_context=SimpleNamespace(context=SimpleNamespace(event=event)),
+                                         get_final_llm_resp=lambda: SimpleNamespace(role="err"))
+                async def output():
+                    if source == "hook":
+                        await self.plugin.on_llm_response(event, SimpleNamespace(role="err"))
+                    if source == "third_party":
+                        event.set_extra("_third_party_runner_error", True)
+                    await event.send(SimpleNamespace(chain=[replies.Plain("错误提示")]))
+                event.send_streaming = output
+                decision = DecisionResult(action="reply", target_message_id="42", use_meme=True, meme_id="cat")
+                self.main_mod.ask_decision = AsyncMock(return_value=decision)
+                await self.plugin.on_chat_message(event)
+                token = marker.set(event)
+                try:
+                    runners = {event.unified_msg_origin: runner} if source == "builtin" else {}
+                    with patch.object(replies, "_ACTIVE_AGENT_RUNNERS", runners):
+                        await event.send_streaming()
+                finally:
+                    marker.reset(token)
+                self.assertEqual([part.text for part in event._sends[0].chain], ["错误提示"])
+                runtime = self.plugin.sessions.get(event.unified_msg_origin)
+                self.assertFalse(is_official_pipeline_busy(runtime))
+                self.assertEqual(runtime.messages[-1].role, "user")
+                self.assertEqual(decision.tool_calls["send_meme"].status, "skipped")
+
+    async def test_stream_end_releases_group_on_success_and_interruption(self):
+        from astrbot_plugin_quick_decision import reply_generator as replies
+        marker = ContextVar("stream", default=None)
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted), patch.object(replies, "streaming_response_event", marker):
+                event = FakeEvent(umo=f"aiocqhttp:GroupMessage:stream-{interrupted}", at_or_wake=True, text="hi")
+                async def output():
+                    await event.send(SimpleNamespace(chain=[replies.Plain("第一段")]))
+                    # MainAgentHooks.on_tool_end 清除结果，但当前流仍是同一份回复。
+                    event.set_result(None)
+                    await event.send(SimpleNamespace(chain=[replies.Plain("第二段")]))
+                    if interrupted:
+                        raise asyncio.CancelledError()
+                event.send_streaming = output
+                result = DecisionResult(action="reply", target_message_id="42")
+                self.main_mod.ask_decision = AsyncMock(return_value=result)
+                await self.plugin.on_chat_message(event)
+                event.set_result(SimpleNamespace(chain=[], is_llm_result=lambda: False))
+                token = marker.set(event)
+                try:
+                    if interrupted:
+                        with self.assertRaises(asyncio.CancelledError):
+                            await event.send_streaming()
+                    else:
+                        await event.send_streaming()
+                finally:
+                    marker.reset(token)
+                self.assertIsNone(event.get_extra("quick_decision"))
+                self.assertIs(event.send_streaming, output)
+                runtime = self.plugin.sessions.get(event.unified_msg_origin)
+                self.assertFalse(is_official_pipeline_busy(runtime))
+                self.assertEqual(runtime.messages[-1].text, "第一段第二段")
+                self.assertEqual(event._sends[0].chain[0].id, "42")
+                self.assertEqual(len(event._sends[1].chain), 1)
 
     def test_late_messages_do_not_reopen_an_evaluated_silence(self) -> None:
         from astrbot_plugin_quick_decision.models import BufferedMessage

@@ -130,8 +130,9 @@ SPEAK_OPTION = {"message_received": "reply", "silence_elapsed": "proactive"}
 OPTION_EFFECTS = {
     "action": {"none": "结束本轮，丢弃提前取得的后续答案", "reply": "允许生成回复，继续处理命中的后续题",
                "proactive": "允许根据近期会话生成冷场发言，继续处理命中的后续题"},
+    "target_gate": {"true": "采用目标选择题选出的具体消息", "false": "自然接话，丢弃预选目标"},
     "target": {"latest": "沿用当前话题，不锁定具体消息",
-               "*": "将选中消息的发送人和原文交给会话模型，引用遵循群聊发送设置"},
+               "*": "将选中消息的发送人和原文交给会话模型，同时提供发送时间；引用方式由群聊设置决定"},
     "meme": {"none": "不选择表情", "*": "选定本轮表情，已安排发送工具时在正文发送成功后尝试发送"},
     "answer": {"*": "记录该答案并交给会话模型"},
     "post_reply": {"*": "将答案记录到本轮回复后判断日志"},
@@ -203,8 +204,40 @@ def migrate_questions(old):
     return migrated, "；".join(warnings) or None
 
 
+def migrate_target_gate(questions):
+    target = next((q for q in questions if q.enabled and q.role == "target"), None)
+    if not target or not target.triggers or any(q.role == "target_gate" for q in questions):
+        return questions, None
+    latest = next(o for o in target.options if o.id == "latest")
+    parents = {t.get("question") for t in target.triggers}
+    # 已由自定义是否题控制时，保留原图。自然接话上的已有业务效果也不能被新题跳过。
+    if any(q.type == "boolean" and q.id in parents for q in questions):
+        return questions, f"已保留 {target.id} 的自定义上游是否题，可在判断配置中检查是否需要添加「判断是否针对单条消息」"
+    if latest.session_hint or latest.tool or any(o.weight != 1 for o in target.options) or any(
+        t.get("question") == target.id and t["option"] == "latest"
+        for q in questions for t in q.triggers or []
+    ):
+        return questions, f"已保留 {target.id} 的自定义选项，可在上游添加「判断是否针对单条消息」"
+    gate_id = "address_message"
+    ids = {q.id for q in questions}
+    while gate_id in ids:
+        gate_id += "_2"
+    gate = DecisionQuestion(
+        gate_id, "boolean", "本次发言是否需要针对某一条具体消息？结合发送时间与话题是否仍在继续判断，"
+        "只回答是或否。已经换题或只是自然接话时选否。",
+        role="target_gate", use_threshold=True, triggers=target.triggers,
+        decision_mode=target.decision_mode,
+    )
+    target.triggers = [{"question": gate.id, "option": "true", "ask_with_parent": True}]
+    if target.instructions == TARGET_PROMPT:
+        target.instructions = "假设需要针对一条消息，结合发送时间和当前话题选择目标。均不合适时选 latest。"
+    questions.insert(questions.index(target), gate)
+    return questions, None
+
+
 def default_questions(legacy=None):
-    return migrate_questions(legacy_questions(legacy))[0]
+    questions, _ = migrate_questions(legacy_questions(legacy))
+    return migrate_target_gate(questions)[0]
 
 
 def dump_decision_questions(questions: list[DecisionQuestion]) -> str:
@@ -353,7 +386,8 @@ def _parse_one_question(
     if (
         not isinstance(role, str)
         or role not in QUESTION_ROLES
-        or (role != "answer" and qtype != "choice")
+        or (role == "target_gate" and qtype != "boolean")
+        or (role not in ("answer", "target_gate") and qtype != "choice")
     ):
         return None, f"问题 {question_id} 的用途与题型不匹配"
     stage = "pre_reply" if legacy else item.get("stage", "pre_reply")
@@ -605,7 +639,7 @@ def _validate_triggers(questions):
 
 
 def load_questions(value, *, strict=False):
-    """读取旧附加题数组、版本 2 分支或版本 3 触发条件。"""
+    """加载判断图，在读入旧版本时迁移目标分支。"""
     if not strict and (value is None or (isinstance(value, str) and not value.strip())):
         return default_questions(), None
     if isinstance(value, str) and value.strip():
@@ -618,15 +652,20 @@ def load_questions(value, *, strict=False):
     if isinstance(value, dict) and "version" in value:
         if (
             type(value.get("version")) is not int
-            or value["version"] not in (2, 3)
+            or value["version"] not in (2, 3, 4)
             or not isinstance(value.get("questions"), list)
         ):
             return [], "无法识别的问题配置版本或格式"
-        if value["version"] == 3:
-            return parse_decision_questions(value["questions"], strict=True, legacy=False, trigger_format=True)
-        old, warning = parse_decision_questions(value["questions"], strict=strict, legacy=False)
-        questions, migrated_warning = migrate_questions(old)
-        return questions, "；".join(w for w in (warning, migrated_warning) if w) or None
+        if value["version"] >= 3:
+            questions, warning = parse_decision_questions(value["questions"], strict=True, legacy=False, trigger_format=True)
+            if warning or value["version"] == 4:
+                return questions, warning
+        else:
+            old, warning = parse_decision_questions(value["questions"], strict=strict, legacy=False)
+            questions, migrated_warning = migrate_questions(old)
+            warning = "；".join(w for w in (warning, migrated_warning) if w)
+        questions, target_warning = migrate_target_gate(questions)
+        return questions, "；".join(w for w in (warning, target_warning) if w) or None
     legacy, warning = parse_decision_questions(value, strict=strict)
     if warning and strict:
         return [], warning
@@ -657,7 +696,8 @@ class PluginSettings:
         )
         self.cooldown_seconds = _as_int(data.get("cooldown_seconds"), 300, minimum=0)
         self.group_enable_interrupt = _as_bool(group.get("enable_interrupt"), True)
-        self.group_direct_send = _as_bool(group.get("direct_send"), True)
+        mode = group.get("target_quote_mode")
+        self.target_quote_mode = mode if mode in ("none", "first", "all") else "first"
         self.group_enable_proactive = _as_bool(
             group.get("enable_proactive_after_silence"), True
         )
@@ -700,9 +740,3 @@ class PluginSettings:
         if is_private:
             return self.private_hourly_proactive_limit
         return self.group_hourly_proactive_limit
-
-    def should_quote_target(self, is_private: bool) -> bool:
-        """群聊在开启直接发送时不引用某一条消息；私聊仍保持原样。"""
-        if is_private:
-            return True
-        return not self.group_direct_send

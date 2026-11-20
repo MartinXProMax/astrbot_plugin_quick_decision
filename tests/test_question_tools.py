@@ -117,7 +117,7 @@ class QuestionToolTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.action, expected)
             self.assertFalse(result.tool_calls)
             ask.assert_not_awaited()
-        self.assertEqual(len(load_questions("[]")[0]), 5)
+        self.assertEqual(len(load_questions("[]")[0]), 6)
 
     def test_reject_unknown_tools_and_ambiguous_role_before_save(self):
         self.questions.append(dict(self.picture, id="other"))
@@ -140,6 +140,7 @@ class QuestionToolTests(unittest.IsolatedAsyncioTestCase):
         questions, warning = load_questions(saved)
         expected_ids = [q["id"] for q in self.questions if q is not duplicate]
         expected_ids.insert(expected_ids.index("speak") + 1, "idle_speak")
+        expected_ids.insert(expected_ids.index("target_message_id"), "address_message")
         self.assertEqual([q.id for q in questions], expected_ids)
         self.assertIn("duplicate_picture", warning)
         self.assertIn("illustration", warning)
@@ -214,6 +215,27 @@ class QuestionToolTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(error)
         duplicate = dict(base[0], id="second_gate")
         self.assertIn("已有", load_questions({"version": 3, "questions": [*base, duplicate]})[1])
+
+    def test_target_gate_upgrade_preserves_inputs_and_remains_deleted_in_v4(self):
+        base = [q.to_dict() for q in default_questions() if q.role != "target_gate"]
+        target = next(q for q in base if q["role"] == "target")
+        conditions = [{"question": "action", "option": "reply", "ask_with_parent": True},
+                      {"question": "length", "option": "short"}]
+        target["triggers"] = conditions
+        for version in (3, 4):
+            questions, warning = load_questions({"version": version, "questions": base}, strict=True)
+            self.assertIsNone(warning)
+            gates = [q for q in questions if q.role == "target_gate"]
+            if version == 4:
+                self.assertEqual(gates, [])
+            else:
+                self.assertEqual(gates[0].triggers, conditions)
+                self.assertEqual(next(q for q in questions if q.role == "target").triggers,
+                                 [{"question": gates[0].id, "option": "true", "ask_with_parent": True}])
+                saved = {"version": 4, "questions": [q.to_dict() for q in questions]}
+                self.assertEqual(load_questions(saved, strict=True), (questions, None))
+        target["enabled"] = False
+        self.assertFalse(any(q.role == "target_gate" for q in load_questions({"version": 3, "questions": base})[0]))
 
     def test_migrate_renamed_gate_collision_and_conflicting_silence_edge(self):
         self.gate["branches"] = {"none": "length", "proactive": "illustration"}

@@ -57,7 +57,7 @@ class WebApiMixin:
         return {
             "decision_mode": settings.decision_mode,
             "decision_custom_context": settings.decision_custom_context,
-            "version": 5,
+            "version": 6,
             "events": EVENTS,
             "effects": OPTION_EFFECTS,
             "default_questions": [q.to_dict() for q in default_questions()],
@@ -83,7 +83,7 @@ class WebApiMixin:
             return error_response("决策模式无效", status_code=400)
         settings = PluginSettings({"decision_mode": mode})
         settings.decision_questions, error = load_questions(
-            {"version": 3, "questions": payload.get("decision_questions")}, strict=True)
+            {"version": 4, "questions": payload.get("decision_questions")}, strict=True)
         if error:
             return error_response(error, status_code=400)
         return json_response(preview_workflow(settings, payload["scene"], choices))
@@ -100,14 +100,14 @@ class WebApiMixin:
         if mode not in ("model", "random"):
             return error_response("请选择模型判断或纯随机", status_code=400)
         version = payload.get("version")
-        if type(version) is not int or version not in (2, 3, 4, 5):
+        if type(version) is not int or version not in (2, 3, 4, 5, 6):
             return error_response("无法识别的编辑器版本，请刷新页面", status_code=400)
-        if version < 5:
+        if version < 6:
             return error_response("当前判断使用生效条件，请刷新编辑页后再保存", status_code=409)
         custom_context = str(payload.get("decision_custom_context") or "").strip()
         questions, error = load_questions(
             {
-                "version": 3,
+                "version": 4,
                 "questions": payload.get("decision_questions"),
             },
             strict=True,
@@ -122,7 +122,7 @@ class WebApiMixin:
             "decision_mode": mode,
             "decision_custom_context": custom_context,
             "decision_questions": json.dumps(
-                {"version": 3, "questions": [q.to_dict() for q in questions]},
+                {"version": 4, "questions": [q.to_dict() for q in questions]},
                 ensure_ascii=False, indent=2,
             ),
         }

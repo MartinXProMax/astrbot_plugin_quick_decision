@@ -241,6 +241,7 @@ def build_state(
     at_or_quoted: bool,
     memes: list[dict[str, str]],
     custom_context: str = "",
+    clock=None,
 ) -> dict[str, Any]:
     """只提供精简上下文，不包含人设、Skill 或官方完整注入。"""
     state: dict[str, Any] = {
@@ -250,14 +251,17 @@ def build_state(
         "recent_messages": [item.to_state_dict() for item in messages],
         "meme_catalog": [dict(meme) for meme in memes],
     }
+    if clock is not None:
+        for record, message in zip(state["recent_messages"], messages, strict=True):
+            if message.role == "user":
+                record["sent_at"] = _sent_time_label(message.sent_at, clock)
     context = custom_context.strip()
     if context:
         state["custom_context"] = context
     return state
 
 
-def _question_info(context, umo, scene, last_activity):
-    now = time.time()
+def _round_clock(context, umo):
     get_config = getattr(context, "get_config", None)
     zone = None
     try:
@@ -267,6 +271,28 @@ def _question_info(context, umo, scene, last_activity):
             zone = timezone.utc if name == "UTC" else ZoneInfo(name)
     except Exception as exc:
         logger.warning("判断题无法读取会话时区，将使用系统时区：%s", exc)
+    return time.time(), zone
+
+
+def _sent_time_label(sent_at, clock):
+    now, zone = clock
+    if sent_at is None or not 0 < sent_at <= now:
+        return "发送时间未知"
+    instant = datetime.fromtimestamp(sent_at, timezone.utc).astimezone(zone)
+    seconds = int(now - sent_at)
+    minutes, seconds = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        age = f"{hours} 小时 {minutes} 分钟"
+    elif minutes:
+        age = f"{minutes} 分 {seconds} 秒"
+    else:
+        age = f"{seconds} 秒"
+    return f"{instant.isoformat(sep=' ', timespec='seconds')}（{age}前）"
+
+
+def _question_info(context, umo, scene, last_activity, clock=None):
+    now, zone = clock or _round_clock(context, umo)
     instant = datetime.fromtimestamp(now, timezone.utc).astimezone(zone)
     silence = "不适用（本轮收到消息）"
     if scene.endswith("_proactive"):
@@ -278,16 +304,19 @@ def _question_info(context, umo, scene, last_activity):
 
 
 def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
-                 context=None, umo="", last_activity=None, stage="pre_reply"):
+                 context=None, umo="", last_activity=None, stage="pre_reply", clock=None):
     specs = []
     proactive = scene.endswith("_proactive")
     info = None
     event = "silence_elapsed" if proactive else "message_received"
+    candidates = {m.message_id: m for m in messages[-8:] if m.role == "user"
+                  and m.message_id and m.message_id not in ("latest", "*")}
+    has_targets = scene == "group_passive" and bool(candidates if targets is None else targets)
     gate = next((q for q in configured if q.enabled and q.role == "action"
                  and any(t.get("event") == event for t in q.triggers or [])), None)
     successors = {}
     for child in configured:
-        if not child.enabled or (child.role == "target" and scene != "group_passive"):
+        if not child.enabled or (child.role in ("target", "target_gate") and not has_targets):
             continue
         for t in child.triggers or []:
             if "question" in t:
@@ -310,6 +339,9 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
 
         def effect(key, hint, tool):
             parts = [effects.get(key, effects.get("*", ""))]
+            if role == "target" and key == "*":
+                parts.append({"none": "正文无引用气泡", "first": "仅首段正文引用这条消息",
+                              "all": "每段正文都引用这条消息"}[settings.target_quote_mode])
             if item.stage != "post_reply":
                 if hint:
                     parts.append("会话提示：" + hint)
@@ -349,9 +381,11 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
             reply = next(o for o in item.options if o.id == "reply")
             spec.session_hints["reply"] = reply.session_hint
             spec.tools["reply"] = reply.tool
-        if fixed or (role == "target" and scene != "group_passive"):
+        if fixed or (role in ("target", "target_gate") and not has_targets):
             continue
         prompt = item.instructions
+        if role in ("target_gate", "target") and _TIME_TOKEN not in prompt:
+            prompt += "\n本轮判断时间：" + _TIME_TOKEN
         if role == "action" and proactive:
             prompt = item.instructions
             for token in (_TIME_TOKEN, _SILENCE_TOKEN):
@@ -359,7 +393,8 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
                     prompt += f"\n{token[1:-1]}：{token}"
         if spec.decision_mode == "model" and (_TIME_TOKEN in prompt or _SILENCE_TOKEN in prompt):
             if info is None:
-                info = _question_info(context, umo, scene, last_activity)
+                clock = clock or _round_clock(context, umo)
+                info = _question_info(context, umo, scene, last_activity, clock)
             for token, value in info.items():
                 prompt = prompt.replace(token, value)
         if any(early for _, _, early in parents):
@@ -378,19 +413,14 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
             continue
         dynamic = {}
         if role == "target":
-            dynamic = (
-                targets
-                if targets is not None
-                else {
-                    m.message_id: f"回复 {m.sender_name or m.sender_id} 的消息：{m.text[:40] or '（无文本）'}"
-                    for m in messages[-8:]
-                    if m.message_id and m.role == "user"
-                }
-            )
-            spec.target_texts = dict(targets) if targets is not None else {
-                m.message_id: f"回复 {m.sender_name or m.sender_id} 的消息：{m.text or '（无文本）'}"
-                for m in messages[-8:] if m.message_id and m.role == "user"
-            }
+            if targets is not None:
+                dynamic = spec.target_texts = dict(targets)
+            else:
+                clock = clock or _round_clock(context, umo)
+                for mid, msg in candidates.items():
+                    header = f"回复 {msg.sender_name or msg.sender_id} · {_sent_time_label(msg.sent_at, clock)}："
+                    dynamic[mid] = header + (msg.text[:40] or "（无文本）")
+                    spec.target_texts[mid] = header + (msg.text or "（无文本）")
         elif role == "meme":
             dynamic = {m["id"]: m["description"] for m in memes}
         spec.candidate_descriptions = dynamic
@@ -704,6 +734,7 @@ async def ask_decision(
 ) -> DecisionResult:
     """按当前模式评估本轮问题。失败时返回带 error 的结果。"""
     started = time.monotonic()
+    quote_mode = settings.target_quote_mode
     if settings.decision_questions_warning:
         logger.warning("判断问题配置：%s", settings.decision_questions_warning)
     specs = []
@@ -711,9 +742,10 @@ async def ask_decision(
     batches = []
     state = None
     try:
+        clock = _round_clock(context, umo) if scene == "group_passive" else None
         all_specs = _build_specs(
             settings.decision_questions, scene, messages, memes, settings,
-            context=context, umo=umo, last_activity=last_activity, stage=None,
+            context=context, umo=umo, last_activity=last_activity, stage=None, clock=clock,
         )
         specs = [s for s in all_specs if s.stage == "pre_reply"]
         post_specs = [s for s in all_specs if s.stage == "post_reply"]
@@ -725,6 +757,7 @@ async def ask_decision(
                 at_or_quoted=at_or_quoted,
                 memes=memes,
                 custom_context=settings.decision_custom_context,
+                clock=clock,
             )
         provider_id = settings.decision_provider_id
         await _run_workflow(context, specs, outcomes, batches, state, provider_id)
@@ -750,6 +783,7 @@ async def ask_decision(
     result.batches = batches
     result.duration_ms = int((time.monotonic() - started) * 1000)
     result.dry_run = settings.dry_run
+    result.target_quote_mode = quote_mode
     result.decision_mode = _result_mode(
         all_specs if "all_specs" in locals() else specs, settings.decision_mode
     )

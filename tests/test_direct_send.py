@@ -51,16 +51,14 @@ class _DummyStore:
 
 
 class DirectSendTests(unittest.TestCase):
-    def test_default_is_direct_send(self) -> None:
-        settings = PluginSettings({})
-        self.assertTrue(settings.group_direct_send)
-        self.assertFalse(settings.should_quote_target(False))
-        self.assertTrue(settings.should_quote_target(True))
+    def test_old_and_new_installations_default_to_first(self) -> None:
+        for group in ({}, {"direct_send": True}, {"direct_send": False}, {"target_quote_mode": "bad"}):
+            self.assertEqual(PluginSettings({"group": group}).target_quote_mode, "first")
 
-    def test_can_turn_quoting_back_on(self) -> None:
-        settings = PluginSettings({"group": {"direct_send": False}})
-        self.assertFalse(settings.group_direct_send)
-        self.assertTrue(settings.should_quote_target(False))
+    def test_explicit_mode_wins_over_old_setting(self) -> None:
+        for mode in ("none", "first", "all"):
+            settings = PluginSettings({"group": {"direct_send": True, "target_quote_mode": mode}})
+            self.assertEqual(settings.target_quote_mode, mode)
 
     def test_build_chain_omits_reply_when_disabled(self) -> None:
         decision = DecisionResult(action="reply", target_message_id="123")
