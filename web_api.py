@@ -74,7 +74,9 @@ class WebApiMixin:
             defaults, _ = migrate_actions(default_questions())
             for obsolete in ("roles", "effects", "tools"):
                 payload.pop(obsolete)
-            payload.update(version=7, workflow_version=5, events=WORKFLOW_EVENTS, actions=ACTIONS,
+            # stored_version 是落盘图的版本；为 5 以前时首次保存会升级，旧编辑页随后无法再写入。
+            payload.update(version=7, workflow_version=5, stored_version=settings.workflow_version,
+                           events=WORKFLOW_EVENTS, actions=ACTIONS,
                            candidate_sources=SOURCES, decision_questions=[q.to_dict() for q in questions],
                            default_questions=[q.to_dict() for q in defaults],
                            warning="；".join(w for w in (payload["warning"], migration_warning) if w) or None)

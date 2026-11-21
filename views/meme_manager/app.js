@@ -1,10 +1,18 @@
 import { probabilityRows } from "./log-probabilities.mjs";
+import * as wf from "./workflow-model.mjs";
 
 const bridge = window.AstrBotPluginView;
 
 const SCENE_LABELS = {
   group_passive: "群聊",
   private_passive: "私聊",
+  group_proactive: "群聊冷场",
+  private_proactive: "私聊冷场",
+};
+
+const PREVIEW_SCENES = {
+  group_passive: "群聊收到消息",
+  private_passive: "私聊收到消息",
   group_proactive: "群聊冷场",
   private_proactive: "私聊冷场",
 };
@@ -25,15 +33,22 @@ const SAVE_MESSAGES = {
 };
 
 const TYPE_LABELS = { choice: "选择题", boolean: "是否题" };
-
-// 专门用途的选项 ID 固定，旁边配一句人话说明。
-const FIXED_OPTION_LABELS = {
-  action: { none: "保持沉默", reply: "发言", proactive: "冷场时主动开口" },
-  target: { latest: "没有合适的消息", "*": "每条候选消息" },
-  meme: { none: "不配图", "*": "每张候选表情" },
-};
-
+const STAGE_LABELS = { pre_reply: "正文生成前", post_reply: "正文生成后" };
+const SOURCE_TAGS = { recent_messages: "选消息", memes: "选表情" };
 const PROMPT_TOKENS = ["当前时间", "冷场时长"];
+
+// 动作目录只给出参数名和时机取值，界面文案先在这里补齐；目录里出现新动作时退回原名。
+const ACTION_UI = {
+  request_reply: { icon: "reply", group: "chat" },
+  add_context: { icon: "context", group: "chat" },
+  quote_message: { icon: "quote", group: "send" },
+  send_meme: { icon: "image", group: "send" },
+};
+const WHEN_LABELS = { on_match: "判断后立即发送", after_send: "正文发送后配图" };
+const TOOL_STATUS = {
+  planned: "计划中", executed: "已执行", skipped: "已跳过", failed: "失败", running: "执行中", interrupted: "已中断",
+};
+const MARK_LABELS = { used: "采用", discarded: "丢弃", unasked: "未提问" };
 
 const ICONS = {
   up: '<path d="m6 15 6-6 6 6"/>',
@@ -46,8 +61,11 @@ const ICONS = {
   arrow: '<path d="M4 12h15"/><path d="m13 6 6 6-6 6"/>',
   image:
     '<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="9" cy="10" r="1.6"/><path d="m21 16-5-5-9 8"/>',
-  hint: '<path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  reply: '<path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+  context: '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><path d="M8 13h8M8 17h5"/>',
+  quote: '<path d="M6 7h5v5c0 3-2 5-5 6"/><path d="M14 7h5v5c0 3-2 5-5 6"/>',
   zap: '<path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/>',
+  close: '<path d="M6 6l12 12M18 6 6 18"/>',
 };
 
 // ---------- 小工具 ----------
@@ -136,12 +154,6 @@ function autosize(el) {
   el.style.height = `${el.scrollHeight + 2}px`;
 }
 
-function nextId(prefix, used) {
-  let index = 1;
-  while (used.has(`${prefix}${index}`)) index += 1;
-  return `${prefix}${index}`;
-}
-
 function moveItem(list, index, delta) {
   const next = index + delta;
   if (next < 0 || next >= list.length) return false;
@@ -150,7 +162,7 @@ function moveItem(list, index, delta) {
   return true;
 }
 
-function normalizeAction(action) {
+function normalizeLogAction(action) {
   return action === "join" ? "reply" : action;
 }
 
@@ -161,17 +173,23 @@ const roughPercent = new Intl.NumberFormat("zh-CN", { style: "percent", maximumF
 
 const state = {
   questions: [],
-  defaults: [], roles: {}, tools: {},
+  defaults: [],
+  catalog: {},
+  events: {},
+  sources: {},
+  storedVersion: null,
   saved: { mode: "model", context: "", questions: [] },
   savedSnapshot: "",
   saving: false,
   fresh: null,
   loaded: false,
-  // 展开的问题以对象记录，改名和排序后保持展开。
+  // 展开的问题和折叠区以对象记录，改名和排序后保持展开。
   open: new Set(),
+  advanced: new Set(),
   // 读到的配置里每道题的序列化结果，用来标出新增和修改过的题。
   baseline: new Map(),
   baselineOrder: [],
+  preview: { scene: "group_passive", choices: new WeakMap(), result: null, stale: false, revision: 0 },
   logs: [],
   logFilter: "all",
 };
@@ -186,125 +204,18 @@ function setMode(mode) {
   }
 }
 
-function normalizeQuestion(raw) {
-  const type = raw?.type === "boolean" ? "boolean" : "choice";
-  const question = {
-    id: String(raw?.id || "").trim(),
-    enabled: raw?.enabled !== false,
-    type,
-    instructions: String(raw?.instructions || ""),
-    options: [],
-    role: raw?.role || "answer",
-    decision_mode: raw?.decision_mode === "random" || raw?.decision_mode === "model" ? raw.decision_mode : "inherit",
-    stage: raw?.stage || "pre_reply",
-    use_threshold: !!raw?.use_threshold,
-    ask_private: !!raw?.ask_private,
-    triggers: [],
-    true_tool: raw?.true_tool || "", false_tool: raw?.false_tool || "",
-    true_session_hint: String(raw?.true_session_hint || ""),
-    false_session_hint: String(raw?.false_session_hint || ""),
-    true_weight: raw?.true_weight ?? 1,
-    false_weight: raw?.false_weight ?? 1,
-  };
-  if (type === "choice") {
-    const options = Array.isArray(raw?.options) ? raw.options : [];
-    question.options = options.map((option) => ({
-      id: String(option?.id || "").trim(),
-      criteria: String(option?.criteria || ""),
-      session_hint: String(option?.session_hint || ""),
-      weight: option?.weight ?? 1, tool: option?.tool || "",
-    }));
-    ensureTwoOptions(question);
-  }
-  return question;
-}
-
-function ensureTwoOptions(question) {
-  question.options = question.options || [];
-  const used = new Set(question.options.map((item) => item.id));
-  while (question.options.length < 2) {
-    const id = nextId("option_", used);
-    used.add(id);
-    question.options.push({ id, criteria: "", session_hint: "", weight: 1, tool: "" });
-  }
-}
-
 function setQuestions(raw) {
-  state.questions = raw.map(normalizeQuestion);
-  // 编辑期间引用问题对象，改名和排序后仍指向同一道题。
-  const byId = new Map(state.questions.map(q => [q.id, q]));
-  state.questions.forEach((q, index) => {
-    q.triggers = (raw[index].triggers || []).map(t => {
-      if (t.event) return {...t};
-      const parent = byId.get(t.question);
-      const option = parent.type === "choice" ? parent.options.find(o => o.id === t.option) : t.option;
-      return {parent, option, ask_with_parent: !!t.ask_with_parent};
-    });
-  });
+  state.questions = wf.normalizeQuestions(JSON.parse(JSON.stringify(raw)));
 }
 
-function gateFor(event) {
-  return state.questions.find(q => q.enabled && q.role === "action" && q.triggers.some(t => t.event === event));
-}
-
-function triggerParent(question, trigger) {
-  if (!trigger.event) return trigger.parent;
-  return question.role === "action" ? null : gateFor(trigger.event);
-}
-
-function triggerOption(trigger) {
-  if (trigger.event) return trigger.event === "message_received" ? "reply" : "proactive";
-  return typeof trigger.option === "string" ? trigger.option : trigger.option.id.trim();
-}
-
-function branchLinks(question) {
-  return state.questions.flatMap(child => child.triggers
-    .filter(t => triggerParent(child, t) === question)
-    .map(t => [triggerOption(t), child, t]));
-}
-
-function parentsOf(question) {
-  return question.triggers.map(t => [triggerParent(question, t), triggerOption(t)]).filter(([p]) => p);
-}
-
-function collectQuestionsFromForm() {
-  return state.questions.map(serializeQuestion);
-}
-
-function serializeQuestion(question) {
-  const common = {id: question.id.trim(), role: question.role, enabled: question.enabled,
-    type: question.type, instructions: question.instructions, use_threshold: question.use_threshold};
-  if (question.decision_mode !== "inherit") common.decision_mode = question.decision_mode;
-  if (question.stage === "post_reply") common.stage = question.stage;
-  common.triggers = question.triggers.map(t => ({
-    ...(t.event ? {event: t.event} : {question: t.parent.id.trim(), option: triggerOption(t)}),
-    ...(t.ask_with_parent ? {ask_with_parent: true} : {}),
-  }));
-  if (question.role === "action" && question.triggers[0]?.event === "message_received") common.ask_private = question.ask_private;
-  if (question.type === "boolean") {
-    return {
-      ...common, true_tool: question.true_tool, false_tool: question.false_tool,
-      true_session_hint: question.true_session_hint,
-      false_session_hint: question.false_session_hint,
-      true_weight: question.true_weight,
-      false_weight: question.false_weight,
-    };
-  }
-  return {
-    ...common,
-    options: (question.options || []).map((option) => ({
-      id: String(option.id || "").trim(),
-      criteria: option.criteria,
-      session_hint: option.session_hint,
-      weight: option.weight, tool: option.tool || "",
-    })),
-  };
+function collectQuestions() {
+  return state.questions.map(wf.serializeQuestion);
 }
 
 // ---------- 改动追踪 ----------
 
 function captureBaseline() {
-  state.baseline = new Map(state.questions.map((q) => [q, { id: q.id.trim(), json: JSON.stringify(serializeQuestion(q)) }]));
+  state.baseline = new Map(state.questions.map((q) => [q, { id: q.id.trim(), json: JSON.stringify(wf.serializeQuestion(q)) }]));
   state.baselineOrder = [...state.questions];
 }
 
@@ -326,7 +237,7 @@ function rebindBaseline() {
 function changeOf(question) {
   const base = state.baseline.get(question);
   if (!base) return "new";
-  return base.json === JSON.stringify(serializeQuestion(question)) ? "" : "changed";
+  return base.json === JSON.stringify(wf.serializeQuestion(question)) ? "" : "changed";
 }
 
 const CHANGE_LABELS = { new: "新增", changed: "已修改" };
@@ -347,7 +258,12 @@ function describeChanges() {
   const kept = state.questions.filter((q) => state.baseline.has(q));
   const order = state.baselineOrder.filter((q) => state.questions.includes(q));
   if (kept.some((q, i) => q !== order[i])) parts.push("调整顺序");
-  return parts.length ? `未保存：${parts.join("、")}` : SAVE_MESSAGES.dirty;
+  const pending = state.questions.filter(wf.isPending).length;
+  const text = parts.length ? `未保存：${parts.join("、")}` : SAVE_MESSAGES.dirty;
+  const notes = [];
+  if (pending) notes.push(`${pending} 道题待连接，保存后不会被提问`);
+  if (Number.isInteger(state.storedVersion) && state.storedVersion < 5) notes.push("保存后配置升级为选项动作格式，旧版编辑页将无法再保存");
+  return notes.length ? `${text}。${notes.join("；")}` : text;
 }
 
 function refreshChangeMarks() {
@@ -367,7 +283,7 @@ function snapshot() {
   return JSON.stringify({
     mode: getMode(),
     context: $("custom-context").value.trim(),
-    questions: collectQuestionsFromForm(),
+    questions: collectQuestions(),
   });
 }
 
@@ -395,7 +311,39 @@ function updateDirty() {
   }
 }
 
-// ---------- 问题的文字说明 ----------
+// 会移除其他内容的修改先试算：第一次点击只提示数量，几秒内再点同一处才执行。
+let armed = null;
+
+function disarm() {
+  if (!armed) return;
+  window.clearTimeout(armed.timer);
+  armed.el?.classList.remove("is-armed");
+  armed = null;
+}
+
+function confirmChange(key, el, apply, verb, after) {
+  const loss = wf.runChange(state.questions, state.catalog, apply, { commit: false });
+  if (loss.total && armed?.key !== key) {
+    disarm();
+    el?.classList.add("is-armed");
+    armed = {
+      key, el,
+      timer: window.setTimeout(() => {
+        disarm();
+        if ($("savebar").dataset.state === "notice") setSaveState(isDirty() ? "dirty" : "clean", isDirty() ? describeChanges() : "");
+      }, 4000),
+    };
+    setSaveState("notice", `再点一次确认${verb}：会同时移除 ${wf.describeLoss(loss)}`);
+    return;
+  }
+  disarm();
+  const lost = wf.runChange(state.questions, state.catalog, apply);
+  after?.();
+  refreshEditor();
+  if (lost.total) setSaveState("dirty", `已${verb}，并移除 ${wf.describeLoss(lost)}；撤销更改可以找回`);
+}
+
+// ---------- 名称与标签 ----------
 
 function qName(question) {
   return question.id.trim() || "未命名问题";
@@ -405,16 +353,28 @@ function qIndexOf(question) {
   return state.questions.indexOf(question);
 }
 
-function roleLabel(question) {
-  return state.roles[question.role] || question.role;
+function slotLabel(q, ref) {
+  if (ref.side) return ref.side === "true" ? "是" : "否";
+  if (wf.isWildcard(ref)) return q.candidate_source === "memes" ? "每张候选表情" : "每条候选消息";
+  return ref.id.trim() || "未命名选项";
 }
 
-function targetTitle(question) {
-  const parts = [qName(question)];
-  if (question.role !== "answer") parts.push(`· ${roleLabel(question)}`);
-  if (question.stage === "post_reply") parts.push("（回复后）");
-  if (!question.enabled) parts.push("（已停用）");
-  return parts.join(" ");
+// 校验信息里的选项名，不依赖所属的题。
+function refLabel(ref) {
+  if (ref.side) return ref.side === "true" ? "是" : "否";
+  return ref.id.trim() === "*" ? "每条候选" : ref.id.trim();
+}
+
+function toolLabel(name) {
+  return state.catalog[name]?.label || { send_meme: "发送表情包" }[name] || name;
+}
+
+function triggerLabel(t) {
+  return t.event ? state.events[t.event] || t.event : `${qName(t.parent)} 选「${slotLabel(t.parent, t.option)}」`;
+}
+
+function timingLabel(t) {
+  return t.ask_with_parent ? "同批" : "命中后问";
 }
 
 // 页面上显示问题名的地方都带 data-name-of，改 ID 时就地刷新。
@@ -422,38 +382,25 @@ function nameRef(question, tag = "code") {
   return h(tag, { dataset: { nameOf: qIndexOf(question) } }, qName(question));
 }
 
-function answerLabel(question, key) {
-  if (question.type === "boolean") return key === "true" ? "是" : "否";
-  if (key === "*") return question.role === "meme" ? "任一表情" : "任一消息";
-  return key || "未命名选项";
+function questionIssues(q) {
+  return wf.questionIssues(q, state.questions, state.catalog, refLabel);
 }
 
-// 每个答案的权重、效果和后继，选择题与是否题统一成同一种形状。
-function answerSlots(question) {
-  if (question.type === "boolean") {
-    return ["true", "false"].map((side) => ({
-      key: side, owner: question, weightKey: `${side}_weight`,
-      hintKey: `${side}_session_hint`, toolKey: `${side}_tool`,
-    }));
-  }
-  return question.options.map((option, index) => ({
-    key: option.id.trim(), owner: option, index, weightKey: "weight",
-    hintKey: "session_hint", toolKey: "tool",
-  }));
+function validate() {
+  return wf.validate(state.questions, state.catalog, refLabel);
 }
 
 function weightShares(question) {
-  const slots = answerSlots(question);
-  const weights = slots.map((slot) => slot.owner[slot.weightKey]);
+  const slots = wf.slotsOf(question);
+  const weights = slots.map((slot) => slot.weight);
   const valid = weights.every((w) => Number.isFinite(w) && w >= 0 && w <= 100);
   const total = valid ? weights.reduce((sum, w) => sum + w, 0) : 0;
   return weights.map((w) => (total > 0 ? w / total : null));
 }
 
 function showsShares(question) {
-  // 回复目标和表情的 * 会展开成多个候选，控制发言按场景只取部分选项，这几种不显示固定比例。
-  return (question.decision_mode === "random" || (question.decision_mode === "inherit" && getMode() === "random"))
-    && question.role === "answer";
+  // 「每条候选」会展开成多个候选，这种题不显示固定比例。
+  return wf.effectiveMode(question, getMode()) === "random" && !question.options.some(wf.isWildcard);
 }
 
 function shareText(share) {
@@ -462,214 +409,266 @@ function shareText(share) {
   return `抽中约 ${roughPercent.format(share)}`;
 }
 
-// ---------- 校验（与后端 strict 规则一致） ----------
-
-function weightError(value) {
-  return !Number.isFinite(value) || value < 0 || value > 100;
-}
-
-function questionIssue(question) {
-  const label = question.id.trim() ? `问题「${question.id.trim()}」` : "这个问题";
-  if (!question.id.trim()) return { field: "id", message: "还没有填写问题 ID" };
-  if (!question.instructions.trim()) {
-    return { field: "instructions", message: `${label}还没有填写要问判断模型的问题` };
-  }
-  if (question.type === "boolean") {
-    for (const side of ["true", "false"]) {
-      if (weightError(question[`${side}_weight`])) {
-        return { o: side, field: "weight", message: `${label}的权重必须是 0 到 100 之间的数字` };
-      }
-    }
-    if (question.true_weight === 0 && question.false_weight === 0) {
-      return { o: "true", field: "weight", message: `${label}至少需要一个权重大于 0 的答案` };
-    }
-    return null;
-  }
-  const optionIds = new Set();
-  for (const [o, option] of question.options.entries()) {
-    const id = option.id.trim();
-    const scene = question.role === "action" && id === "proactive" ? "proactive" : "passive";
-    if (!id) return { o, scene, field: "opt-id", message: `${label}的选项 ${o + 1} 还没有填写 ID` };
-    if (optionIds.has(id)) return { o, scene, field: "opt-id", message: `${label}的选项 ID「${id}」重复了` };
-    optionIds.add(id);
-    if (!option.criteria.trim()) {
-      return { o, scene, field: "opt-criteria", message: `${label}的选项「${id}」还没有填写选择标准` };
-    }
-    if (weightError(option.weight)) {
-      return { o, scene, field: "weight", message: `${label}的选项「${id}」权重必须是 0 到 100 之间的数字` };
-    }
-  }
-  if (!question.options.some((option) => option.weight > 0)) {
-    return { o: 0, field: "weight", message: `${label}至少需要一个权重大于 0 的选项` };
-  }
-  return null;
-}
-
-function findCycle() {
-  const visiting = new Set();
-  const done = new Set();
-  const path = [];
-  function walk(question) {
-    if (done.has(question)) return null;
-    if (visiting.has(question)) return [...path.slice(path.indexOf(question)), question];
-    visiting.add(question);
-    path.push(question);
-    for (const [, target] of branchLinks(question)) {
-      const cycle = walk(target);
-      if (cycle) return cycle;
-    }
-    path.pop();
-    visiting.delete(question);
-    done.add(question);
-    return null;
-  }
-  for (const question of state.questions) {
-    const cycle = walk(question);
-    if (cycle) return cycle;
-  }
-  return null;
-}
-
-function validate() {
-  const used = new Set();
-  const roles = new Map();
-  for (const [q, question] of state.questions.entries()) {
-    const issue = questionIssue(question);
-    if (issue) return { q, ...issue, message: issue.message.replace(/^还没有/, `第 ${q + 1} 个问题还没有`) };
-    const id = question.id.trim();
-    if (used.has(id)) return { q, field: "id", message: `问题 ID「${id}」重复了` };
-    used.add(id);
-    if (question.enabled && question.role !== "answer") {
-      const role = question.role === "action" ? "action/" + question.triggers[0]?.event : question.role;
-      if (roles.has(role)) {
-        return { q, field: "role", message: `「${roleLabel(question)}」只能启用一个问题，${roles.get(role)} 已经在用` };
-      }
-      roles.set(role, id);
-    }
-    const seen = new Set();
-    for (const t of question.triggers) {
-      const key = JSON.stringify(t.event || [t.parent?.id, triggerOption(t)]);
-      if (seen.has(key)) return {q, message: "同一道题含有重复的生效条件"};
-      seen.add(key);
-      if (!t.event && !answerSlots(t.parent).some(slot => slot.key === triggerOption(t)))
-        return {q, message: "上游选项已更改，请重新选择生效条件"};
-      if (t.parent?.stage === "post_reply" && question.stage !== "post_reply")
-        return {q, message: "回复后问题不能触发回复前问题"};
-    }
-  }
-  const cycle = findCycle();
-  if (cycle) {
-    return { q: qIndexOf(cycle[0]), field: "next",
-      message: `「接着问」形成了循环：${cycle.map(qName).join(" → ")}` };
-  }
-  return null;
-}
-
 function markInvalid(error) {
   const question = state.questions[error.q];
   if (!question) return;
-
   state.open.add(question);
+  if (["default_option", "private_default", "alias", "scenes"].includes(error.field)) state.advanced.add(question);
   renderQuestions();
   const card = $("questions").querySelector(`[data-q="${error.q}"]`);
-  const scope = error.o === undefined ? card : card?.querySelector(`[data-o="${error.o}"]`);
-  const field = scope?.querySelector(`[data-field="${error.field}"]`) || card;
+  let scope = card;
+  if (error.o !== undefined) scope = scope?.querySelector(`[data-o="${error.o}"]`) || scope;
+  if (error.a !== undefined) scope = scope?.querySelector(`[data-a="${error.a}"]`) || scope;
+  if (error.t !== undefined) scope = scope?.querySelector(`[data-t="${error.t}"]`) || scope;
+  const field = scope?.matches?.(`[data-field="${error.field}"]`) ? scope
+    : scope?.querySelector(`[data-field="${error.field}"]`) || scope;
   if (!field) return;
   field.classList.add("is-invalid");
   field.scrollIntoView({ block: "center", behavior: "smooth" });
   field.focus?.({ preventScroll: true });
 }
 
-// ---------- 判断流程 ----------
+// ---------- 流程泳道 ----------
 
-function renderFlow() {
-  if ($("decision-preview").open) previewFields();
-  const box = $("flow");
-  box.hidden = !state.questions.length;
-  if (box.hidden) return;
-  const children = new Set(state.questions.flatMap(q => branchLinks(q).map(([, target]) => target)));
-  const shown = new Set();
-  function node(question, edge) {
-    const repeated = shown.has(question);
-    const item = h("li", null,
-      edge && h("span", { class: "flow-edge" }, edge, icon("arrow")),
-      h("button", {
-        type: "button",
-        class: cls("flow-node", !question.enabled && "is-off", question.stage === "post_reply" && "is-post",
-          { new: "is-changed is-added", changed: "is-changed" }[changeOf(question)]),
-        title: question.instructions.trim() || undefined,
-        onclick: () => revealQuestion(question),
-      },
-        h("span", { class: "flow-num" }, qIndexOf(question) + 1),
-        nameRef(question),
-        h("span", { class: "flow-meta" }, question.role === "answer" ? TYPE_LABELS[question.type] : roleLabel(question)),
-        question.stage === "post_reply" && h("span", { class: "q-tag is-post" }, "回复后"),
-        !question.enabled && h("span", { class: "q-tag is-off" }, "已停用"),
-        repeated && h("span", { class: "flow-meta" }, "（同上）"),
-      ));
-    if (repeated) return item;
-    shown.add(question);
-    const links = branchLinks(question);
-    if (links.length) {
-      item.append(h("ul", null, links.map(([key, target, t]) => node(target, answerLabel(question, key) + (t.ask_with_parent ? " · 同批" : " · 命中后问")))));
-    }
-    return item;
+function descendants(starts) {
+  const seen = new Set();
+  const stack = [...starts];
+  while (stack.length) {
+    const q = stack.pop();
+    if (seen.has(q)) continue;
+    seen.add(q);
+    for (const { child } of wf.childLinks(state.questions, q)) stack.push(child);
   }
-  const roots = state.questions.filter(q => !children.has(q));
-  const groups = roots.map(q => [q.role === "action" ? state.events[q.triggers[0]?.event] : "待触发", [q]]);
-  const body = $("flow-body");
-  body.replaceChildren(...groups.map(([title, list]) => h("div", { class: "flow-group" },
-    h("p", { class: "flow-group-title" }, title),
-    h("ul", { class: "flow-tree" }, list.map(q => node(q))))));
-  // 尚未断开的循环里没有入口，也要显示出来。
-  const orphans = state.questions.filter(q => !shown.has(q));
-  if (orphans.length) {
-    body.append(h("div", { class: "flow-group" },
-      h("p", { class: "flow-group-title is-danger" }, "这些问题互相「接着问」形成了循环，没有入口"),
-      h("ul", { class: "flow-tree" }, orphans.filter(q => !shown.has(q)).map(q => node(q)))));
-  }
+  return seen;
 }
 
-const previewChoices = new WeakMap();
-let previewScene = "group_passive";
-let previewRevision = 0;
+function previewMarks() {
+  const marks = new Map();
+  const data = state.preview.result;
+  if (!data || state.preview.stale) return marks;
+  const asked = new Set(data.batches.flatMap((b) => b.asked || []));
+  const discarded = new Set(data.batches.flatMap((b) => b.discarded || []));
+  for (const q of state.questions) {
+    const id = q.id.trim();
+    if (discarded.has(id)) marks.set(id, "discarded");
+    else if (Object.hasOwn(data.answers || {}, id)) marks.set(id, "used");
+    else if (!asked.has(id) && q.enabled) marks.set(id, "unasked");
+  }
+  return marks;
+}
+
+function slotTools(ref) {
+  return [...new Set(ref.actions.map((a) => a.tool))];
+}
+
+function actIcons(tools) {
+  return tools.map((tool) => h("span", {
+    class: cls("flow-act", `is-${ACTION_UI[tool]?.group || "send"}`),
+    title: toolLabel(tool),
+  }, icon(ACTION_UI[tool]?.icon || "zap")));
+}
+
+function flowNode(q, edge, shown, marks) {
+  const repeated = shown.has(q);
+  const mark = marks.get(q.id.trim());
+  const links = wf.childLinks(state.questions, q);
+  const outs = wf.slotsOf(q).map((ref) => {
+    const tools = slotTools(ref);
+    const kids = links.filter((l) => l.option === ref);
+    if (!tools.length && !kids.length) return null;
+    return h("span", { class: "flow-out" }, slotLabel(q, ref), actIcons(tools),
+      kids.length > 0 && h("span", { class: "flow-kids" }, icon("arrow"), kids.map((l) => qIndexOf(l.child) + 1).join(" ")));
+  }).filter(Boolean);
+  const item = h("li", null,
+    edge && h("span", { class: "flow-edge" }, edge, icon("arrow")),
+    h("button", {
+      type: "button",
+      class: cls("flow-node", !q.enabled && "is-off", q.stage === "post_reply" && "is-post",
+        { new: "is-changed is-added", changed: "is-changed" }[changeOf(q)]),
+      title: q.instructions.trim() || undefined,
+      onclick: () => revealQuestion(q),
+    },
+      h("span", { class: "flow-num" }, qIndexOf(q) + 1),
+      nameRef(q),
+      h("span", { class: "flow-meta" }, TYPE_LABELS[q.type]),
+      !q.enabled && h("span", { class: "q-tag is-off" }, "已停用"),
+      mark && h("span", { class: `flow-badge is-${mark}` }, MARK_LABELS[mark]),
+      repeated ? h("span", { class: "flow-meta" }, "（同上）")
+        : outs.length ? h("span", { class: "flow-outs" }, outs) : h("span", { class: "flow-meta" }, "只记录答案"),
+    ));
+  if (repeated) return item;
+  shown.add(q);
+  if (links.length) {
+    item.append(h("ul", null, links.map((l) =>
+      flowNode(l.child, `${slotLabel(q, l.option)} · ${timingLabel(l.trigger)}`, shown, marks))));
+  }
+  return item;
+}
+
+function renderFlow() {
+  const qs = state.questions;
+  const marks = previewMarks();
+  const lanes = Object.entries(state.events).map(([event, title]) => {
+    const entries = wf.roots(qs, event);
+    const sources = wf.replySources(qs, entries);
+    const shown = new Set();
+    const speaks = event !== wf.POST_EVENT && entries.some((q) => q.enabled);
+    return h("section", { class: cls("lane", !entries.length && "is-empty"), dataset: { event } },
+      h("div", { class: "lane-head" },
+        h("span", { class: "lane-title" }, title),
+        h("span", { class: "lane-stats" }, entries.length ? `${entries.length} 道入口` : "没有题订阅",
+          sources.length > 0 && ` · 请求发言：${sources.map((s) => `${qName(s.q)}=${slotLabel(s.q, s.ref)}`).join("、")}`),
+        h("button", { type: "button", class: "btn btn-text lane-add", onclick: () => addEntry(event) }, icon("plus"), "添加入口题")),
+      speaks && !sources.length && h("p", { class: "lane-note" }, "这个事件不会调用会话模型发言，独立动作照常执行。"),
+      sources.length > 1 && h("p", { class: "lane-note is-info" }, "多处请求发言时只生成一次正文。"),
+      entries.length > 0 && h("ul", { class: "flow-tree" }, entries.map((q) => flowNode(q, null, shown, marks))));
+  });
+  const pending = qs.filter(wf.isPending);
+  if (pending.length) {
+    const shown = new Set();
+    lanes.push(h("section", { class: "lane is-pending" },
+      h("div", { class: "lane-head" },
+        h("span", { class: "lane-title" }, "待连接"),
+        h("span", { class: "lane-stats" }, "没有触发来源，不会被提问")),
+      h("ul", { class: "flow-tree" }, pending.map((q) => flowNode(q, null, shown, marks)))));
+  }
+  const covered = descendants([...Object.keys(state.events).flatMap((event) => wf.roots(qs, event)), ...pending]);
+  const orphans = qs.filter((q) => !covered.has(q));
+  if (orphans.length) {
+    const shown = new Set();
+    lanes.push(h("section", { class: "lane is-danger" },
+      h("div", { class: "lane-head" }, h("span", { class: "lane-title" }, "这些题互相触发形成了循环，没有入口")),
+      h("ul", { class: "flow-tree" }, orphans.map((q) => flowNode(q, null, shown, marks)))));
+  }
+  $("flow-body").replaceChildren(...lanes);
+  if ($("decision-preview").open) previewFields();
+}
+
+// ---------- 试算 ----------
+
+function markPreviewStale() {
+  if (!state.preview.result || state.preview.stale) return;
+  state.preview.stale = true;
+  $("preview-stale").hidden = false;
+  renderFlow();
+}
 
 function previewFields() {
-  previewRevision++;
-  $("preview-result").replaceChildren();
   const fields = $("preview-fields");
-  fields.replaceChildren(fieldSelect("场景", SCENE_LABELS, previewScene, scene => {
-    previewScene = scene; previewFields();
-  }));
-  for (const q of state.questions.filter(q => q.enabled)) {
-    if (q.role === "action" && !q.triggers.some(t => t.event === (previewScene.endsWith("_proactive") ? "silence_elapsed" : "message_received"))) continue;
-    if (["target", "target_gate"].includes(q.role) && previewScene !== "group_passive") continue;
-    if (q.role === "action" && previewScene === "private_passive" && !q.ask_private) continue;
-    const options = Object.fromEntries(answerSlots(q).filter(s => s.owner[s.weightKey] > 0).map(s => [s.key, answerLabel(q,s.key)]));
-    let key = previewChoices.get(q);
-    if (!Object.hasOwn(options,key)) key = Object.keys(options)[0];
-    previewChoices.set(q,key);
-    fields.append(fieldSelect(qName(q), options, key, value => {
-      previewChoices.set(q,value); previewRevision++; $("preview-result").replaceChildren();
-    }));
+  const scene = state.preview.scene;
+  const list = wf.questionsForScene(state.questions, scene);
+  const selects = list.map((q) => {
+    const slots = wf.slotsOf(q).filter((ref) => ref.weight > 0);
+    if (!slots.length) return null;
+    const options = Object.fromEntries(slots.map((ref) => [wf.keyOf(ref),
+      wf.isWildcard(ref) ? (q.candidate_source === "memes" ? "示例表情" : "示例消息") : slotLabel(q, ref)]));
+    let key = state.preview.choices.get(q);
+    if (!Object.hasOwn(options, key)) key = Object.keys(options)[0];
+    state.preview.choices.set(q, key);
+    return fieldSelect(qName(q), options, key, (value) => {
+      state.preview.choices.set(q, value);
+      markPreviewStale();
+    });
+  });
+  fields.replaceChildren(
+    fieldSelect("场景", PREVIEW_SCENES, scene, (value) => {
+      state.preview.scene = value;
+      markPreviewStale();
+      previewFields();
+    }),
+    ...selects,
+    !list.length && h("p", { class: "hint" }, "这个场景下没有会被提问的题。"),
+  );
+}
+
+function formatSource(text) {
+  const index = String(text).indexOf("=");
+  if (index < 0) return String(text);
+  const id = text.slice(0, index);
+  const value = text.slice(index + 1);
+  return `${id}=${formatPreviewAnswer(id, value)}`;
+}
+
+function formatPreviewAnswer(id, value) {
+  const q = state.questions.find((item) => item.id.trim() === id);
+  if (value === true || (q?.type === "boolean" && value === "true")) return "是";
+  if (value === false || (q?.type === "boolean" && value === "false")) return "否";
+  if (value === "sample_message") return "示例消息";
+  if (value === "sample_meme") return "示例表情";
+  return formatAnswer(value);
+}
+
+function previewRow(title, ...content) {
+  return h("div", { class: "pv-row" }, h("span", { class: "pv-title" }, title), h("div", { class: "pv-value" }, content));
+}
+
+function renderPreviewResult() {
+  const box = $("preview-result");
+  const data = state.preview.result;
+  $("preview-stale").hidden = !state.preview.stale;
+  if (!data) {
+    box.replaceChildren();
+    return;
   }
+  const context = data.context || {};
+  const materials = [
+    context.message && h("li", null, h("b", null, "选中的消息："), context.message),
+    ...Object.entries(context.fields || {}).map(([label, value]) => h("li", null, h("b", null, `${label}：`), formatAnswer(value))),
+    ...Object.entries(context.answers || {}).map(([id, value]) => h("li", null, h("b", null, `${id}：`), formatPreviewAnswer(id, value))),
+    ...(context.hints || []).map((text) => h("li", null, h("b", null, "固定文本："), text)),
+  ].filter(Boolean);
+  const answers = Object.entries(data.answers || {});
+  const hasPost = state.questions.some((q) => q.enabled && q.stage === "post_reply");
+  box.replaceChildren(h("div", { class: "pv-grid" },
+    previewRow("判断请求", h("b", null, `${data.batches.length} 次`),
+      data.batches.map((b, i) => h("p", { class: "pv-batch" },
+        `第 ${i + 1} 批 · ${b.stage === "post_reply" ? "正文后" : "正文前"} · 问 ${b.asked.join("、") || "—"}`,
+        b.discarded?.length > 0 && [" · 丢弃 ", b.discarded.map((id, j) => [j ? "、" : "", h("s", null, id)])]))),
+    previewRow("有效答案", answers.length
+      ? answers.map(([id, value]) => h("span", { class: "tag tag-judge" }, h("b", null, id), formatPreviewAnswer(id, value)))
+      : "无"),
+    previewRow("会话模型", data.reply && data.reply !== "none"
+      ? [h("b", null, "生成 1 次"), ` · 来源 ${(data.reply_sources || []).map(formatSource).join("、")}`]
+      : ["不发言", hasPost ? h("small", { class: "pv-note" }, "正文后的题只在正文前请求了发言时才计算。") : null]),
+    previewRow("交给会话模型", materials.length ? h("ul", { class: "pv-list" }, materials) : "无"),
+    previewRow("引用", data.quote ? h("code", null, data.quote) : "无"),
+    previewRow("动作", data.tools?.length
+      ? h("ul", { class: "pv-list" }, data.tools.map((tool) => h("li", null,
+        h("span", { class: "act-icon" }, icon(ACTION_UI[tool.name]?.icon || "zap")),
+        h("b", null, toolLabel(tool.name)), ` · ${WHEN_LABELS[tool.when] || tool.when} · ${TOOL_STATUS[tool.status] || tool.status}`,
+        tool.sources?.length ? ` · 来源 ${tool.sources.map(formatSource).join("、")}` : "",
+        tool.reason ? ` · ${tool.reason}` : "")))
+      : "无"),
+  ));
 }
 
 async function runPreview() {
-  const revision = ++previewRevision;
+  const revision = ++state.preview.revision;
   const box = $("preview-result");
-  box.textContent = "正在预览…";
+  const error = validate();
+  if (error) {
+    box.replaceChildren(h("p", { class: "log-error" }, `配置还有问题：${error.message}`,
+      h("button", { type: "button", class: "btn btn-text", onclick: () => markInvalid(error) }, "去修改")));
+    return;
+  }
+  box.replaceChildren(h("p", { class: "hint" }, "正在试算…"));
   try {
-    const data = await bridge.apiPost("decision-preview", {scene:previewScene, decision_mode:getMode(),
-      decision_questions:collectQuestionsFromForm(), answers:Object.fromEntries(state.questions
-        .filter(q => previewChoices.has(q)).map(q => [q.id.trim(),previewChoices.get(q)]))});
-    if (revision !== previewRevision) return;
-    box.replaceChildren(h("b",null,data.batches.length + " 次模型请求（示例候选与答案）"),
-      ...data.batches.map((b,i) => h("p",null,"第 " + (i+1) + " 批 · " + (b.stage === "post_reply" ? "回复后" : "回复前")
-        + " · " + b.asked.join("、") + (b.discarded.length ? " · 丢弃 " + b.discarded.join("、") : ""))),
-      h("small",null,"生效：" + (Object.keys(data.answers).join("、") || "无")));
+    const list = wf.questionsForScene(state.questions, state.preview.scene);
+    const data = await bridge.apiPost("decision-preview", {
+      version: 7,
+      scene: state.preview.scene,
+      decision_mode: getMode(),
+      decision_questions: collectQuestions(),
+      answers: Object.fromEntries(list.filter((q) => state.preview.choices.has(q))
+        .map((q) => [q.id.trim(), state.preview.choices.get(q)])),
+    });
+    if (revision !== state.preview.revision) return;
+    state.preview.result = data;
+    state.preview.stale = false;
+    renderPreviewResult();
+    renderFlow();
   } catch (err) {
-    if (revision === previewRevision) box.textContent = err.message;
+    if (revision === state.preview.revision) box.replaceChildren(h("p", { class: "log-error" }, `试算失败：${err.message}`));
   }
 }
 
@@ -684,13 +683,17 @@ function revealQuestion(question) {
 }
 
 function renderStats() {
-  const total = state.questions.length;
-  const enabled = state.questions.filter(q => q.enabled).length;
-  const entries = state.questions.filter(q => q.enabled && q.role === "action").length;
+  const qs = state.questions;
+  const total = qs.length;
+  const enabled = qs.filter((q) => q.enabled).length;
+  const entries = qs.filter((q) => q.enabled && q.triggers.some((t) => t.event)).length;
+  const pending = qs.filter(wf.isPending).length;
+  const speaks = wf.allReplySources(qs.filter((q) => q.enabled)).length;
   $("question-stats").textContent = total
-    ? `共 ${total} 个问题 · ${enabled} 个启用 · ${entries} 个入口`
+    ? [`共 ${total} 个问题`, `${enabled} 个启用`, `${entries} 个入口`, pending && `${pending} 个待连接`, `${speaks} 处请求发言`]
+      .filter(Boolean).join(" · ")
     : "";
-  const allOpen = total > 0 && state.questions.every(q => state.open.has(q));
+  const allOpen = total > 0 && qs.every((q) => state.open.has(q));
   const toggle = $("toggle-all");
   toggle.hidden = !total;
   toggle.textContent = allOpen ? "全部收起" : "全部展开";
@@ -699,11 +702,16 @@ function renderStats() {
 // ---------- 问题卡片 ----------
 
 function renderQuestions(focus) {
+  disarm();
   const root = $("questions");
   if (!state.questions.length) {
     root.replaceChildren(h("li", { class: "questions-empty" },
-      h("b", null, "还没有问题"),
-      h("span", null, "没有发言入口时，群聊、私聊和冷场都保持沉默。可以从下方添加问题，或恢复默认问题。")));
+      h("b", null, "还没有题目"),
+      h("span", null, "没有题目订阅事件时，插件不发起判断，也不会调用会话模型发言。"),
+      h("span", { class: "questions-empty-actions" },
+        h("button", { type: "button", class: "btn btn-outline", onclick: () => addEntry("message_received") },
+          icon("plus"), "添加入口题（收到消息）"),
+        h("button", { type: "button", class: "btn btn-text", onclick: onRestoreDefault }, "恢复默认问题"))));
   } else {
     root.replaceChildren(...state.questions.map(renderQuestion));
   }
@@ -712,7 +720,13 @@ function renderQuestions(focus) {
   renderStats();
   refreshChangeMarks();
   if (NEEDS_AUTOSIZE) root.querySelectorAll("textarea.autosize").forEach(autosize);
-  if (focus) root.querySelector(focus)?.focus();
+  if (focus) document.querySelector(focus)?.focus();
+}
+
+function refreshEditor(focus) {
+  renderQuestions(focus);
+  updateDirty();
+  markPreviewStale();
 }
 
 function toggleQuestion(question) {
@@ -723,15 +737,16 @@ function toggleQuestion(question) {
 
 function renderQuestion(question, qIndex) {
   const open = state.open.has(question);
-  const issue = questionIssue(question);
+  const [issue] = questionIssues(question);
+  const pending = wf.isPending(question);
   const card = h("li", {
     class: cls("question", !question.enabled && "is-disabled", open && "is-open",
-      state.fresh === question && "is-new", question.stage === "post_reply" && "is-post"),
-    dataset: { q: qIndex, role: question.role },
+      state.fresh === question && "is-new", question.stage === "post_reply" && "is-post", pending && "is-pending"),
+    dataset: { q: qIndex },
   });
 
   const enabledText = h("span", null, question.enabled ? "启用" : "已停用");
-  const enabledToggle = h("label", { class: "switch", title: "停用后不会问这个问题，也会阻断经过它的「接着问」" },
+  const enabledToggle = h("label", { class: "switch", title: "停用后不会问这道题，也会阻断经过它的后续题" },
     h("input", {
       type: "checkbox",
       checked: question.enabled,
@@ -739,13 +754,11 @@ function renderQuestion(question, qIndex) {
       onchange: (event) => {
         question.enabled = event.target.checked;
         enabledText.textContent = question.enabled ? "启用" : "已停用";
-        card.classList.toggle("is-disabled", !question.enabled);
-        renderQuestions();
+        refreshEditor();
       },
     }),
     enabledText);
 
-  const parents = parentsOf(question);
   const toggle = h("button", {
     type: "button",
     class: "q-toggle",
@@ -756,26 +769,28 @@ function renderQuestion(question, qIndex) {
     icon("chevron"),
     h("span", { class: "q-index" }, qIndex + 1),
     h("span", { class: "q-name mono", dataset: { nameOf: qIndex } }, qName(question)),
-    question.role !== "answer" && h("span", { class: "q-tag is-role" }, roleLabel(question)),
     h("span", { class: "q-tag" }, TYPE_LABELS[question.type]),
+    wf.isDynamic(question) && h("span", { class: "q-tag is-source" }, SOURCE_TAGS[question.candidate_source] || question.candidate_source),
+    question.stage === "post_reply" && h("span", { class: "q-tag is-post" }, "正文后"),
     question.decision_mode !== "inherit" && h("span", { class: "q-tag" }, question.decision_mode === "random" ? "随机" : "模型"),
-    question.stage === "post_reply" && h("span", { class: "q-tag is-post" }, "回复后"),
+    pending && h("span", { class: "q-tag is-pending" }, "待连接"),
     !open && issue && h("span", { class: "q-tag is-issue", title: issue.message }, "待完善"),
     h("span", { class: "q-change", hidden: true }),
   );
 
   const tools = h("div", { class: "q-tools" },
-    question.role === "answer" && iconButton("copy", "复制这个问题", () => duplicateQuestion(question)),
+    iconButton("copy", "复制这个问题", () => duplicateQuestion(question)),
     iconButton("up", "上移问题", () => moveQuestion(qIndex, -1, "up"), { disabled: qIndex === 0, act: "up" }),
     iconButton("down", "下移问题", () => moveQuestion(qIndex, 1, "down"), {
       disabled: qIndex === state.questions.length - 1, act: "down",
     }),
     confirmButton(`删除问题 ${qName(question)}`, () => deleteQuestion(question), {
       onArm: () => {
-        if (parents.length) setSaveState("notice", `「${qName(question)}」被 ${parents.length} 个答案接着问，删除后这些分支会直接结束`);
+        const loss = wf.runChange(state.questions, state.catalog, wf.deleteQuestion(state.questions, question), { commit: false });
+        if (loss.total) setSaveState("notice", `删除「${qName(question)}」会同时移除 ${wf.describeLoss(loss)}，失去来源的子题进入待连接`);
       },
       onDisarm: () => {
-        if (parents.length && $("savebar").dataset.state === "notice") setSaveState(isDirty() ? "dirty" : "clean");
+        if ($("savebar").dataset.state === "notice") setSaveState(isDirty() ? "dirty" : "clean", isDirty() ? describeChanges() : "");
       },
     }),
   );
@@ -787,86 +802,20 @@ function renderQuestion(question, qIndex) {
     return card;
   }
   card.append(h("div", { class: "q-body", id: `q-body-${qIndex}` },
-    renderTriggers(question),
-    renderPrompt(question, qIndex),
-    renderSettings(question, qIndex),
-    renderRoleNote(question),
-    renderAnswers(question, qIndex),
+    renderWhen(question, qIndex),
+    renderAsk(question, qIndex),
+    renderOutcomes(question, qIndex),
+    renderAdvanced(question, qIndex),
   ));
   return card;
 }
 
-function conditionLabel(q, t) {
-  if (t.event) return state.events[t.event] + (q.role === "action" ? "" : "且允许发言");
-  return qName(t.parent) + " = " + answerLabel(t.parent, triggerOption(t));
-}
-
 function renderEntry(q) {
-  return h("span", {class: "q-entry"}, q.triggers.map(t => conditionLabel(q, t)
-    + (q.role === "action" ? "" : t.ask_with_parent ? " · 同批" : " · 命中后问")).join(" 或 ") || "待设置生效条件");
+  if (wf.isPending(q)) return h("span", { class: "q-entry is-pending" }, "待连接 · 不会被提问");
+  return h("span", { class: "q-entry" }, q.triggers.map((t) => t.event ? triggerLabel(t) : `${triggerLabel(t)} · ${timingLabel(t)}`).join(" 或 "));
 }
 
-function setGateEvent(q, event) {
-  const active = q.options.find(o => o.id !== "none");
-  const next = event === "message_received" ? "reply" : "proactive";
-  if (active && active.id !== next) {
-    const preset = state.defaults.find(d => d.role === "action" && d.options.some(o => o.id === next));
-    const old = state.defaults.find(d => d.role === "action" && d.options.some(o => o.id === active.id));
-    if (old && preset) {
-      if (q.instructions === old.instructions) q.instructions = preset.instructions;
-      for (const opt of q.options) {
-        if (opt.criteria === old.options.find(o => o.id === opt.id)?.criteria)
-          opt.criteria = preset.options.find(o => o.id === (opt.id === "none" ? "none" : next)).criteria;
-      }
-    }
-    active.id = next;
-  }
-  q.triggers = [{event}];
-}
-
-function refreshEditor() {
-  renderQuestions();
-  updateDirty();
-}
-
-function renderTriggers(q) {
-  if (q.role === "action") return fieldSelect("生效条件", state.events, q.triggers[0]?.event, event => {
-    setGateEvent(q, event); refreshEditor();
-  });
-  const sources = Object.entries(state.events).map(([event, label]) => [{event}, label + "且允许发言"]);
-  for (const parent of state.questions) {
-    if (parent === q || (parent.stage === "post_reply" && q.stage !== "post_reply")) continue;
-    for (const slot of answerSlots(parent)) {
-      if (parent.role === "action" && slot.key === "none") continue;
-      sources.push([{parent, option: parent.type === "boolean" ? slot.key : slot.owner},
-        qName(parent) + " → " + answerLabel(parent, slot.key)]);
-    }
-  }
-  const rows = q.triggers.map((t, i) => {
-    const index = sources.findIndex(([v]) => t.event ? v.event === t.event : v.parent === t.parent && v.option === t.option);
-    const parent = triggerParent(q, t);
-    const local = (q.decision_mode === "inherit" ? getMode() : q.decision_mode) === "random";
-    const crossStage = q.stage !== (parent?.stage || "pre_reply");
-    return h("div", {class: "effect-row"},
-      fieldSelect("生效条件", Object.fromEntries(sources.map(([, label], j) => [j, label])), index, selected => {
-        q.triggers[i] = {...sources[Number(selected)][0]}; refreshEditor();
-      }),
-      crossStage || local ? h("span", {class:"note"}, crossStage ? "需等正文生成" : "本地随机判断")
-        : fieldSelect("提问时机", {after:"命中后再问", with:"与上题一起问"}, t.ask_with_parent ? "with" : "after", value => {
-          t.ask_with_parent = value === "with"; refreshEditor();
-        }),
-      iconButton("trash", "移除生效条件", () => { q.triggers.splice(i, 1); refreshEditor(); }));
-  });
-  return h("div", {class:"q-triggers"}, rows,
-    h("button", {type:"button", class:"btn btn-text", onclick:() => {
-      const source = sources.find(([v]) => !q.triggers.some(t => v.event ? v.event === t.event : t.parent === v.parent && t.option === v.option));
-      if (source) q.triggers.push({...source[0]});
-      refreshEditor();
-    }}, "添加生效条件"),
-    q.triggers.some(t => t.ask_with_parent) && h("small", {class:"hint"}, "只有上游选项命中时才采用同批答案。需要上题实际答案时，请选「命中后再问」。"));
-}
-
-// 改选项 ID 或「接着问」时，其他卡片里的进入条件随之更新；只替换文字，不动输入框。
+// 改选项 ID 时，其他卡片里的触发描述随之更新；只替换文字，不动输入框。
 function refreshEntries() {
   for (const card of $("questions").querySelectorAll(".question[data-q]")) {
     const question = state.questions[Number(card.dataset.q)];
@@ -876,64 +825,29 @@ function refreshEntries() {
 }
 
 function renderSummary(question) {
-  const post = question.stage === "post_reply";
-  const preview = question.instructions;
-  const chips = answerSlots(question).map((slot) => {
-    const weight = slot.owner[slot.weightKey];
-    const links = branchLinks(question).filter(([key]) => key === slot.key);
-    const hint = !post && String(slot.owner[slot.hintKey] || "").trim();
-    const tool = !post && slot.owner[slot.toolKey];
-    return h("span", { class: cls("ans-chip", weight === 0 && "is-zero") },
-      h("b", null, answerLabel(question, slot.key)),
-      Number.isFinite(weight) && weight !== 1 && h("small", null, `×${weight}`),
-      hint && h("span", { class: "ans-mark is-hint", title: `会话提示：${hint}` }, icon("hint")),
-      tool && h("span", { class: "ans-mark is-tool", title: `调用工具：${state.tools[tool] || tool}` }, icon("zap")),
-      links.map(([, next]) => [icon("arrow"), nameRef(next)]),
-    );
-  });
+  const links = wf.childLinks(state.questions, question);
+  const chips = wf.slotsOf(question).map((ref) => h("span", { class: cls("ans-chip", ref.weight === 0 && "is-zero") },
+    h("b", null, slotLabel(question, ref)),
+    Number.isFinite(ref.weight) && ref.weight !== 1 && h("small", null, `×${ref.weight}`),
+    actIcons(slotTools(ref)),
+    links.filter((l) => l.option === ref).map((l) => [icon("arrow"), nameRef(l.child)]),
+  ));
   return h("div", { class: "q-summary", onclick: () => toggleQuestion(question) },
-    h("p", { class: cls("q-preview", !preview.trim() && "is-empty") },
-      preview.trim() || "还没有填写要问判断模型的问题"),
+    h("p", { class: cls("q-preview", !question.instructions.trim() && "is-empty") },
+      question.instructions.trim() || "还没有填写要问判断模型的问题"),
     h("div", { class: "q-chips" }, renderEntry(question), h("span", { class: "q-chips-sep", "aria-hidden": "true" }), chips),
   );
 }
 
-function promptField(question, key, label, placeholder, qIndex) {
-  const id = `q${qIndex}-${key}`;
-  const input = h("textarea", {
-    id, class: "autosize", rows: 2, value: question[key],
-    placeholder, dataset: { field: key },
-    oninput: () => { question[key] = input.value; },
-  });
-  const tokens = h("span", { class: "token-bar" }, "插入",
-    PROMPT_TOKENS.map(name => h("button", {
-      type: "button", class: "token",
-      title: `判断模型会看到本轮的实际${name}`,
-      "aria-label": `在${label}中插入${name}`,
-      onclick: () => {
-        input.setRangeText(`{${name}}`, input.selectionStart, input.selectionEnd, "end");
-        input.focus();
-        input.dispatchEvent(new Event("input", { bubbles: true }));
-      },
-    }, `{${name}}`)));
-  return h("div", { class: "q-prompt" },
-    h("div", { class: "field-row" }, h("label", { class: "field-label is-judge", for: id }, label), tokens),
-    input);
-}
-
-function segmented(label, choices, selected, onPick, { disabled = {}, extra = "" } = {}) {
-  return h("div", { class: cls("seg", extra), role: "group", "aria-label": label },
+function segmented(label, choices, selected, onPick, { disabled = {}, extra = "", field } = {}) {
+  return h("div", { class: cls("seg", extra), role: "group", "aria-label": label, dataset: field ? { field } : undefined },
     choices.map(([value, text]) => h("button", {
       type: "button",
       "aria-pressed": String(value === selected),
       disabled: !!disabled[value],
       title: disabled[value] || undefined,
-      onclick: () => { if (value !== selected) onPick(value); },
+      onclick: (event) => { if (value !== selected) onPick(value, event.currentTarget); },
     }, text)));
-}
-
-function renderPrompt(question, qIndex) {
-  return promptField(question, "instructions", "问判断模型", "例如：这轮回复应该用什么语气？", qIndex);
 }
 
 function fieldSelect(label, choices, selected, onChange, { field, id } = {}) {
@@ -943,141 +857,230 @@ function fieldSelect(label, choices, selected, onChange, { field, id } = {}) {
   return h("label", { class: "setting" }, h("span", { class: "field-label" }, label), input);
 }
 
+// 带分组和置灰原因的下拉框：choices 为 {group, label, disabled, reason}。
+function choiceSelect(label, choices, current, onPick, { field, placeholder } = {}) {
+  const groups = new Map();
+  choices.forEach((c, i) => {
+    if (!groups.has(c.group)) groups.set(c.group, []);
+    groups.get(c.group).push(h("option", { value: String(i), disabled: !!c.disabled },
+      c.label + (c.reason ? `（${c.reason}）` : "")));
+  });
+  const select = h("select", {
+    "aria-label": label,
+    dataset: field ? { field } : undefined,
+    onchange: (e) => { if (e.target.value !== "") onPick(choices[Number(e.target.value)]); },
+  },
+    placeholder && h("option", { value: "" }, placeholder),
+    [...groups].map(([group, options]) => group ? h("optgroup", { label: group }, options) : options));
+  select.value = current >= 0 ? String(current) : "";
+  return select;
+}
+
+function section(title, ...children) {
+  return h("div", { class: "q-section" }, h("h3", { class: "q-section-title" }, title), children);
+}
+
 function switchField(label, checked, onChange, note) {
   return h("label", { class: "switch switch-row" },
     h("input", { type: "checkbox", checked, onchange: (e) => onChange(e.target.checked) }),
     h("span", null, label, note && h("small", null, note)));
 }
 
-function renderSettings(question, qIndex) {
-  const isAnswer = question.role === "answer";
-  const post = question.stage === "post_reply";
-  const idInput = h("input", {
-    type: "text", class: "mono", value: question.id, placeholder: "如 tone",
-    spellcheck: "false", autocomplete: "off", dataset: { field: "id" },
-    oninput: (event) => {
-      question.id = event.target.value;
-      for (const el of document.querySelectorAll(`[data-name-of="${qIndex}"]`)) {
-        el.textContent = el.tagName === "OPTION" ? targetTitle(question) : qName(question);
-      }
-    },
-  });
-  const roleSelect = fieldSelect("用途", post ? { answer: state.roles.answer } : state.roles, question.role, (value) => {
-    question.role = value;
-    if (value !== "answer") {
-      const preset = state.defaults.find(q => q.role === value);
-      question.type = preset.type;
-      question.stage = "pre_reply";
-      question.options = (preset.options || []).map(o => question.options.find(old => old.id === o.id) || {...o});
-      if (value === "action") {
-        setGateEvent(question, question.triggers.find(t => t.event)?.event || "message_received");
-        const silent = question.options.find(o => o.id === "none");
-        silent.session_hint = silent.tool = "";
-      }
-      for (const child of state.questions) {
-        child.triggers = child.triggers.filter(t => t.parent !== question ||
-          (question.type === "boolean" && ["true", "false"].includes(t.option)) ||
-          (question.options.includes(t.option) && !(value === "action" && t.option.id === "none")));
+// ---------- 何时提问 ----------
+
+function triggerChoices(q, current) {
+  const used = new Set(q.triggers.filter((t) => t !== current).map((t) => (t.event ? `event:${t.event}` : t.option)));
+  const list = [];
+  for (const [event, label] of Object.entries(state.events)) {
+    if (!wf.eventAllowed(q, event) || used.has(`event:${event}`)) continue;
+    list.push({ group: "事件", label, match: (t) => t.event === event, make: () => ({ event }) });
+  }
+  for (const parent of state.questions) {
+    if (parent === q || (parent.stage === "post_reply" && q.stage === "pre_reply")) continue;
+    const cycle = wf.wouldCycle(state.questions, q, parent);
+    for (const ref of wf.slotsOf(parent)) {
+      if (used.has(ref)) continue;
+      list.push({
+        group: "上游选项",
+        label: `${qName(parent)} 选「${slotLabel(parent, ref)}」`,
+        disabled: cycle,
+        reason: cycle ? "会形成循环" : "",
+        match: (t) => t.option === ref,
+        make: () => ({
+          parent, option: ref,
+          ask_with_parent: parent.stage === q.stage && (current?.parent ? current.ask_with_parent : true),
+        }),
+      });
+    }
+  }
+  return list;
+}
+
+function renderWhen(q, qIndex) {
+  const stageSeg = segmented("提问阶段", [["pre_reply", "正文生成前"], ["post_reply", "正文生成后"]], q.stage,
+    (stage, el) => confirmChange(`stage:${qIndex}:${stage}`, el, wf.changeStage(q, stage), `切换到${STAGE_LABELS[stage]}`),
+    { extra: "stage-seg", field: "stage" });
+  const random = wf.effectiveMode(q, getMode()) === "random";
+  const rows = q.triggers.map((t, i) => {
+    const choices = triggerChoices(q, t);
+    const select = choiceSelect("触发来源", choices, choices.findIndex((c) => c.match(t)), (choice) => {
+      q.triggers[i] = choice.make();
+      refreshEditor(`[data-q="${qIndex}"] [data-t="${i}"] select`);
+    }, { field: "trigger" });
+    let timing = null;
+    if (t.parent) {
+      if (t.parent.stage !== q.stage) timing = h("span", { class: "note-inline" }, "需等正文生成，命中后再问");
+      else if (random) timing = h("span", { class: "note-inline" }, "本地随机，无需等批");
+      else {
+        timing = segmented("提问时机", [["with", "随上游同批"], ["after", "命中后再问"]], t.ask_with_parent ? "with" : "after",
+          (value) => { t.ask_with_parent = value === "with"; refreshEditor(); }, { extra: "timing-seg", field: "timing" });
       }
     }
-    renderQuestions(`[data-q="${qIndex}"] [data-field="role"]`);
-    updateDirty();
-  }, { field: "role" });
-
-  const typeSeg = segmented("题型", [["choice", "选择题"], ["boolean", "是否题"]], question.type, (type) => {
-    question.type = type;
-    if (type === "choice") ensureTwoOptions(question);
-    renderQuestions(`[data-q="${qIndex}"] .type-seg [aria-pressed="true"]`);
-    updateDirty();
-  }, { disabled: isAnswer ? {} : question.role === "target_gate"
-    ? { choice: "这个用途使用是否题" } : { boolean: "这个用途只支持选择题" }, extra: "type-seg" });
-
-  const stageSeg = segmented("判断时机", [["pre_reply", "回复前"], ["post_reply", "回复写完后"]], question.stage, (stage) => {
-    question.stage = stage;
-    for (const child of state.questions) for (const t of child.triggers)
-      if (child.stage !== (triggerParent(child, t)?.stage || "pre_reply")) t.ask_with_parent = false;
-    renderQuestions(`[data-q="${qIndex}"] .stage-seg [aria-pressed="true"]`);
-    updateDirty();
-  }, { disabled: isAnswer ? {} : { post_reply: "只有「记录答案」可以在回复写完后判断" }, extra: "stage-seg" });
-
-  const modeSelect = fieldSelect("本题决策", {
-    inherit: "继承默认模式", model: "模型判断", random: "按权重随机",
-  }, question.decision_mode, (mode) => {
-    question.decision_mode = mode;
-    renderQuestions(`[data-q="${qIndex}"] [data-field="decision-mode"]`);
-    updateDirty();
-  }, { field: "decision-mode" });
-
-  const thresholdNote = question.type === "boolean"
-    ? "仅模型判断。两侧权重都是 1 时，「是」的概率达到阈值才判为是；调整权重后取加权概率较高的一侧。不按温度抽样。"
-    : "仅模型判断。选中答案的原始概率低于插件判断阈值时，按没有选中处理。";
-
-  return h("div", { class: "q-settings" },
-    h("div", { class: "settings-grid" },
-      h("label", { class: "setting" }, h("span", { class: "field-label" }, "问题 ID"), idInput),
-      roleSelect,
-      h("div", { class: "setting" }, h("span", { class: "field-label" }, "题型"), typeSeg),
-      h("div", { class: "setting" }, h("span", { class: "field-label" }, "判断时机"), stageSeg),
-      modeSelect,
-    ),
-    h("div", { class: "settings-switches" },
-      switchField("使用插件判断阈值", question.use_threshold, (v) => { question.use_threshold = v; }, thresholdNote),
-      question.role === "action" && question.triggers[0]?.event === "message_received" && switchField("私聊也判断是否发言", question.ask_private,
-        (v) => { question.ask_private = v; }, "关闭时私聊消息直接回复，不问这道题。"),
-    ),
-    post && h("p", { class: "note" }, "回复写完后判断：模型会读到本轮回复正文和此前的答案。这里只记录答案并决定接着问什么，不再给会话模型提示，也不调用工具。"),
-  );
-}
-
-function renderRoleNote(question) {
-  const notes = {
-    target_gate: "只在群聊收到消息且有候选时判断。把选择目标接在“是”下面，可以与本题同批提问。",
-    target: "只在群聊收到消息时判断。「*」会展开成本轮每条候选消息，选择标准里可以用 {描述} 引用消息摘要。",
-    meme: "「*」会展开成图库里每张带描述的表情，选择标准里可以用 {描述} 引用表情描述。",
-  };
-  return notes[question.role] ? h("p", { class: "note" }, notes[question.role]) : null;
-}
-
-function renderAnswers(question, qIndex) {
-  const post = question.stage === "post_reply";
-  const fixedRows = question.role !== "answer" || question.type === "boolean";
-  const wrap = h("div", { class: cls("answers", fixedRows && "is-fixed") },
-    h("div", { class: "ans-row ans-head", "aria-hidden": "true" },
-      h("span", { class: "ans-col-judge" }, question.type === "boolean" ? "判断模型的回答" : "选项 · 判断模型看到"),
-      h("span", { class: "ans-col-weight", title: "默认 1。调高更偏向这一项，0 表示不选" }, "权重"),
-      h("span", { class: "ans-col-effect" }, post ? "选中后" : "选中后 · 会话模型收到")));
-  const shares = showsShares(question) ? weightShares(question) : null;
-  if (question.type === "boolean") {
-    ["true", "false"].forEach((side, i) => wrap.append(booleanRow(question, qIndex, side, shares?.[i])));
-    return wrap;
-  }
-
-  const editable = question.role === "answer";
-  question.options.forEach((option, oIndex) => {
-    wrap.append(choiceRow(question, qIndex, option, oIndex, shares?.[oIndex]));
+    return h("div", { class: "trigger-row", dataset: { t: i } }, select, timing,
+      iconButton("close", "移除这条触发来源", () => { q.triggers.splice(i, 1); refreshEditor(); }));
   });
-  if (editable) {
+  const free = triggerChoices(q, null).find((c) => !c.disabled);
+  const addTrigger = h("button", {
+    type: "button", class: "btn btn-text", disabled: !free, dataset: { act: "add-trigger" },
+    title: free ? undefined : "没有可以再添加的触发来源",
+    onclick: () => {
+      q.triggers.push(free.make());
+      refreshEditor(`[data-q="${qIndex}"] [data-t="${q.triggers.length - 1}"] select`);
+    },
+  }, icon("plus"), "添加触发来源");
+
+  const sceneChips = h("div", { class: "scene-chips", role: "group", "aria-label": "限定场景" },
+    wf.SCENE_KEYS.map((scene) => h("button", {
+      type: "button",
+      class: "chip-toggle",
+      "aria-pressed": String(q.scenes.includes(scene)),
+      onclick: () => {
+        q.scenes = q.scenes.includes(scene) ? q.scenes.filter((s) => s !== scene)
+          : wf.SCENE_KEYS.filter((s) => s === scene || q.scenes.includes(s));
+        refreshEditor();
+      },
+    }, SCENE_LABELS[scene])));
+  const scenes = wf.possibleScenes(q);
+  const effective = wf.isPending(q) ? null : scenes.size
+    ? `实际会在${wf.SCENE_KEYS.filter((s) => scenes.has(s)).map((s) => PREVIEW_SCENES[s]).join("、")}时问${q.stage === "post_reply" ? "（正文生成后）" : ""}`
+    : "按当前触发来源和场景限制，这道题不会被提问";
+
+  return section("何时提问",
+    h("div", { class: "when-grid" },
+      h("span", { class: "field-label" }, "阶段"), stageSeg,
+      h("span", { class: "field-label" }, "触发来源"),
+      h("div", { class: "q-triggers" },
+        wf.isPending(q) && h("p", { class: "pending-note" }, "待连接：这道题不会被提问。选择一个事件或上游选项。"),
+        rows,
+        h("div", { class: "trigger-foot" }, addTrigger,
+          q.triggers.length > 1 && h("small", { class: "hint" }, "任一来源命中即提问，同一轮只问一次。"),
+          q.triggers.some((t) => t.ask_with_parent) && h("small", { class: "hint" }, "同批只是提前问，上游命中后才采用答案。"))),
+      h("span", { class: "field-label" }, "限定"),
+      h("div", { class: "when-limits" },
+        sceneChips,
+        h("small", { class: "hint" }, "不选即不限，对上游来源同样生效"),
+        h("label", { class: "inline-field" }, "有候选时才问",
+          (() => {
+            const select = h("select", { onchange: (e) => { q.requires_candidates = e.target.value; refreshEditor(); } },
+              h("option", { value: "" }, "不限"),
+              h("option", { value: "recent_messages" }, "有最近用户消息时"),
+              h("option", { value: "memes" }, "有图库表情时"));
+            select.value = q.requires_candidates;
+            return select;
+          })()),
+        effective && h("p", { class: "effective" }, effective))));
+}
+
+// ---------- 问判断模型 ----------
+
+function renderAsk(q, qIndex) {
+  const idInput = h("input", {
+    type: "text", class: "mono", value: q.id, placeholder: "如 join_chat",
+    spellcheck: "false", autocomplete: "off", dataset: { field: "id" },
+    oninput: (event) => {
+      q.id = event.target.value;
+      for (const el of document.querySelectorAll(`[data-name-of="${qIndex}"]`)) el.textContent = qName(q);
+    },
+  });
+  const typeSeg = segmented("题型", [["boolean", "是否题"], ["choice", "选择题"]], q.type,
+    (type, el) => confirmChange(`type:${qIndex}:${type}`, el, wf.changeType(q, type), `改为${TYPE_LABELS[type]}`),
+    { disabled: wf.isDynamic(q) ? { boolean: "动态候选需要选择题" } : {}, extra: "type-seg" });
+  const sources = Object.entries(state.sources).length ? Object.entries(state.sources)
+    : [["options", "固定选项"], ["recent_messages", "最近用户消息"], ["memes", "图库表情"]];
+  const sourceSeg = segmented("候选来源", sources, q.candidate_source,
+    (source, el) => confirmChange(`source:${qIndex}:${source}`, el, wf.changeSource(q, source), `改为「${state.sources[source] || source}」`),
+    { extra: "source-seg", field: "source" });
+
+  const id = `q${qIndex}-instructions`;
+  const input = h("textarea", {
+    id, class: "autosize", rows: 2, value: q.instructions,
+    placeholder: "例如：现在加入讨论合适吗？", dataset: { field: "instructions" },
+    oninput: () => { q.instructions = input.value; },
+  });
+  const tokens = h("span", { class: "token-bar" }, "插入",
+    PROMPT_TOKENS.map((name) => h("button", {
+      type: "button", class: "token",
+      title: `判断模型会看到本轮的实际${name}`,
+      "aria-label": `插入${name}`,
+      onclick: () => {
+        input.setRangeText(`{${name}}`, input.selectionStart, input.selectionEnd, "end");
+        input.focus();
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      },
+    }, `{${name}}`)));
+  const dynamicNote = {
+    recent_messages: "「每条候选消息」行会展开为本轮快照中的每条用户消息（最多 8 条），{描述} 换成发送人、时间和摘要。",
+    memes: "「每张候选表情」行会展开为图库里每张带描述的表情，{描述} 换成表情描述。",
+  }[q.candidate_source];
+
+  return section("问判断模型",
+    h("div", { class: "settings-grid ask-grid" },
+      h("label", { class: "setting" }, h("span", { class: "field-label" }, "题目 ID"), idInput),
+      h("div", { class: "setting" }, h("span", { class: "field-label" }, "题型"), typeSeg),
+      h("div", { class: "setting is-wide" }, h("span", { class: "field-label" }, "候选来源"), sourceSeg)),
+    h("div", { class: "q-prompt" },
+      h("div", { class: "field-row" }, h("label", { class: "field-label is-judge", for: id }, "问判断模型"), tokens),
+      input),
+    dynamicNote && h("p", { class: "note" }, dynamicNote));
+}
+
+// ---------- 选项与结果 ----------
+
+function renderOutcomes(q, qIndex) {
+  const shares = showsShares(q) ? weightShares(q) : null;
+  const wrap = h("div", { class: cls("answers", q.type === "boolean" && "is-fixed") },
+    h("div", { class: "ans-row ans-head", "aria-hidden": "true" },
+      h("span", { class: "ans-col-judge" }, q.type === "boolean" ? "判断模型的回答" : "选项 · 判断模型看到"),
+      h("span", { class: "ans-col-weight", title: "默认 1。调高更偏向这一项，0 表示不选" }, "权重"),
+      h("span", { class: "ans-col-effect" }, "选中后")));
+  if (q.type === "boolean") {
+    ["true", "false"].forEach((side, i) => wrap.append(booleanRow(q, qIndex, side, shares?.[i])));
+  } else {
+    q.options.forEach((option, oIndex) => wrap.append(choiceRow(q, qIndex, option, oIndex, shares?.[oIndex])));
     wrap.append(h("button", {
       type: "button",
       class: "btn btn-add-opt",
       onclick: () => {
-        const used = new Set(question.options.map((item) => item.id));
-        question.options.push({ id: nextId("option_", used), criteria: "", session_hint: "", weight: 1, tool: "" });
-        renderQuestions(`[data-q="${qIndex}"] [data-o="${question.options.length - 1}"] [data-field="opt-id"]`);
-        updateDirty();
+        const used = new Set(q.options.map((item) => item.id.trim()));
+        const fresh = wf.newOption(wf.nextId("option_", used));
+        const star = q.options.findIndex(wf.isWildcard);
+        // 新选项排在「每条候选」之前，候选行留在最后。
+        if (star >= 0) q.options.splice(star, 0, fresh);
+        else q.options.push(fresh);
+        refreshEditor(`[data-q="${qIndex}"] [data-o="${q.options.indexOf(fresh)}"] [data-field="opt-id"]`);
       },
     }, icon("plus"), "添加选项"));
   }
-  return wrap;
+  return section("选项与结果", wrap);
 }
 
-function weightCell(question, qIndex, owner, key, label, share) {
+function weightCell(question, qIndex, ref, label, share) {
   return h("div", { class: "ans-weight" },
     h("input", {
-      type: "number", min: 0, max: 100, step: "any", value: owner[key] ?? 1,
+      type: "number", min: 0, max: 100, step: "any", value: ref.weight ?? 1,
       "aria-label": label, dataset: { field: "weight" },
       oninput: (event) => {
-        owner[key] = event.target.valueAsNumber;
+        ref.weight = event.target.valueAsNumber;
         refreshShares(question, qIndex);
       },
     }),
@@ -1087,123 +1090,319 @@ function weightCell(question, qIndex, owner, key, label, share) {
 function refreshShares(question, qIndex) {
   if (!showsShares(question)) return;
   const shares = weightShares(question);
-  const slots = answerSlots(question);
   const card = $("questions").querySelector(`[data-q="${qIndex}"]`);
-  slots.forEach((slot, i) => {
-    const cell = card?.querySelector(`[data-o="${slot.index ?? slot.key}"] [data-share]`);
+  wf.slotsOf(question).forEach((ref, i) => {
+    const cell = card?.querySelector(`[data-o="${wf.slotIndex(question, ref)}"] [data-share]`);
     if (cell) cell.textContent = shareText(shares[i]);
   });
 }
 
-function effectsCell(question, qIndex, owner, keys, rowKey, label) {
-  const post = question.stage === "post_reply";
-  const key = question.type === "boolean" ? rowKey : owner.id;
-  const effects = state.effects[post ? "post_reply" : question.role];
-  const result = h("span", {class:"ans-fixed-text"}, Object.hasOwn(effects,key) ? effects[key] : effects["*"]);
-  if (question.role === "action" && key === "none") return h("div", {class:"ans-effects"}, result);
-  const toolChoices = { "": "不调用", ...state.tools };
-  return h("div", { class: "ans-effects" },
-    result,
-    !post && h("textarea", {
-      class: "ans-hint autosize", rows: 1, value: owner[keys.hint] || "",
-      placeholder: "给会话模型的提示（可选）",
-      "aria-label": `${label}时给会话模型的提示`,
-      oninput: (event) => { owner[keys.hint] = event.target.value; },
-    }),
-    h("div", { class: "effect-row" },
-      branchField(question, question.type === "boolean" ? rowKey : owner),
-      !post && Object.keys(state.tools).length > 0 && h("label", { class: "effect-field" },
-        h("span", null, "调用工具"),
-        (() => {
-          const select = h("select", { onchange: (e) => { owner[keys.tool] = e.target.value; } },
-            Object.entries(toolChoices).map(([value, text]) => h("option", { value }, text)));
-          select.value = owner[keys.tool] || "";
-          return select;
-        })()),
-    ));
-}
-
-function branchField(parent, option) {
-  const links = branchLinks(parent).filter(([key]) => key === triggerOption({option}));
-  const candidates = state.questions.filter(q => q !== parent && q.role !== "action" &&
-    !(parent.stage === "post_reply" && q.stage !== "post_reply") && !links.some(([, target]) => target === q));
-  const select = h("select", {"aria-label": "添加后继问题", onchange:event => {
-    const value = event.target.value;
-    if (!value) return;
-    if (value === "new") {
-      const child = blankQuestion(parent.stage === "post_reply" ? "post" : "choice");
-      child.triggers = [{parent, option}];
-      insertQuestion(child, qIndexOf(parent) + 1);
-    } else {
-      candidates[Number(value)].triggers.push({parent, option});
-      refreshEditor();
-    }
-  }}, h("option", {value:""}, "添加后继…"), candidates.map((q,i) => h("option",{value:String(i)}, targetTitle(q))),
-    h("option",{value:"new"}, "新建一个问题…"));
-  const eligible = links.filter(([,child]) => child.stage === parent.stage &&
-    (child.decision_mode === "inherit" ? getMode() : child.decision_mode) === "model");
-  return h("div",{class:"effect-field"}, h("span",null,"接着问"), select,
-    links.map(([,child,t]) => h("button",{type:"button",class:"btn btn-text",onclick:() => revealQuestion(child)},
-      qName(child) + (t.ask_with_parent ? " · 同批" : " · 命中后问"))),
-    eligible.length > 1 && eligible.some(([, ,t]) => !t.ask_with_parent) &&
-      h("button",{type:"button",class:"btn btn-text",onclick:() => {
-        for (const [, ,t] of eligible) t.ask_with_parent = true;
-        refreshEditor();
-      }}, "把这几题一起问"));
-}
-
-function choiceRow(question, qIndex, option, oIndex, share) {
-  const fixed = question.role !== "answer";
-  const label = `选项「${option.id || oIndex + 1}」`;
-  const idCell = fixed
-    ? h("span", { class: "ans-fixed", title: FIXED_OPTION_LABELS[question.role]?.[option.id] || "" },
-        h("code", null, option.id),
-        h("small", null, FIXED_OPTION_LABELS[question.role]?.[option.id] || ""))
+function choiceRow(q, qIndex, option, oIndex, share) {
+  const star = wf.isWildcard(option);
+  const label = `选项「${star ? slotLabel(q, option) : option.id || oIndex + 1}」`;
+  const idCell = star
+    ? h("span", { class: "ans-fixed", title: "动态候选行，ID 固定为 *" }, h("code", null, "*"), h("small", null, slotLabel(q, option)))
     : h("input", {
-        type: "text", class: "opt-id mono", value: option.id, placeholder: "选项 ID",
-        spellcheck: "false", autocomplete: "off", "aria-label": `选项 ${oIndex + 1} 的 ID`,
-        dataset: { field: "opt-id" },
-        oninput: (event) => { option.id = event.target.value; },
-      });
+      type: "text", class: "opt-id mono", value: option.id, placeholder: "选项 ID",
+      spellcheck: "false", autocomplete: "off", "aria-label": `选项 ${oIndex + 1} 的 ID`,
+      dataset: { field: "opt-id" },
+      oninput: (event) => { option.id = event.target.value; },
+    });
   const criteria = h("textarea", {
-        class: "opt-criteria autosize", rows: 1, value: option.criteria,
-        placeholder: option.id === "*" ? "候选说明，{描述} 会换成每个候选的内容" : "什么情况下选它",
-        "aria-label": `${label}的选择标准`, dataset: { field: "opt-criteria" },
-        oninput: (event) => { option.criteria = event.target.value; },
-      });
-  const count = question.options.length;
+    class: "opt-criteria autosize", rows: 1, value: option.criteria,
+    placeholder: star ? "候选说明，{描述} 会换成每个候选的内容" : "什么情况下选它",
+    "aria-label": `${label}的说明`, dataset: { field: "opt-criteria" },
+    oninput: (event) => { option.criteria = event.target.value; },
+  });
+  const count = q.options.length;
+  const removeReason = star ? "动态候选需要这一行" : count <= 2 ? "至少保留两个选项" : "";
+  const remove = iconButton("trash", removeReason || `删除${label}`, (event) => {
+    if (removeReason) return;
+    confirmChange(`option:${qIndex}:${oIndex}`, event.currentTarget, wf.deleteOption(q, option), `删除${label}`,
+      () => state.preview.choices.delete(q));
+  }, { disabled: !!removeReason, danger: true });
   return h("div", { class: "ans-row", dataset: { o: oIndex } },
-    h("div", { class: cls("ans-judge", fixed && "is-fixed") }, idCell, criteria),
-    weightCell(question, qIndex, option, "weight", `${label}的权重`, share),
+    h("div", { class: cls("ans-judge", star && "is-fixed") }, idCell, criteria),
+    weightCell(q, qIndex, option, `${label}的权重`, share),
     h("span", { class: "ans-arrow", "aria-hidden": "true" }, icon("arrow")),
-    effectsCell(question, qIndex, option, { hint: "session_hint", tool: "tool" }, oIndex, `选中${label}`),
-    h("div", { class: "ans-tools" }, !fixed && [
-      iconButton("up", `上移${label}`, () => moveOption(question, qIndex, oIndex, -1), { disabled: oIndex === 0 }),
-      iconButton("down", `下移${label}`, () => moveOption(question, qIndex, oIndex, 1), { disabled: oIndex === count - 1 }),
-      iconButton("trash", count <= 2 ? "至少保留两个选项" : `删除${label}`, () => {
-        if (question.options.length <= 2) return;
-        for (const child of state.questions) child.triggers = child.triggers.filter(t => t.parent !== question || t.option !== option);
-        question.options.splice(oIndex, 1);
-        renderQuestions();
-        updateDirty();
-      }, { disabled: count <= 2, danger: true }),
-    ]),
+    renderOutcome(q, qIndex, option),
+    h("div", { class: "ans-tools" },
+      iconButton("up", `上移${label}`, () => moveOption(q, qIndex, oIndex, -1), { disabled: oIndex === 0 }),
+      iconButton("down", `下移${label}`, () => moveOption(q, qIndex, oIndex, 1), { disabled: oIndex === count - 1 }),
+      remove),
   );
 }
 
-function booleanRow(question, qIndex, side, share) {
-  const yes = side === "true";
-  const text = yes ? "是" : "否";
+function booleanRow(q, qIndex, side, share) {
+  const text = side === "true" ? "是" : "否";
+  const ref = q.sides[side];
   return h("div", { class: "ans-row", dataset: { o: side } },
     h("div", { class: "ans-judge is-fixed" },
       h("span", { class: "ans-fixed is-bool" }, h("code", null, text)),
       h("span", { class: "ans-fixed-text" }, `判断模型回答「${text}」`)),
-    weightCell(question, qIndex, question, `${side}_weight`, `「${text}」的权重`, share),
+    weightCell(q, qIndex, ref, `「${text}」的权重`, share),
     h("span", { class: "ans-arrow", "aria-hidden": "true" }, icon("arrow")),
-    effectsCell(question, qIndex, question,
-      { hint: `${side}_session_hint`, tool: `${side}_tool` }, side, `判断为「${text}」`),
+    renderOutcome(q, qIndex, ref),
     h("div", { class: "ans-tools" }),
   );
+}
+
+function renderOutcome(q, qIndex, ref) {
+  const kids = wf.childLinks(state.questions, q).filter((l) => l.option === ref);
+  return h("div", { class: "ans-effects" },
+    ref.actions.length
+      ? h("div", { class: "act-list" }, ref.actions.map((action, a) => renderAction(q, qIndex, ref, action, a)))
+      : h("p", { class: "act-empty" }, "无动作，只记录答案"),
+    h("div", { class: "effect-row" }, addActionField(q, qIndex, ref), followField(q, qIndex, ref)),
+    kids.length > 0 && h("div", { class: "follow-list" }, h("span", null, "接着问"),
+      kids.map((l) => h("button", { type: "button", class: "follow-link", onclick: () => revealQuestion(l.child) },
+        icon("arrow"), nameRef(l.child), h("small", null, timingLabel(l.trigger))))),
+  );
+}
+
+function addActionField(q, qIndex, ref) {
+  const choices = Object.keys(state.catalog).map((tool) => {
+    const reason = wf.actionAvailability(state.questions, state.catalog, q, ref, tool);
+    return { group: "", label: toolLabel(tool), disabled: !!reason, reason: reason || "", tool };
+  });
+  const select = choiceSelect(`给${slotLabel(q, ref)}添加动作`, choices, -1, (choice) => {
+    ref.actions.push(wf.newAction(state.questions, state.catalog, q, ref, choice.tool));
+    const o = wf.slotIndex(q, ref);
+    refreshEditor(`[data-q="${qIndex}"] [data-o="${o}"] [data-a="${ref.actions.length - 1}"] select, [data-q="${qIndex}"] [data-o="${o}"] [data-a="${ref.actions.length - 1}"] button`);
+  }, { placeholder: "添加动作…" });
+  return h("label", { class: "effect-field is-action" }, h("span", null, "动作"), select);
+}
+
+function followField(q, qIndex, ref) {
+  const linked = new Set(wf.childLinks(state.questions, q).filter((l) => l.option === ref).map((l) => l.child));
+  const existing = state.questions.filter((c) => c !== q && !linked.has(c)
+    && !(q.stage === "post_reply" && c.stage === "pre_reply") && !wf.wouldCycle(state.questions, c, q));
+  const kinds = [["boolean", "新建是否题"], ["choice", "新建选择题"], ["message", "新建选消息题"], ["meme", "新建选表情题"]]
+    .filter(([kind]) => !(q.stage === "post_reply" && kind === "message"));
+  const choices = [
+    ...existing.map((c) => ({ group: "现有的题", label: `${qIndexOf(c) + 1}. ${qName(c)}${wf.isPending(c) ? "（待连接）" : ""}`, child: c })),
+    ...kinds.map(([kind, label]) => ({ group: "新建", label, kind })),
+  ];
+  const select = choiceSelect(`选中${slotLabel(q, ref)}后接着问`, choices, -1, (choice) => {
+    if (choice.child) {
+      choice.child.triggers.push({ parent: q, option: ref, ask_with_parent: choice.child.stage === q.stage });
+      refreshEditor();
+      return;
+    }
+    const child = wf.templateQuestion(choice.kind, state.questions, { stage: q.stage });
+    child.triggers = [{ parent: q, option: ref, ask_with_parent: true }];
+    insertQuestion(child, qIndexOf(q) + 1);
+  }, { placeholder: "接着问…" });
+  return h("label", { class: "effect-field is-linked" }, h("span", null, "接着问"), select);
+}
+
+function isAncestor(source, q, seen = new Set()) {
+  if (seen.has(q)) return false;
+  seen.add(q);
+  return q.triggers.some((t) => t.parent && (t.parent === source || isAncestor(source, t.parent, seen)));
+}
+
+function answerDescription(q, ref) {
+  if (wf.isWildcard(ref)) {
+    return q.candidate_source === "memes" ? "选中表情的描述" : "选中的消息（发送人、时间和原文）";
+  }
+  return `本题答案「${slotLabel(q, ref)}」`;
+}
+
+function sourceSelect(label, choices, current, onPick) {
+  const select = h("select", { "aria-label": label, onchange: (e) => onPick(e.target.value) },
+    choices.map(([value, text]) => h("option", { value }, text)));
+  select.value = current;
+  return h("label", { class: "act-field" }, h("span", null, label), select);
+}
+
+// 文本参数逐字输入时不重画卡片，只就地更新这张动作卡片的错误状态。
+function recheckAction(input, q, ref, action) {
+  const box = input.closest(".act");
+  if (!box) return;
+  const issue = wf.actionIssue(state.questions, state.catalog, q, ref, action);
+  box.classList.toggle("is-invalid", !!issue);
+  const error = box.querySelector(".act-error");
+  if (!issue) error?.remove();
+  else if (error) error.textContent = issue;
+  else box.append(h("p", { class: "act-error" }, issue));
+}
+
+function actionParams(q, ref, action) {
+  const tool = state.catalog[action.tool];
+  if (!tool) return null;
+  const params = tool.parameters || [];
+  const fields = [];
+  const fromValue = action.from ? String(qIndexOf(action.from)) : "self";
+  const pick = (value) => (value === "self" ? null : state.questions[Number(value)] || null);
+  if (action.tool === "add_context") {
+    const sources = wf.sourceChoices(state.questions, state.catalog, q, ref, action.tool).filter(Boolean);
+    const choices = [["self", answerDescription(q, ref)], ...sources.map((s) => [String(qIndexOf(s)), `「${qName(s)}」的答案`]), ["text", "固定文本"]];
+    const current = action.text !== undefined ? "text" : fromValue;
+    if (!choices.some(([value]) => value === current)) choices.push([current, `「${qName(action.from)}」的答案（已失效）`]);
+    fields.push(sourceSelect("内容", choices, current, (value) => {
+      if (value === "text") {
+        action.from = null;
+        action.text = action.text ?? "";
+      } else {
+        delete action.text;
+        action.from = pick(value);
+      }
+      refreshEditor();
+    }));
+    if (action.text !== undefined) {
+      fields.push(h("textarea", {
+        class: "act-text autosize", rows: 1, value: action.text,
+        placeholder: "例如：这轮用简短、口语化的语气回复", "aria-label": "固定文本",
+        oninput: (event) => { action.text = event.target.value; recheckAction(event.target, q, ref, action); },
+      }));
+    }
+    fields.push(h("label", { class: "act-field is-label" }, h("span", null, "字段名"),
+      h("input", {
+        type: "text", value: action.label || "", placeholder: "可选，如 篇幅",
+        oninput: (event) => { action.label = event.target.value; recheckAction(event.target, q, ref, action); },
+      })));
+  } else if (params.includes("from")) {
+    const noun = { recent_messages: "消息", memes: "表情" }[tool.source] || "答案";
+    const sources = wf.sourceChoices(state.questions, state.catalog, q, ref, action.tool);
+    const choices = sources.map((s) => (s ? [String(qIndexOf(s)), `「${qName(s)}」选中的${noun}`] : ["self", `本题选中的${noun}`]));
+    if (!choices.some(([value]) => value === fromValue)) {
+      choices.push([fromValue, action.from ? `「${qName(action.from)}」（已失效）` : `本题（已失效）`]);
+    }
+    fields.push(sourceSelect(noun, choices, fromValue, (value) => { action.from = pick(value); refreshEditor(); }));
+  }
+  if (params.includes("when") && tool.when?.length) {
+    fields.push(segmented("时机", tool.when.map((w) => [w, WHEN_LABELS[w] || w]), action.when,
+      (w) => { action.when = w; refreshEditor(); }, { extra: "when-seg", field: "when" }));
+  }
+  return fields.length ? h("div", { class: "act-params" }, fields) : null;
+}
+
+function quoteBindings() {
+  return state.questions.flatMap((q) => wf.slotsOf(q).flatMap((ref) => ref.actions
+    .filter((a) => a.tool === "quote_message").map((a) => ({ q, ref, action: a }))));
+}
+
+function actionNotes(q, ref, action) {
+  const notes = [];
+  if (action.tool === "request_reply") {
+    // 只算可能在同一轮命中的来源：冷场和收到消息不会共用一次生成。
+    const scenes = wf.possibleScenes(q);
+    const others = wf.allReplySources(state.questions)
+      .filter((s) => s.ref !== ref && [...wf.possibleScenes(s.q)].some((scene) => scenes.has(scene)));
+    notes.push(others.length
+      ? `与 ${others.slice(0, 2).map((s) => `${qName(s.q)}=${slotLabel(s.q, s.ref)}`).join("、")}${others.length > 2 ? ` 等 ${others.length} 处` : ""}共用一次生成`
+      : "本轮生成一次正文");
+  } else if (action.tool === "add_context") {
+    if (action.label?.trim()) notes.push(`会话模型会看到「${action.label.trim()}：…」`);
+    else if (action.text !== undefined) notes.push("作为本轮提示交给会话模型");
+  } else if (action.tool === "quote_message") {
+    notes.push("引用方式沿用群聊策略里的「指定消息的引用方式」");
+    const all = quoteBindings();
+    if (all.length > 1) notes.push(`多个引用同时命中时，采用排在最后的「${qName(all[all.length - 1].q)}」`);
+  } else if (action.tool === "send_meme") {
+    notes.push(action.when === "after_send" ? "正文确认发送后再发，本轮不发言就跳过" : "不等正文，本轮不发言也会发送");
+  }
+  if (action.from && !isAncestor(action.from, q)) notes.push(`「${qName(action.from)}」未提问或未命中时跳过这个动作`);
+  return notes;
+}
+
+function renderAction(q, qIndex, ref, action, a) {
+  const tool = state.catalog[action.tool];
+  const ui = ACTION_UI[action.tool] || { icon: "zap", group: "send" };
+  const issue = wf.actionIssue(state.questions, state.catalog, q, ref, action);
+  const targets = wf.moveTargets(state.questions, state.catalog, q, ref, action);
+  const count = ref.actions.length;
+  const move = targets.length > 0 && h("select", {
+    class: "act-move", "aria-label": "移到其他选项",
+    onchange: (event) => {
+      const target = targets[Number(event.target.value)];
+      if (!target) return;
+      ref.actions.splice(a, 1);
+      target.actions.push(action);
+      refreshEditor();
+    },
+  }, h("option", { value: "" }, "移到…"), targets.map((t, i) => h("option", { value: String(i) }, `选项「${slotLabel(q, t)}」`)));
+  return h("div", { class: cls("act", `is-${ui.group}`, issue && "is-invalid"), dataset: { a, field: "action" } },
+    h("div", { class: "act-head" },
+      h("span", { class: "act-icon" }, icon(ui.icon)),
+      h("b", null, tool?.label || action.tool),
+      h("span", { class: "act-tools" },
+        count > 1 && iconButton("up", "上移动作", () => { moveItem(ref.actions, a, -1); refreshEditor(); }, { disabled: a === 0 }),
+        count > 1 && iconButton("down", "下移动作", () => { moveItem(ref.actions, a, 1); refreshEditor(); }, { disabled: a === count - 1 }),
+        move,
+        iconButton("close", `移除动作 ${tool?.label || action.tool}`, () => { ref.actions.splice(a, 1); refreshEditor(); }, { danger: true }))),
+    actionParams(q, ref, action),
+    actionNotes(q, ref, action).map((note) => h("p", { class: "act-note" }, note)),
+    issue && h("p", { class: "act-error" }, issue),
+  );
+}
+
+// ---------- 判断方式与兜底 ----------
+
+function slotChoices(q) {
+  return Object.fromEntries(wf.slotsOf(q).filter((ref) => !wf.isWildcard(ref))
+    .map((ref) => [String(wf.slotIndex(q, ref)), slotLabel(q, ref)]));
+}
+
+function slotByIndex(q, value) {
+  if (value === "") return null;
+  return q.type === "boolean" ? q.sides[value] : q.options[Number(value)] || null;
+}
+
+function renderAdvanced(q, qIndex) {
+  const mode = { inherit: "继承默认模式", model: "模型判断", random: "按权重随机" }[q.decision_mode];
+  const privateShown = wf.possibleScenes(q).has("private_passive") || q.private_default;
+  const summary = [mode, q.use_threshold ? "用阈值" : "不用阈值",
+    `兜底 ${q.default_option ? slotLabel(q, q.default_option) : "无"}`,
+    privateShown && `私聊${q.private_default ? `直接选「${slotLabel(q, q.private_default)}」` : "照常判断"}`,
+    q.aliases.length && `${q.aliases.length} 个别名`].filter(Boolean).join(" · ");
+  const thresholdNote = q.type === "boolean"
+    ? "仅模型判断。两侧权重都是 1 时，「是」的概率达到阈值才判为是；调整权重后取加权概率较高的一侧。不按温度抽样。"
+    : "仅模型判断。选中答案的原始概率低于插件判断阈值时，按没有选中处理。";
+  const details = h("details", {
+    class: "q-adv", open: state.advanced.has(q),
+    ontoggle: () => (details.open ? state.advanced.add(q) : state.advanced.delete(q)),
+  },
+    h("summary", null, h("span", { class: "q-section-title" }, "判断方式与兜底"), h("span", { class: "q-adv-sum" }, summary)),
+    h("div", { class: "q-adv-body" },
+      h("div", { class: "settings-grid" },
+        fieldSelect("本题决策", { inherit: "继承默认模式", model: "模型判断", random: "按权重随机" }, q.decision_mode, (value) => {
+          q.decision_mode = value;
+          refreshEditor(`[data-q="${qIndex}"] [data-field="decision-mode"]`);
+        }, { field: "decision-mode" }),
+        fieldSelect("没有有效答案时记为", { "": "不记录", ...slotChoices(q) },
+          q.default_option ? String(wf.slotIndex(q, q.default_option)) : "", (value) => {
+            q.default_option = slotByIndex(q, value);
+            refreshEditor(`[data-q="${qIndex}"] [data-field="default_option"]`);
+          }, { field: "default_option" }),
+        privateShown && fieldSelect("私聊收到消息时", { "": "照常问判断模型", ...slotChoices(q) },
+          q.private_default ? String(wf.slotIndex(q, q.private_default)) : "", (value) => {
+            q.private_default = slotByIndex(q, value);
+            refreshEditor(`[data-q="${qIndex}"] [data-field="private_default"]`);
+          }, { field: "private_default" })),
+      h("p", { class: "note" }, "兜底答案只写进日志，不执行该选项的动作，也不触发接着问。",
+        privateShown ? "私聊直接采用的选项不问判断模型，照常执行动作并触发接着问。" : ""),
+      switchField("使用插件判断阈值", q.use_threshold, (v) => { q.use_threshold = v; refreshEditor(); }, thresholdNote),
+      q.aliases.length > 0 && h("div", { class: "alias-list" },
+        h("span", { class: "field-label" }, "判断模型可能输出的别名"),
+        q.aliases.map((alias, i) => h("div", { class: "alias-row", dataset: { i, field: "alias" } },
+          h("input", {
+            type: "text", class: "mono", value: alias.alias, "aria-label": "别名",
+            oninput: (event) => { alias.alias = event.target.value; },
+          }),
+          icon("arrow"),
+          (() => {
+            const select = h("select", {
+              "aria-label": "对应的选项",
+              onchange: (e) => { alias.option = slotByIndex(q, e.target.value); refreshEditor(); },
+            }, Object.entries(slotChoices(q)).map(([value, text]) => h("option", { value }, text)));
+            select.value = String(wf.slotIndex(q, alias.option));
+            return select;
+          })(),
+          iconButton("close", "移除别名", () => { q.aliases.splice(i, 1); refreshEditor(); }, { danger: true })))),
+    ));
+  return details;
 }
 
 // ---------- 问题操作 ----------
@@ -1213,24 +1412,23 @@ function moveQuestion(qIndex, delta, act) {
   const target = qIndex + delta;
   const edge = target === 0 || target === state.questions.length - 1;
   const fallback = act === "up" ? "down" : "up";
-  renderQuestions(`[data-q="${target}"] .q-tools [data-act="${edge ? fallback : act}"]`);
-  updateDirty();
+  refreshEditor(`[data-q="${target}"] .q-tools [data-act="${edge ? fallback : act}"]`);
 }
 
 function moveOption(question, qIndex, oIndex, delta) {
   if (!moveItem(question.options, oIndex, delta)) return;
-  renderQuestions(`[data-q="${qIndex}"] [data-o="${oIndex + delta}"] [data-field="opt-criteria"]`);
-  updateDirty();
+  refreshEditor(`[data-q="${qIndex}"] [data-o="${oIndex + delta}"] [data-field="opt-criteria"]`);
 }
 
 function deleteQuestion(question) {
   const index = qIndexOf(question);
-  for (const child of state.questions) child.triggers = child.triggers.filter(t => t.parent !== question);
-  state.questions.splice(index, 1);
+  const lost = wf.runChange(state.questions, state.catalog, wf.deleteQuestion(state.questions, question));
   state.open.delete(question);
   const focusIndex = Math.min(index, state.questions.length - 1);
   renderQuestions(focusIndex >= 0 ? `[data-q="${focusIndex}"] .q-toggle` : undefined);
-  if (isDirty()) setSaveState("dirty", `已删除「${qName(question)}」，保存后生效；撤销更改可以找回`);
+  markPreviewStale();
+  const extra = lost.total ? `，并移除 ${wf.describeLoss(lost)}` : "";
+  if (isDirty()) setSaveState("dirty", `已删除「${qName(question)}」${extra}，保存后生效；撤销更改可以找回`);
   else setSaveState("clean");
 }
 
@@ -1238,32 +1436,31 @@ function insertQuestion(question, index) {
   state.questions.splice(index, 0, question);
   state.open.add(question);
   state.fresh = question;
-  renderQuestions(`[data-q="${index}"] [data-field="instructions"]`);
+  const focus = wf.isPending(question) ? `[data-q="${index}"] [data-act="add-trigger"]` : `[data-q="${index}"] [data-field="instructions"]`;
+  refreshEditor(focus);
   $("questions").querySelector(`[data-q="${index}"]`)?.scrollIntoView({ block: "nearest", behavior: "smooth" });
-  updateDirty();
 }
 
-function blankQuestion(template) {
-  const used = new Set(state.questions.map((item) => item.id.trim()));
-  const question = normalizeQuestion({
-    id: nextId(template === "post" ? "check_" : "question_", used),
-    type: template === "choice" ? "choice" : "boolean",
-    stage: template === "post" ? "post_reply" : "pre_reply",
-    options: [],
-  });
-  return question;
+function addEntry(event) {
+  const q = wf.templateQuestion(event === wf.POST_EVENT ? "post" : "boolean", state.questions);
+  q.triggers = [{ event }];
+  insertQuestion(q, state.questions.length);
 }
 
 function duplicateQuestion(question) {
-  const used = new Set(state.questions.map(q => q.id.trim()));
-  const fresh = normalizeQuestion({...serializeQuestion(question), id: nextId(question.id + "_copy", used)});
-  fresh.triggers = question.triggers.map(t => ({...t}));
-  insertQuestion(fresh, qIndexOf(question) + 1);
+  const used = new Set(state.questions.map((q) => q.id.trim()));
+  const raw = { ...wf.serializeQuestion(question), id: wf.nextId(`${question.id.trim()}_copy`, used), triggers: [], actions: {} };
+  const [copy] = wf.normalizeQuestions([raw]);
+  copy.triggers = question.triggers.map((t) => ({ ...t }));
+  wf.slotsOf(question).forEach((ref, i) => {
+    wf.slotsOf(copy)[i].actions = ref.actions.map((a) => ({ ...a }));
+  });
+  insertQuestion(copy, qIndexOf(question) + 1);
 }
 
 function onAddQuestion(template) {
   $("add-menu").open = false;
-  insertQuestion(blankQuestion(template), state.questions.length);
+  insertQuestion(wf.templateQuestion(template, state.questions), state.questions.length);
 }
 
 // ---------- 读取与保存 ----------
@@ -1277,20 +1474,26 @@ function fillForm(saved) {
   setMode(saved.mode);
   $("custom-context").value = saved.context;
   updateContextCount();
-  const open = new Set([...state.open].map(q => q.id.trim()));
+  const open = new Set([...state.open].map((q) => q.id.trim()));
   setQuestions(saved.questions);
-  state.open = new Set(state.questions.filter(q => open.has(q.id)));
+  state.open = new Set(state.questions.filter((q) => open.has(q.id)));
+  state.advanced = new Set();
   captureBaseline();
+  state.preview.result = null;
+  state.preview.stale = false;
+  renderPreviewResult();
   renderQuestions();
 }
 
 function applyConfig(data, fallbackQuestions) {
-  if (data.version !== 6 || !Array.isArray(data.default_questions)) throw new Error("请重载插件并刷新页面");
+  if (data.version !== 7 || !data.actions || !Array.isArray(data.default_questions)) {
+    throw new Error("插件版本与页面不匹配，请重载插件后刷新页面");
+  }
   state.defaults = data.default_questions;
-  state.roles = data.roles;
-  state.tools = data.tools;
+  state.catalog = data.actions;
   state.events = data.events;
-  state.effects = data.effects;
+  state.sources = data.candidate_sources || {};
+  state.storedVersion = data.stored_version ?? null;
   const questions = data.decision_questions ?? fallbackQuestions;
   state.saved = {
     mode: data.decision_mode === "random" ? "random" : "model",
@@ -1305,11 +1508,11 @@ function applyConfig(data, fallbackQuestions) {
 function showConfigWarning(text) {
   const box = $("config-warning");
   box.hidden = !text;
-  box.textContent = text ? `当前配置有问题：${text}。修改后保存即可覆盖。` : "";
+  box.textContent = text ? `读取配置时的提示：${text}。检查后保存即可。` : "";
 }
 
 async function loadDecisionConfig() {
-  const data = await bridge.apiGet("decision-config");
+  const data = await bridge.apiGet("decision-config", { version: 7 });
   applyConfig(data);
   showConfigWarning(data.warning);
   setSaveState("clean");
@@ -1324,17 +1527,17 @@ async function saveDecisionConfig() {
     return;
   }
   const payload = {
-    version: 6,
+    version: 7,
     decision_mode: getMode(),
     decision_custom_context: $("custom-context").value,
-    decision_questions: collectQuestionsFromForm(),
+    decision_questions: collectQuestions(),
   };
   state.saving = true;
   setSaveState("saving");
   try {
     const data = await bridge.apiPost("decision-config", payload);
     applyConfig(data, payload.decision_questions);
-    showConfigWarning("");
+    showConfigWarning(data.warning);
     state.saving = false;
     setSaveState("saved");
   } catch (err) {
@@ -1460,7 +1663,7 @@ function renderProbabilityChart(id, answer, isRandom) {
   const rows = probabilityRows(answer, isRandom);
   const title = h("h4", null, id);
   if (!rows.length) {
-    const note = answer?.note === "private_passive_default_reply" ? "私聊固定回复，本题无抽样。" : "未记录可用的概率分布。";
+    const note = answer?.note === "private_passive_default_reply" ? "私聊直接采用固定选项，本题无抽样。" : "未记录可用的概率分布。";
     return h("section", { class: "prob-question" }, title, h("p", { class: "hint" }, note));
   }
   const isBoolean = answer.question_type === "boolean" || !answer.probabilities;
@@ -1486,8 +1689,15 @@ function renderProbabilityChart(id, answer, isRandom) {
   );
 }
 
+function callText(call, statusLabels) {
+  const parts = [toolLabel(call.name)];
+  if (call.when) parts.push(WHEN_LABELS[call.when] || call.when);
+  parts.push(statusLabels[call.status] || call.status);
+  return parts.join(" · ");
+}
+
 function renderLog(item) {
-  const action = normalizeAction(item.action);
+  const action = normalizeLogAction(item.action);
   const isRandom = item.decision_mode === "random";
   const isMixed = item.decision_mode === "mixed";
   const time = splitTime(item.time);
@@ -1497,7 +1707,8 @@ function renderLog(item) {
   const post = item.post_decision;
   const postAnswers = Object.entries(post?.answers || {});
   const calls = item.tool_calls || [];
-  const statusLabels = {planned: item.dry_run ? "试运行" : "未确认执行", executed: "已执行", skipped: "已跳过", failed: "失败", running: "执行中", interrupted: "已中断"};
+  const sources = Array.isArray(item.reply_sources) ? item.reply_sources : [];
+  const statusLabels = { ...TOOL_STATUS, planned: item.dry_run ? "试运行" : "未确认执行" };
 
   const main = h(
     "div",
@@ -1515,69 +1726,78 @@ function renderLog(item) {
     h("span", { class: "log-dur" }, `${item.duration_ms ?? "—"} ms`),
   );
 
-  const sub = answers.length || hints.length || postAnswers.length || calls.length
+  const sub = answers.length || hints.length || postAnswers.length || calls.length || sources.length
     ? h(
-        "div",
-        { class: "log-sub" },
-        answers.map(([key, value]) =>
-          h("span", { class: "tag tag-judge", title: questionText(key) }, h("b", null, key), formatAnswer(value)),
-        ),
-        postAnswers.map(([key, value]) =>
-          h("span", { class: "tag tag-judge tag-post", title: questionText(key) || "会话模型写完回复后判断" },
-            h("small", null, "回复后"), h("b", null, key), formatAnswer(value)),
-        ),
-        hints.length ? h("span", { class: "tag tag-chat" }, `会话提示 ${hints.length} 条`) : null,
-        calls.map(call => h("span", {
-          class: cls("tag tag-tool", `is-${call.status}`),
-          title: [call.sources?.length ? `来源：${call.sources.join("、")}` : "", call.reason].filter(Boolean).join(" · ") || undefined,
-        }, icon("zap"), `${state.tools[call.name] || call.name} · ${statusLabels[call.status] || call.status}`)),
-      )
+      "div",
+      { class: "log-sub" },
+      sources.length > 0 && h("span", { class: "tag tag-chat", title: "调用会话模型发言的选项" },
+        icon("reply"), `发言来源 ${sources.join("、")}`),
+      answers.map(([key, value]) =>
+        h("span", { class: "tag tag-judge", title: questionText(key) }, h("b", null, key), formatAnswer(value)),
+      ),
+      postAnswers.map(([key, value]) =>
+        h("span", { class: "tag tag-judge tag-post", title: questionText(key) || "会话模型写完回复后判断" },
+          h("small", null, "回复后"), h("b", null, key), formatAnswer(value)),
+      ),
+      hints.length ? h("span", { class: "tag tag-chat" }, `会话提示 ${hints.length} 条`) : null,
+      calls.map((call) => h("span", {
+        class: cls("tag tag-tool", `is-${call.status}`),
+        title: [call.sources?.length ? `来源：${call.sources.join("、")}` : "", call.reason].filter(Boolean).join(" · ") || undefined,
+      }, icon("zap"), callText(call, statusLabels))),
+    )
     : null;
 
-  const raw = {...item.raw, ...post?.raw};
+  const raw = { ...item.raw, ...post?.raw };
   const hasRaw = Object.keys(raw).length > 0;
   const postIssues = Object.entries(post?.outcomes || {});
   const outcomes = Object.entries(item.outcomes || {});
-  const reasons = {branch_not_selected:"未命中触发条件", preasked_discarded:"预问后丢弃",
-    not_asked:"当前场景或候选不适用", missing_answer:"缺少答案", below_threshold:"未过阈值",
-    answer_type:"答案类型无效", unknown_option:"未知选项", batch_error:"请求失败"};
+  const reasons = {
+    branch_not_selected: "未命中触发条件", preasked_discarded: "预问后丢弃",
+    not_asked: "当前场景或候选不适用", missing_answer: "缺少答案", below_threshold: "未过阈值",
+    answer_type: "答案类型无效", unknown_option: "未知选项", batch_error: "请求失败",
+  };
   const batches = [...(item.batches || []), ...(post?.batches || [])];
   const detail = Array.isArray(item.batches) || calls.length || hints.length || hasRaw || item.target_message_id || item.degraded || post
     ? h(
-        "details",
-        { class: "log-detail" },
-        h("summary", null, hasRaw ? "查看概率对比与详情" : "查看详情"),
-        Array.isArray(item.batches) && h("section", {class:"prob-question"}, h("h4",null,"判断请求 · " + batches.length + " 次"),
-          batches.map((b,i) => h("p",{class:"log-meta"}, "第 " + (i+1) + " 批 · " + b.duration_ms + " ms · 提问 " + b.asked.join("、"),
-            b.used.length ? " · 采用 " + b.used.join("、") : "", b.discarded.length ? " · 丢弃 " + b.discarded.join("、") : "", b.unanswered?.length ? " · 无有效答案 " + b.unanswered.join("、") : "", b.error || ""))),
-        outcomes.length > 0 && h("p", {class:"log-meta"}, outcomes.map(([id,r]) => id + " · " + (reasons[r] || r)).join("，")),
-        post && (postIssues.length || post.error) && h("section", {class: "prob-question"}, h("h4", null, "回复后判断"),
-          postIssues.map(([id, o]) =>
-            h("p", {class: "log-meta"}, `${id} · ${o.reason || o.status}`)),
-          post.error && h("p", {class: "log-error"}, post.error)),
-        item.target_message_id
-          ? h("p", { class: "log-meta" }, "回复的消息：", h("code", null, item.target_message_id))
-          : null,
-        hints.length ? h("ul", { class: "log-hints" }, hints.map((text) => h("li", null, text))) : null,
-        ...calls.map(call => h("p", {class: "log-meta"}, `${state.tools[call.name] || call.name} · ${statusLabels[call.status] || call.status}`, call.sources?.length ? `（${call.sources.join("、")}）` : "", call.reason ? ` · ${call.reason}` : "")),
-        !hasRaw && item.degraded ? h("p", { class: "hint" }, "判断失败，本轮没有可展示的概率。") : null,
-      )
+      "details",
+      { class: "log-detail" },
+      h("summary", null, hasRaw ? "查看概率对比与详情" : "查看详情"),
+      Array.isArray(item.batches) && h("section", { class: "prob-question" }, h("h4", null, `判断请求 · ${batches.length} 次`),
+        batches.map((b, i) => h("p", { class: "log-meta" }, `第 ${i + 1} 批 · ${b.duration_ms} ms · 提问 ${b.asked.join("、")}`,
+          b.used?.length ? ` · 采用 ${b.used.join("、")}` : "",
+          b.discarded?.length ? [" · 丢弃 ", b.discarded.map((id, j) => [j ? "、" : "", h("s", null, id)])] : "",
+          b.unanswered?.length ? ` · 无有效答案 ${b.unanswered.join("、")}` : "", b.error || ""))),
+      outcomes.length > 0 && h("p", { class: "log-meta" }, outcomes.map(([id, r]) => `${id} · ${reasons[r] || r}`).join("，")),
+      post && (postIssues.length || post.error) && h("section", { class: "prob-question" }, h("h4", null, "回复后判断"),
+        postIssues.map(([id, o]) =>
+          h("p", { class: "log-meta" }, `${id} · ${o.reason || o.status}`)),
+        post.error && h("p", { class: "log-error" }, post.error)),
+      item.target_message_id
+        ? h("p", { class: "log-meta" }, "引用的消息：", h("code", null, item.target_message_id))
+        : null,
+      hints.length ? h("ul", { class: "log-hints" }, hints.map((text) => h("li", null, text))) : null,
+      ...calls.map((call) => h("p", { class: "log-meta" }, callText(call, statusLabels),
+        call.sources?.length ? `（${call.sources.join("、")}）` : "", call.reason ? ` · ${call.reason}` : "")),
+      !hasRaw && item.degraded ? h("p", { class: "hint" }, "判断失败，本轮没有可展示的概率。") : null,
+    )
     : null;
 
-  if (hasRaw) detail.addEventListener("toggle", function showCharts() {
-    if (!detail.open) return;
-    detail.removeEventListener("toggle", showCharts);
-    detail.append(
-      h("p", { class: "hint" }, isRandom
-        ? "等权基准表示每个候选的初始机会相同。加权后即为实际抽中概率。"
-        : "加权后按本轮选项权重归一化，温度在此后生效。"),
-      ...Object.entries(raw).map(([id, answer]) => renderProbabilityChart(
-        id, answer, isRandom || answer?.decision_mode === "random",
-      )),
-      h("details", { class: "prob-raw" }, h("summary", null, "查看原始数据"),
-        h("pre", { class: "log-raw" }, JSON.stringify(raw, null, 2))),
-    );
-  });
+  if (hasRaw) {
+    detail.addEventListener("toggle", function showCharts() {
+      if (!detail.open) return;
+      detail.removeEventListener("toggle", showCharts);
+      detail.append(
+        h("p", { class: "hint" }, isRandom
+          ? "等权基准表示每个候选的初始机会相同。加权后即为实际抽中概率。"
+          : "加权后按本轮选项权重归一化，温度在此后生效。"),
+        ...Object.entries(raw).map(([id, answer]) => renderProbabilityChart(
+          id, answer, isRandom || answer?.decision_mode === "random",
+        )),
+        h("details", { class: "prob-raw" }, h("summary", null, "查看原始数据"),
+          h("pre", { class: "log-raw" }, JSON.stringify(raw, null, 2))),
+      );
+    });
+  }
 
   return h(
     "li",
@@ -1606,19 +1826,20 @@ function logHasIssue(item) {
 
 const LOG_FILTERS = {
   all: () => true,
-  speak: (item) => !logHasIssue(item) && ["reply", "proactive"].includes(normalizeAction(item.action)),
-  silent: (item) => !logHasIssue(item) && normalizeAction(item.action) === "none",
+  speak: (item) => !logHasIssue(item) && ["reply", "proactive"].includes(normalizeLogAction(item.action)),
+  silent: (item) => !logHasIssue(item) && normalizeLogAction(item.action) === "none",
   issue: logHasIssue,
 };
 
 function logSearchText(item) {
   const answers = { ...(item.answers || item.custom_answers), ...item.post_decision?.answers };
   return [
-    item.umo, SCENE_LABELS[item.scene], ACTION_LABELS[normalizeAction(item.action)], item.meme_id,
+    item.umo, SCENE_LABELS[item.scene], ACTION_LABELS[normalizeLogAction(item.action)], item.meme_id,
     item.error, item.post_decision?.error, item.target_message_id,
     ...Object.entries(answers).flatMap(([key, value]) => [key, formatAnswer(value), `${key}=${formatAnswer(value)}`]),
     ...(item.session_hints || []),
-    ...(item.tool_calls || []).map((call) => state.tools[call.name] || call.name),
+    ...(item.reply_sources || []),
+    ...(item.tool_calls || []).map((call) => toolLabel(call.name)),
   ].filter(Boolean).join(" ").toLowerCase();
 }
 
@@ -1750,13 +1971,13 @@ function onRestoreDefault() {
   setQuestions(state.defaults);
   rebindBaseline();
   state.open.clear();
-  renderQuestions();
+  refreshEditor();
   if (isDirty()) setSaveState("dirty", "已换成默认问题，保存后生效");
   else setSaveState("clean");
 }
 
 function onToggleAll() {
-  const allOpen = state.questions.every(q => state.open.has(q));
+  const allOpen = state.questions.every((q) => state.open.has(q));
   state.open = allOpen ? new Set() : new Set(state.questions);
   renderQuestions();
 }
@@ -1798,8 +2019,8 @@ for (const item of document.querySelectorAll("#add-menu [data-template]")) {
   item.addEventListener("click", () => onAddQuestion(item.dataset.template));
 }
 for (const input of document.querySelectorAll('input[name="decision-mode"]')) {
-  // 随机模式下显示各答案的抽中比例，切换模式时重画问题。
-  input.addEventListener("change", () => renderQuestions());
+  // 随机模式下显示各答案的抽中比例和提问时机，切换模式时重画问题。
+  input.addEventListener("change", () => refreshEditor());
 }
 
 // 点击菜单外或按 Esc 时收起「添加问题」菜单。
@@ -1823,13 +2044,19 @@ for (const type of ["input", "change"]) {
   $("panel-decision").addEventListener(type, (event) => {
     event.target.classList?.remove("is-invalid");
     autosize(event.target);
+    if (event.target.closest("#preview-fields")) return;
     updateDirty();
     if (event.target.closest("#questions")) {
+      // 改名会影响其他卡片里的下拉选项，重画不含输入框的卡片；正在输入的卡片保持不动。
       if (type === "input" && ["id", "opt-id"].includes(event.target.dataset.field)) {
-        for (const row of $("questions").querySelectorAll(".q-triggers")) {
-          row.replaceWith(renderTriggers(state.questions[Number(row.closest(".question").dataset.q)]));
+        const editing = event.target.closest(".question");
+        for (const card of $("questions").querySelectorAll(".question[data-q]")) {
+          if (card === editing) continue;
+          const index = Number(card.dataset.q);
+          card.replaceWith(renderQuestion(state.questions[index], index));
         }
       }
+      markPreviewStale();
       renderFlow();
       refreshEntries();
       renderStats();
