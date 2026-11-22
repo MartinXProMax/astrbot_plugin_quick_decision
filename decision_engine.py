@@ -305,10 +305,11 @@ def _question_info(context, umo, scene, last_activity, clock=None):
 
 
 def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
-                 context=None, umo="", last_activity=None, stage="pre_reply", clock=None):
+                 context=None, umo="", last_activity=None, stage="pre_reply", clock=None,
+                 trigger_event="", timer_roots=None):
     specs = []
     info = None
-    event = "silence_elapsed" if scene.endswith("_proactive") else "message_received"
+    event = trigger_event or ("silence_elapsed" if scene.endswith("_proactive") else "message_received")
     candidates = {m.message_id: m for m in messages[-8:] if m.role == "user" and m.message_id}
     configured, _ = migrate_actions(configured)
     available = {"recent_messages": bool(candidates if targets is None else targets), "memes": bool(memes)}
@@ -329,6 +330,8 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
                    for t in item.triggers if "question" in t and in_scene]
         root_event = "reply_generated" if item.stage == "post_reply" else event
         root = in_scene and any(t.get("event") == root_event for t in item.triggers)
+        if root_event == "timer_elapsed" and timer_roots is not None:
+            root = root and item.id in timer_roots
         if not in_scene and all("event" in t for t in item.triggers):
             continue
         fixed = item.private_default if scene == "private_passive" else ""
@@ -535,11 +538,12 @@ def _activate_post(specs, outcomes, post_specs):
     return any(s.is_root for s in post_specs)
 
 
-def preview_workflow(settings, scene, choices):
+def preview_workflow(settings, scene, choices, *, trigger_event=""):
     """以示例候选和用户指定的有效答案预览，不调用提供商或工具。"""
     message = BufferedMessage("sample_message", "user", "示例用户", "user", "示例消息")
     specs = _build_specs(settings.decision_questions, scene, [message],
-                         [{"id": "sample_meme", "description": "示例表情"}], settings, stage=None)
+                         [{"id": "sample_meme", "description": "示例表情"}], settings, stage=None,
+                         trigger_event=trigger_event)
     assumed = {}
     for spec in specs:
         if spec.question is None:
@@ -734,6 +738,8 @@ async def ask_decision(
     memes: list[dict[str, str]],
     umo: str = "",
     last_activity: float | None = None,
+    trigger_event: str = "",
+    timer_roots: set[str] | None = None,
 ) -> DecisionResult:
     """按当前模式评估本轮问题。失败时返回带 error 的结果。"""
     started = time.monotonic()
@@ -749,6 +755,7 @@ async def ask_decision(
         all_specs = _build_specs(
             settings.decision_questions, scene, messages, memes, settings,
             context=context, umo=umo, last_activity=last_activity, stage=None, clock=clock,
+            trigger_event=trigger_event, timer_roots=timer_roots,
         )
         specs = [s for s in all_specs if s.stage == "pre_reply"]
         post_specs = [s for s in all_specs if s.stage == "post_reply"]
@@ -762,6 +769,8 @@ async def ask_decision(
                 custom_context=settings.decision_custom_context,
                 clock=clock,
             )
+            if trigger_event == "timer_elapsed":
+                state["trigger_event"] = trigger_event
         provider_id = settings.decision_provider_id
         await _run_workflow(context, specs, outcomes, batches, state, provider_id)
         result = _assemble_result(specs, outcomes, scene=scene)
@@ -784,6 +793,7 @@ async def ask_decision(
             outcomes=outcomes,
         )
     result.batches = batches
+    result.trigger_event = trigger_event or ("silence_elapsed" if scene.endswith("_proactive") else "message_received")
     result.duration_ms = int((time.monotonic() - started) * 1000)
     result.dry_run = settings.dry_run
     result.target_quote_mode = quote_mode

@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import math
+import re
 from graphlib import CycleError, TopologicalSorter
 from typing import Any
 
@@ -620,7 +621,17 @@ def _validate_triggers(questions, action_format=False):
             if "event" in t:
                 event = t["event"]
                 events = WORKFLOW_EVENTS if action_format else EVENTS
-                if set(t) - {"event", "ask_with_parent"} or not isinstance(event, str) or event not in events:
+                allowed = {"event", "ask_with_parent"}
+                if event == "timer_elapsed" and action_format:
+                    allowed |= {"interval_seconds", "daily_time"}
+                    interval, daily = t.get("interval_seconds"), t.get("daily_time")
+                    if ("interval_seconds" in t) == ("daily_time" in t):
+                        return f"问题 {q.id} 的定时触发须选择固定间隔或每日时刻"
+                    if "interval_seconds" in t and (type(interval) is not int or not 15 <= interval <= 2147483647):
+                        return f"问题 {q.id} 的定时间隔须为 15～2147483647 秒的整数"
+                    if "daily_time" in t and (not isinstance(daily, str) or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", daily)):
+                        return f"问题 {q.id} 的每日时刻须为 HH:MM（00:00～23:59）"
+                if set(t) - allowed or not isinstance(event, str) or event not in events:
                     return f"问题 {q.id} 的事件无效"
                 if action_format and (early or (event == "reply_generated") != (q.stage == "post_reply")):
                     return f"问题 {q.id} 的事件与判断阶段或提问时机不符"

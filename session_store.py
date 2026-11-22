@@ -23,6 +23,7 @@ class SessionRuntime:
     last_user_ts: float = 0.0
     last_bot_ts: float = 0.0
     silence_evaluated_at_user_ts: float = 0.0
+    timer_due: dict[tuple, float] = field(default_factory=dict)
     proactive_times: deque[float] = field(default_factory=deque)
     last_decision: DecisionResult | None = None
     pending_pipeline: DecisionResult | None = None
@@ -60,7 +61,7 @@ class SessionStore:
         return list(self._sessions.values())
 
     def prune_idle(self, max_idle_seconds: int = 86400) -> int:
-        """丢弃一天没有活动且没有进行中任务的会话，限制长期运行时的内存。"""
+        """丢弃一天没有活动且没有进行中任务或定时订阅的会话。"""
         cutoff = time.time() - max(max_idle_seconds, 1)
         removed = 0
         for umo, runtime in list(self._sessions.items()):
@@ -69,6 +70,7 @@ class SessionStore:
                 runtime.deciding
                 or runtime.pending_pipeline is not None
                 or runtime.pending
+                or runtime.timer_due
                 or (lock is not None and lock.locked())
             ):
                 continue

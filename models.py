@@ -233,6 +233,7 @@ class DecisionResult:
     use_meme: bool = False
     meme_id: str | None = None
     scene: SceneType = "group_passive"
+    trigger_event: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
     custom_answers: dict[str, Any] = field(default_factory=dict)
     session_hints: list[str] = field(default_factory=list)

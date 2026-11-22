@@ -98,11 +98,15 @@ class WebApiMixin:
         version = payload.get("version", 6)
         if version not in (6, 7):
             return error_response("预览配置版本无效", status_code=400)
+        trigger_event = payload.get("trigger_event", "")
+        allowed_events = ("silence_elapsed", "timer_elapsed") if payload["scene"].endswith("_proactive") else ("message_received",)
+        if not isinstance(trigger_event, str) or (trigger_event and trigger_event not in allowed_events):
+            return error_response("触发事件与预览场景不匹配", status_code=400)
         settings.decision_questions, error = load_questions(
             {"version": 5 if version == 7 else 4, "questions": payload.get("decision_questions")}, strict=True)
         if error:
             return error_response(error, status_code=400)
-        return json_response(preview_workflow(settings, payload["scene"], choices))
+        return json_response(preview_workflow(settings, payload["scene"], choices, trigger_event=trigger_event))
 
     async def web_decision_config(self):
         if request.method == "GET":

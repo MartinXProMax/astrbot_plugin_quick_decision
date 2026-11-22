@@ -5,6 +5,7 @@ from copy import deepcopy
 
 WORKFLOW_EVENTS = {
     "message_received": "收到消息", "silence_elapsed": "达到冷场时长",
+    "timer_elapsed": "定时触发",
     "reply_generated": "本轮正文生成完成",
 }
 SOURCES = {"options": "固定选项", "recent_messages": "最近用户消息", "memes": "图库表情"}

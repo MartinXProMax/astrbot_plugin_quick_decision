@@ -7,11 +7,12 @@ export const SCENE_KEYS = ["group_passive", "private_passive", "group_proactive"
 export const EVENT_SCENES = {
   message_received: ["group_passive", "private_passive"],
   silence_elapsed: ["group_proactive", "private_proactive"],
+  timer_elapsed: ["group_proactive", "private_proactive"],
   reply_generated: SCENE_KEYS,
 };
 
 export const POST_EVENT = "reply_generated";
-const PRE_EVENTS = new Set(["message_received", "silence_elapsed"]);
+const PRE_EVENTS = new Set(["message_received", "silence_elapsed", "timer_elapsed"]);
 
 // 与后端 send_meme 的缺省时机一致，省略 when 即为判断后立即发送。
 const DEFAULT_WHEN = "on_match";
@@ -98,7 +99,7 @@ export function normalizeQuestions(rawList) {
   questions.forEach((q, index) => {
     const raw = list[index] || {};
     q.triggers = (Array.isArray(raw.triggers) ? raw.triggers : []).flatMap((t) => {
-      if (typeof t?.event === "string") return [{ event: t.event }];
+      if (typeof t?.event === "string") return [{ ...t }];
       const parent = byId.get(t?.question);
       const option = parent ? findSlot(parent, String(t?.option)) : null;
       return option ? [{ parent, option, ask_with_parent: !!t.ask_with_parent }] : [];
@@ -159,7 +160,7 @@ export function serializeQuestion(q) {
     data.false_weight = q.sides.false.weight;
   }
   data.triggers = q.triggers.map((t) => t.event
-    ? { event: t.event }
+    ? { ...t }
     : { question: t.parent.id.trim(), option: keyOf(t.option), ...(t.ask_with_parent ? { ask_with_parent: true } : {}) });
   data.actions = {};
   for (const ref of slotsOf(q)) {
@@ -359,6 +360,13 @@ export function questionIssues(q, questions, catalog, labelOf = keyOf) {
     if (seenTriggers.has(key)) issues.push({ t: i, field: "trigger", message: `${name}有重复的触发来源` });
     seenTriggers.add(key);
     if (t.event) {
+      if (t.event === "timer_elapsed") {
+        const interval = Object.hasOwn(t, "interval_seconds"), daily = Object.hasOwn(t, "daily_time");
+        if (interval === daily || (interval && (!Number.isInteger(t.interval_seconds) || t.interval_seconds < 15 || t.interval_seconds > 2147483647))
+          || (daily && (typeof t.daily_time !== "string" || t.daily_time.length !== 5 || !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(t.daily_time)))) {
+          issues.push({ t: i, field: "trigger", message: `${name}的定时触发需要 15～2147483647 秒的整数间隔，或 HH:MM 格式的每日时刻` });
+        }
+      }
       if (!eventAllowed(q, t.event)) {
         issues.push({ t: i, field: "trigger", message: q.stage === "post_reply"
           ? `${name}在正文生成后提问，事件只能选「本轮正文生成完成」`
@@ -632,8 +640,9 @@ export function roots(questions, event) {
 }
 
 // 试算可设定答案的题：在该场景下可能被提问的启用题。
-export function questionsForScene(questions, scene) {
-  return questions.filter((q) => q.enabled && possibleScenes(q).has(scene));
+export function questionsForScene(questions, scene, event = "") {
+  const live = event ? reachable(questions, [...roots(questions, event), ...roots(questions, POST_EVENT)]) : null;
+  return questions.filter((q) => q.enabled && possibleScenes(q).has(scene) && (!live || live.has(q)));
 }
 
 // ---------- 模板 ----------

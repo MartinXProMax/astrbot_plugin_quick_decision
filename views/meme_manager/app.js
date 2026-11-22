@@ -6,15 +6,15 @@ const bridge = window.AstrBotPluginView;
 const SCENE_LABELS = {
   group_passive: "群聊",
   private_passive: "私聊",
-  group_proactive: "群聊冷场",
-  private_proactive: "私聊冷场",
+  group_proactive: "群聊主动",
+  private_proactive: "私聊主动",
 };
 
 const PREVIEW_SCENES = {
   group_passive: "群聊收到消息",
   private_passive: "私聊收到消息",
-  group_proactive: "群聊冷场",
-  private_proactive: "私聊冷场",
+  group_proactive: "群聊主动判断",
+  private_proactive: "私聊主动判断",
 };
 
 const ACTION_LABELS = {
@@ -189,7 +189,7 @@ const state = {
   // 读到的配置里每道题的序列化结果，用来标出新增和修改过的题。
   baseline: new Map(),
   baselineOrder: [],
-  preview: { scene: "group_passive", choices: new WeakMap(), result: null, stale: false, revision: 0 },
+  preview: { scene: "group_passive", trigger_event: "silence_elapsed", choices: new WeakMap(), result: null, stale: false, revision: 0 },
   logs: [],
   logFilter: "all",
 };
@@ -370,6 +370,7 @@ function toolLabel(name) {
 }
 
 function triggerLabel(t) {
+  if (t.event === "timer_elapsed") return t.daily_time !== undefined ? `每天 ${t.daily_time}` : `每 ${t.interval_seconds} 秒`;
   return t.event ? state.events[t.event] || t.event : `${qName(t.parent)} 选「${slotLabel(t.parent, t.option)}」`;
 }
 
@@ -556,7 +557,8 @@ function markPreviewStale() {
 function previewFields() {
   const fields = $("preview-fields");
   const scene = state.preview.scene;
-  const list = wf.questionsForScene(state.questions, scene);
+  const event = scene.endsWith("_proactive") ? state.preview.trigger_event : "message_received";
+  const list = wf.questionsForScene(state.questions, scene, event);
   const selects = list.map((q) => {
     const slots = wf.slotsOf(q).filter((ref) => ref.weight > 0);
     if (!slots.length) return null;
@@ -570,15 +572,20 @@ function previewFields() {
       markPreviewStale();
     });
   });
-  fields.replaceChildren(
+  fields.replaceChildren(...[
     fieldSelect("场景", PREVIEW_SCENES, scene, (value) => {
       state.preview.scene = value;
       markPreviewStale();
       previewFields();
     }),
+    scene.endsWith("_proactive") && fieldSelect("触发事件", { silence_elapsed: "达到冷场时长", timer_elapsed: "定时到期（预览全部定时入口）" }, event, (value) => {
+      state.preview.trigger_event = value;
+      markPreviewStale();
+      previewFields();
+    }),
     ...selects,
     !list.length && h("p", { class: "hint" }, "这个场景下没有会被提问的题。"),
-  );
+  ].filter(Boolean));
 }
 
 function formatSource(text) {
@@ -653,10 +660,12 @@ async function runPreview() {
   }
   box.replaceChildren(h("p", { class: "hint" }, "正在试算…"));
   try {
-    const list = wf.questionsForScene(state.questions, state.preview.scene);
+    const event = state.preview.scene.endsWith("_proactive") ? state.preview.trigger_event : "message_received";
+    const list = wf.questionsForScene(state.questions, state.preview.scene, event);
     const data = await bridge.apiPost("decision-preview", {
       version: 7,
       scene: state.preview.scene,
+      trigger_event: event,
       decision_mode: getMode(),
       decision_questions: collectQuestions(),
       answers: Object.fromEntries(list.filter((q) => state.preview.choices.has(q))
@@ -893,7 +902,8 @@ function triggerChoices(q, current) {
   const list = [];
   for (const [event, label] of Object.entries(state.events)) {
     if (!wf.eventAllowed(q, event) || used.has(`event:${event}`)) continue;
-    list.push({ group: "事件", label, match: (t) => t.event === event, make: () => ({ event }) });
+    list.push({ group: "事件", label, match: (t) => t.event === event,
+      make: () => ({ event, ...(event === "timer_elapsed" ? { interval_seconds: 600 } : {}) }) });
   }
   for (const parent of state.questions) {
     if (parent === q || (parent.stage === "post_reply" && q.stage === "pre_reply")) continue;
@@ -928,6 +938,29 @@ function renderWhen(q, qIndex) {
       refreshEditor(`[data-q="${qIndex}"] [data-t="${i}"] select`);
     }, { field: "trigger" });
     let timing = null;
+    if (t.event === "timer_elapsed") {
+      const daily = t.daily_time !== undefined;
+      timing = h("div", { class: "timer-fields" },
+        segmented("定时方式", [["interval", "固定间隔"], ["daily", "每天"]], daily ? "daily" : "interval", (mode) => {
+          delete t.interval_seconds;
+          delete t.daily_time;
+          Object.assign(t, mode === "daily" ? { daily_time: "08:00" } : { interval_seconds: 600 });
+          refreshEditor();
+        }),
+        h("label", { class: "inline-field" }, daily ? "时刻" : "每",
+          h("input", {
+            type: daily ? "time" : "number", min: daily ? undefined : 15, max: daily ? undefined : 2147483647,
+            step: daily ? 60 : 1, value: daily ? t.daily_time : t.interval_seconds,
+            "aria-label": daily ? "每日触发时刻" : "定时间隔（秒）", dataset: { field: "trigger" },
+            oninput: (e) => {
+              if (daily) t.daily_time = e.target.value;
+              else t.interval_seconds = e.target.valueAsNumber;
+              updateDirty();
+              markPreviewStale();
+            },
+            onchange: () => refreshEditor(),
+          }), daily ? "" : "秒"));
+    }
     if (t.parent) {
       if (t.parent.stage !== q.stage) timing = h("span", { class: "note-inline" }, "需等正文生成，命中后再问");
       else if (random) timing = h("span", { class: "note-inline" }, "本地随机，无需等批");
@@ -974,7 +1007,9 @@ function renderWhen(q, qIndex) {
         rows,
         h("div", { class: "trigger-foot" }, addTrigger,
           q.triggers.length > 1 && h("small", { class: "hint" }, "任一来源命中即提问，同一轮只问一次。"),
-          q.triggers.some((t) => t.ask_with_parent) && h("small", { class: "hint" }, "同批只是提前问，上游命中后才采用答案。"))),
+          q.triggers.some((t) => t.ask_with_parent) && h("small", { class: "hint" }, "同批只是提前问，上游命中后才采用答案。")),
+        q.triggers.some((t) => t.event === "timer_elapsed") && h("small", { class: "hint" },
+          "定时仅作用于插件已收到过消息的会话；每天按 AstrBot 会话时区执行，未配置时用服务器时区。约每 15 秒检查一次，重启后重新计时。")),
       h("span", { class: "field-label" }, "限定"),
       h("div", { class: "when-limits" },
         sceneChips,
@@ -1443,7 +1478,7 @@ function insertQuestion(question, index) {
 
 function addEntry(event) {
   const q = wf.templateQuestion(event === wf.POST_EVENT ? "post" : "boolean", state.questions);
-  q.triggers = [{ event }];
+  q.triggers = [{ event, ...(event === "timer_elapsed" ? { interval_seconds: 600 } : {}) }];
   insertQuestion(q, state.questions.length);
 }
 
@@ -1714,7 +1749,7 @@ function renderLog(item) {
     "div",
     { class: "log-main" },
     h("span", { class: "log-action" }, ACTION_LABELS[action] || item.action || "未知"),
-    h("span", { class: "tag" }, SCENE_LABELS[item.scene] || item.scene || "未知场景"),
+    h("span", { class: "tag" }, item.trigger_event === "timer_elapsed" ? `${SCENE_LABELS[item.scene]} · 定时` : SCENE_LABELS[item.scene] || item.scene || "未知场景"),
     isRandom ? h("span", { class: "tag" }, "纯随机") : null,
     isMixed ? h("span", { class: "tag" }, "混合决策") : null,
     item.use_meme

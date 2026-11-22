@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import asdict
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from astrbot.api import AstrBotConfig, logger
@@ -15,7 +16,7 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
 from .config_util import PluginSettings
-from .decision_engine import ask_decision, evaluate_post_reply
+from .decision_engine import _round_clock, ask_decision, evaluate_post_reply
 from .decision_tools import run_tools, skip_tools
 from .event_utils import (
     event_has_command_handler,
@@ -57,6 +58,16 @@ from .session_store import SessionStore
 from .web_api import WebApiMixin
 
 PLUGIN_NAME = "astrbot_plugin_quick_decision"
+
+
+def _next_timer_at(trigger, now, zone):
+    if "interval_seconds" in trigger:
+        return now + trigger["interval_seconds"]
+    hour, minute = map(int, trigger["daily_time"].split(":"))
+    next_time = datetime.fromtimestamp(now, zone).replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if next_time.timestamp() <= now:
+        next_time += timedelta(days=1)
+    return next_time.timestamp()
 
 
 class QuickDecisionPlugin(Star, WebApiMixin):
@@ -404,6 +415,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "umo": profile.umo,
                 "scene": result.scene,
+                "trigger_event": result.trigger_event,
                 "decision_mode": result.decision_mode,
                 "action": result.action,
                 "reply_sources": result.reply_sources,
@@ -422,17 +434,52 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             }
         )
 
-    # --- 冷场主动发言 ---
+    # --- 定时判断与冷场主动发言 ---
 
     async def _silence_loop(self) -> None:
         while True:
             try:
                 await asyncio.sleep(15)
+                await self._check_timers()
                 await self._check_silence()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
-                logger.exception("检查冷场主动发言时出错")
+                logger.exception("检查定时判断或冷场主动发言时出错")
+
+    async def _check_timers(self) -> None:
+        settings = self.settings
+        if not settings.enabled:
+            return
+        for runtime in self.sessions.all_sessions():
+            scene = "private_proactive" if runtime.profile.is_private else "group_proactive"
+            timers = {
+                (q.id, t.get("interval_seconds"), t.get("daily_time")): t
+                for q in settings.decision_questions
+                if q.enabled and q.stage == "pre_reply" and (not q.scenes or scene in q.scenes)
+                for t in q.triggers or [] if t.get("event") == "timer_elapsed"
+            }
+            runtime.timer_due = {key: due for key, due in runtime.timer_due.items() if key in timers}
+            if not timers or not runtime.last_user_ts:
+                continue
+            now, zone = _round_clock(self.context, runtime.profile.umo)
+            for key, trigger in timers.items():
+                if key not in runtime.timer_due:
+                    runtime.timer_due[key] = _next_timer_at(trigger, now, zone)
+            if is_official_pipeline_busy(runtime):
+                continue
+            due = {key for key, deadline in runtime.timer_due.items() if deadline <= now}
+            if not due:
+                continue
+            for key in due:
+                runtime.timer_due[key] = _next_timer_at(timers[key], now, zone)
+            runtime.deciding = True
+            try:
+                await self._run_proactive(runtime, timer_roots={key[0] for key in due})
+            except Exception:  # noqa: BLE001
+                logger.exception("定时判断失败：%s", runtime.profile.umo)
+            finally:
+                runtime.deciding = False
 
     async def _check_silence(self) -> None:
         settings = self.settings
@@ -454,10 +501,12 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             finally:
                 runtime.deciding = False
 
-    async def _run_proactive(self, runtime) -> None:
+    async def _run_proactive(self, runtime, *, timer_roots=None) -> None:
         profile: SessionProfile = runtime.profile
         settings = self.settings
-        self.sessions.mark_silence_evaluated(profile.umo)
+        scheduled = timer_roots is not None
+        if not scheduled:
+            self.sessions.mark_silence_evaluated(profile.umo)
         scene: SceneType = (
             "private_proactive" if profile.is_private else "group_proactive"
         )
@@ -474,21 +523,23 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             memes=self._meme_candidates(settings),
             umo=profile.umo,
             last_activity=runtime.last_activity,
+            trigger_event="timer_elapsed" if scheduled else "silence_elapsed",
+            timer_roots=timer_roots,
         )
         result.dry_run = settings.dry_run
         runtime.last_decision = result
         if not settings.dry_run and not result.failed:
             await run_tools(self.context, umo=profile.umo, resolver=self.meme_adapter, decision=result, when="on_match")
-        limited = (not settings.proactive_enabled(profile.is_private)
+        limited = ((not scheduled and not settings.proactive_enabled(profile.is_private))
                    or self.sessions.in_cooldown(profile.umo, settings.cooldown_seconds)
                    or not self.sessions.can_proactive(profile.umo, settings.hourly_proactive_limit(profile.is_private)))
         if limited:
-            skip_tools(result, "冷场发言已关闭、冷却中或已达次数上限", when="after_send")
+            skip_tools(result, "主动发言已关闭、冷却中或已达次数上限", when="after_send")
         await self._log_decision(profile, result)
         if limited or result.failed or result.action != "proactive":
             return
         if settings.dry_run:
-            logger.info("试运行：冷场判断为可以主动开口，但不会发送：%s", profile.umo)
+            logger.info("试运行：主动判断为可以开口，但不会发送：%s", profile.umo)
             return
         try:
             await self._self_generate_and_send(profile, result, None)

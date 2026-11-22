@@ -2695,6 +2695,17 @@ textarea.is-invalid {
   padding-block: 5px;
 }
 
+.timer-fields {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.timer-fields input {
+  width: 7em;
+}
+
 .trigger-foot {
   display: flex;
   flex-wrap: wrap;
@@ -3074,7 +3085,7 @@ textarea.is-invalid {
     grid-template-columns: minmax(0, 1fr) 32px;
   }
 
-  .trigger-row > :is(.seg, .note-inline) {
+  .trigger-row > :is(.seg, .note-inline, .timer-fields) {
     grid-row: 2;
     grid-column: 1 / -1;
   }

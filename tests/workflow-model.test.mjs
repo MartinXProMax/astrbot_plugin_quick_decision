@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   actionAvailability, changeSource, changeStage, changeType, deleteOption, deleteQuestion, findSlot,
-  normalizeQuestions, possibleScenes, questionIssues, replySources, roots, runChange, serializeQuestion,
+  normalizeQuestions, possibleScenes, questionIssues, questionsForScene, replySources, roots, runChange, serializeQuestion,
   sourceChoices, templateQuestion, validate, wouldCycle,
 } from "../views/meme_manager/workflow-model.mjs";
 
@@ -20,6 +20,41 @@ const CATALOG = {
 const base = (id, fields) => ({ id, enabled: true, instructions: id, use_threshold: false, actions: {}, ...fields });
 const yesNo = { type: "boolean", true_weight: 1, false_weight: 1 };
 const options = (...ids) => ({ type: "choice", options: ids.map((id) => ({ id, criteria: id, weight: 1 })) });
+
+test("两种定时触发可读写，副本修改不影响原题，切换阶段移除定时参数", () => {
+  for (const schedule of [{ interval_seconds: 600 }, { daily_time: "08:00" }]) {
+    const trigger = { event: "timer_elapsed", ...schedule };
+    const raw = base("timer", { ...yesNo, triggers: [trigger] });
+    const questions = normalizeQuestions([raw]);
+    const q = questions[0];
+    assert.deepEqual(serializeQuestion(q).triggers, [trigger]);
+    assert.equal(validate(questions, CATALOG), null);
+    assert.deepEqual([...possibleScenes(q)], ["group_proactive", "private_proactive"]);
+    q.triggers[0].daily_time = "09:00";
+    assert.deepEqual(raw.triggers, [trigger]);
+    runChange(questions, CATALOG, changeStage(q, "post_reply"));
+    assert.deepEqual(serializeQuestion(q).triggers, [{ event: "reply_generated" }]);
+  }
+});
+
+test("定时参数缺失、冲突、非法间隔或时刻均定位到触发来源", () => {
+  for (const schedule of [{}, { interval_seconds: 14 }, { interval_seconds: true }, { interval_seconds: 15.5 },
+    { interval_seconds: 2147483648 }, { daily_time: "24:00" }, { daily_time: "8:00" }, { daily_time: "08:60" },
+    { daily_time: "08:00\n" }, { daily_time: null }, { interval_seconds: 60, daily_time: "08:00" }]) {
+    const questions = normalizeQuestions([base("timer", { ...yesNo, triggers: [{ event: "timer_elapsed", ...schedule }] })]);
+    assert.equal(validate(questions, CATALOG)?.field, "trigger");
+  }
+});
+
+test("定时预览包含定时入口及后继，与冷场入口分开", () => {
+  const questions = normalizeQuestions([
+    base("timer", { ...yesNo, triggers: [{ event: "timer_elapsed", interval_seconds: 600 }] }),
+    base("child", { ...yesNo, triggers: [{ question: "timer", option: "true" }] }),
+    base("idle", { ...yesNo, triggers: [{ event: "silence_elapsed" }] }),
+  ]);
+  assert.deepEqual(questionsForScene(questions, "group_proactive", "timer_elapsed").map((q) => q.id), ["timer", "child"]);
+  assert.deepEqual(questionsForScene(questions, "private_proactive", "silence_elapsed").map((q) => q.id), ["idle"]);
+});
 
 // 设计文档「用界面从空配置重建」里的 A–E，加上冷场入口和篇幅题。
 const GRAPH = [

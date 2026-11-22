@@ -391,7 +391,9 @@ async def generate_text(
     )
     prompt = user_prompt.strip() or "请根据当前对话自然地回复。"
     if decision.scene in {"group_proactive", "private_proactive"}:
-        prompt = "会话已经沉默一段时间，请结合上下文主动开一个自然的话题或打个招呼。"
+        prompt = ("本轮由定时任务触发，请结合当前时间、会话上下文和判断提示自然地发言。"
+                  if decision.trigger_event == "timer_elapsed" else
+                  "会话已经沉默一段时间，请结合上下文主动开一个自然的话题或打个招呼。")
     response = await context.llm_generate(
         chat_provider_id=provider_id,
         prompt=prompt,
