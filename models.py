@@ -194,6 +194,10 @@ class DecisionQuestion:
             else:
                 for key in ("true_tool", "false_tool", "true_session_hint", "false_session_hint"):
                     data.pop(key)
+        if self.candidate_source != "options":
+            data["candidate_source"] = self.candidate_source
+        if self.requires_candidates:
+            data["requires_candidates"] = self.requires_candidates
         return data
 
 

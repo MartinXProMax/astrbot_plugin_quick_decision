@@ -80,6 +80,34 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
             else [{"id": "cat", "description": "微笑"}],
         )
 
+    async def test_default_meme_flow_selects_category_before_image(self):
+        settings = PluginSettings({})
+        service = AsyncMock(side_effect=[
+            {
+                "action": choice("reply", reply=1),
+                "use_meme": DecisionBooleanAnswer(probability=1),
+            },
+            {
+                "meme_category": choice("pack-a/imported", **{"pack-a/imported": 1}),
+            },
+            {"meme_id": choice("cat", cat=1)},
+        ])
+        result = await self.ask(
+            SimpleNamespace(ask=service),
+            settings=settings,
+            memes=[
+                {"id": "cat", "description": "微笑", "category": "pack-a/imported"},
+                {"id": "dog", "description": "哭", "category": "pack-a/other"},
+            ],
+        )
+        asked = [list(call.args[0]) for call in service.await_args_list]
+        self.assertEqual(asked[-2:], [["meme_category"], ["meme_id"]])
+        self.assertEqual(result.meme_id, "cat")
+        self.assertEqual(
+            list(service.await_args_list[-1].args[0]["meme_id"].criteria),
+            ["none", "cat"],
+        )
+
     def test_on_match_action_probe_only_keeps_immediate_meme_tools(self):
         settings = PluginSettings({"decision_questions": {"version": 5, "questions": [
             {
@@ -623,7 +651,8 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unanswered_and_disabled_parents_do_not_activate_children(self):
         settings = PluginSettings({})
-        action, _, _, _, length, gate, meme = settings.decision_questions
+        by_id = {q.id: q for q in settings.decision_questions}
+        action, length, gate, meme = (by_id[key] for key in ("action", "length", "use_meme", "meme_id"))
         for child in (length, gate):
             child.triggers = [{"question": action.id, "option": "reply"}]
         action.use_threshold = True
@@ -641,7 +670,8 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_random_workflow_deduplicates_shared_child_and_follows_fixed_reply(self):
         settings = PluginSettings({"decision_mode": "random"})
-        action, _, _, _, length, gate, meme = settings.decision_questions
+        by_id = {q.id: q for q in settings.decision_questions}
+        action, length, gate, meme = (by_id[key] for key in ("action", "length", "use_meme", "meme_id"))
         meme.triggers.append({"question": action.id, "option": "reply"})
         gate.false_weight = 0
         meme.options[0].weight = 0

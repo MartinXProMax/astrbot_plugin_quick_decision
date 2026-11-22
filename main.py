@@ -192,6 +192,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 scene,
                 candidate_available={
                     "memes": bool(memes),
+                    "meme_categories": bool(memes),
                     "recent_messages": any(
                         item.role == "user" and item.message_id for item in messages
                     ),
@@ -593,6 +594,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 timer_roots=timer_roots,
                 candidate_available={
                     "memes": bool(memes),
+                    "meme_categories": bool(memes),
                     "recent_messages": any(
                         item.role == "user" and item.message_id for item in messages
                     ),

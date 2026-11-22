@@ -147,6 +147,7 @@ def read_star_version(registered: Any) -> str | None:
 class MemeCandidate:
     id: str
     pack_id: str
+    category: str
     relative_path: str
     description: str
     path: Path
@@ -267,12 +268,10 @@ def iter_pack_images(
             if not caption and not include_undesc:
                 continue
             description = caption or "（暂无描述）"
-            file_sha = str(rec.get("content_sha256") or "").strip()
-            if not ENTRY_ID_RE.match(file_sha):
-                try:
-                    file_sha = content_sha256(safe.read_bytes())
-                except OSError:
-                    continue
+            try:
+                file_sha = content_sha256(safe.read_bytes())
+            except OSError:
+                continue
             entry_id = str(rec.get("entry_id") or "").strip().lower()
             if not ENTRY_ID_RE.match(entry_id):
                 entry_id = semantic_entry_id(file_sha, category, relative_path)
@@ -280,6 +279,7 @@ def iter_pack_images(
                 MemeCandidate(
                     id=entry_id,
                     pack_id=pack_id,
+                    category=f"{pack_id}/{category}",
                     relative_path=relative_path,
                     description=description,
                     path=safe,
@@ -340,7 +340,7 @@ class MemeManagerAdapter:
         return self._registry_cache
 
     def _candidate_cache_key(
-        self, data_dir: Path, packs: list[dict[str, Any]], include_undesc: bool
+        self, data_dir: Path, packs: list[dict[str, Any]]
     ) -> tuple[Any, ...]:
         packs_root = data_dir / "packs"
         key: list[Any] = [str(data_dir), self._mtime(data_dir / "registry.json")]
@@ -363,10 +363,9 @@ class MemeManagerAdapter:
                     for category_dir in sorted(memes_dir.iterdir()):
                         if category_dir.is_dir():
                             key.extend((str(category_dir), self._mtime(category_dir)))
-                            if not include_undesc:
-                                continue
                             for image in sorted(category_dir.iterdir()):
                                 if image.is_file() and image.suffix.lower() in IMAGE_EXTENSIONS:
+                                    # Image replacement can keep the directory mtime unchanged.
                                     key.extend((str(image), self._mtime(image)))
         return tuple(key)
 
@@ -447,7 +446,7 @@ class MemeManagerAdapter:
         if data_dir is None:
             return []
         packs = self._registry(data_dir)
-        cache_key = self._candidate_cache_key(data_dir, packs, include_undesc)
+        cache_key = self._candidate_cache_key(data_dir, packs)
         cached = self._candidate_cache.get(include_undesc)
         if cached and cached[0] == cache_key:
             return cached[1]
@@ -473,7 +472,7 @@ class MemeManagerAdapter:
 
     def described_catalog(self) -> list[dict[str, str]]:
         return [
-            {"id": item.id, "description": item.description}
+            {"id": item.id, "description": item.description, "category": item.category}
             for item in self.list_candidates()
         ]
 

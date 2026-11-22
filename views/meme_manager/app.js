@@ -34,7 +34,7 @@ const SAVE_MESSAGES = {
 
 const TYPE_LABELS = { choice: "选择题", boolean: "是否题" };
 const STAGE_LABELS = { pre_reply: "正文生成前", post_reply: "正文生成后" };
-const SOURCE_TAGS = { recent_messages: "选消息", memes: "选表情" };
+const SOURCE_TAGS = { recent_messages: "选消息", meme_categories: "选图库分类", memes: "选表情" };
 const PROMPT_TOKENS = ["当前时间", "冷场时长"];
 
 // 动作目录只给出参数名和时机取值，界面文案先在这里补齐；目录里出现新动作时退回原名。
@@ -355,7 +355,11 @@ function qIndexOf(question) {
 
 function slotLabel(q, ref) {
   if (ref.side) return ref.side === "true" ? "是" : "否";
-  if (wf.isWildcard(ref)) return q.candidate_source === "memes" ? "每张候选表情" : "每条候选消息";
+  if (wf.isWildcard(ref)) {
+    if (q.candidate_source === "memes") return "每张候选表情";
+    if (q.candidate_source === "meme_categories") return "每个图库分类";
+    return "每条候选消息";
+  }
   return ref.id.trim() || "未命名选项";
 }
 
@@ -1041,7 +1045,7 @@ function renderAsk(q, qIndex) {
     (type, el) => confirmChange(`type:${qIndex}:${type}`, el, wf.changeType(q, type), `改为${TYPE_LABELS[type]}`),
     { disabled: wf.isDynamic(q) ? { boolean: "动态候选需要选择题" } : {}, extra: "type-seg" });
   const sources = Object.entries(state.sources).length ? Object.entries(state.sources)
-    : [["options", "固定选项"], ["recent_messages", "最近用户消息"], ["memes", "图库表情"]];
+    : [["options", "固定选项"], ["recent_messages", "最近用户消息"], ["meme_categories", "图库分类"], ["memes", "图库表情"]];
   const sourceSeg = segmented("候选来源", sources, q.candidate_source,
     (source, el) => confirmChange(`source:${qIndex}:${source}`, el, wf.changeSource(q, source), `改为「${state.sources[source] || source}」`),
     { extra: "source-seg", field: "source" });
@@ -1065,6 +1069,7 @@ function renderAsk(q, qIndex) {
     }, `{${name}}`)));
   const dynamicNote = {
     recent_messages: "「每条候选消息」行会展开为本轮快照中的每条用户消息（最多 8 条），{描述} 换成发送人、时间和摘要。",
+    meme_categories: "「每个图库分类」行会展开为当前图库中带描述图片所属的分类。",
     memes: "「每张候选表情」行会展开为图库里每张带描述的表情，{描述} 换成表情描述。",
   }[q.candidate_source];
 

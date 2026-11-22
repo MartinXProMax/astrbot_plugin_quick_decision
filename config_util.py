@@ -42,6 +42,7 @@ MEME_PROMPT = (
     "若需要配图，请根据描述选择最合适的一张表情包；不合适则选 none。"
     "只根据描述选择，不要假设你能看到原图。"
 )
+MEME_CATEGORY_PROMPT = "若需要配图，请先根据当前语境选择最合适的图库分类；没有合适分类则选 none。"
 TARGET_DEFAULT = {"latest": "沿用会话上下文，自然参与当前话题"}
 MEME_DEFAULT = {"none": "不配表情包"}
 
@@ -239,6 +240,21 @@ def migrate_target_gate(questions):
 
 def default_questions(legacy=None):
     questions, _ = migrate_questions(legacy_questions(legacy))
+    if legacy is None:
+        meme = next(q for q in questions if q.id == "meme_id")
+        meme.triggers = [{"question": "meme_category", "option": "*"}]
+        category = DecisionQuestion(
+            "meme_category",
+            "choice",
+            MEME_CATEGORY_PROMPT,
+            options=[
+                DecisionQuestionOption("none", MEME_DEFAULT["none"]),
+                DecisionQuestionOption("*", "{描述}"),
+            ],
+            candidate_source="meme_categories",
+            triggers=[{"question": "use_meme", "option": "true"}],
+        )
+        questions.insert(questions.index(meme), category)
     return migrate_target_gate(questions)[0]
 
 
@@ -406,6 +422,8 @@ def _parse_one_question(
         "decision_mode": decision_mode,
         "use_threshold": not legacy and _as_bool(item.get("use_threshold"), False),
         "branches": {} if legacy else item.get("branches", {}),
+        "candidate_source": str(item.get("candidate_source") or "options"),
+        "requires_candidates": str(item.get("requires_candidates") or ""),
     }
     if qtype == "choice":
         options, error = _parse_choice_options(
@@ -704,6 +722,8 @@ def load_questions(value, *, strict=False):
     legacy, warning = parse_decision_questions(value, strict=strict)
     if warning and strict:
         return [], warning
+    if warning and isinstance(value, str):
+        return default_questions(), warning
     return default_questions(legacy), warning
 
 

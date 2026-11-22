@@ -8,7 +8,12 @@ WORKFLOW_EVENTS = {
     "timer_elapsed": "定时触发",
     "reply_generated": "本轮正文生成完成",
 }
-SOURCES = {"options": "固定选项", "recent_messages": "最近用户消息", "memes": "图库表情"}
+SOURCES = {
+    "options": "固定选项",
+    "recent_messages": "最近用户消息",
+    "meme_categories": "图库分类",
+    "memes": "图库表情",
+}
 SCENES = ("group_passive", "private_passive", "group_proactive", "private_proactive")
 ACTIONS = {
     "request_reply": {"label": "调用会话模型发言", "stages": ["pre_reply"], "parameters": []},
@@ -102,7 +107,7 @@ def migrate_actions(questions):
 
 def validate_actions(q, by_id):
     keys = {o.id for o in q.options} if q.type == "choice" else {"true", "false"}
-    if q.candidate_source not in SOURCES or (q.requires_candidates and q.requires_candidates not in ("recent_messages", "memes")):
+    if q.candidate_source not in SOURCES or (q.requires_candidates and q.requires_candidates not in ("recent_messages", "meme_categories", "memes")):
         return "候选来源无效"
     if q.candidate_source != "options" and (q.type != "choice" or "*" not in keys):
         return "动态候选需要选择题和 * 选项"

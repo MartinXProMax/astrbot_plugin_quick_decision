@@ -250,6 +250,7 @@ class MemeAdapterTests(unittest.TestCase):
         adapter = MemeManagerAdapter(data_dir=self.manager_dir, require_plugin=False)
         catalog = adapter.described_catalog()
         self.assertEqual({item["description"] for item in catalog}, {"微笑点头", "大哭"})
+        self.assertEqual({item["category"] for item in catalog}, {"pack-a/imported"})
         by_desc = {item["description"]: item["id"] for item in catalog}
         smile = adapter.resolve_image(by_desc["微笑点头"])
         cry = adapter.resolve_image(by_desc["大哭"])
@@ -268,6 +269,15 @@ class MemeAdapterTests(unittest.TestCase):
             adapter.described_catalog()
             adapter.described_catalog()
             self.assertEqual(load.call_count, 1)
+
+    def test_catalog_cache_reloads_when_image_is_replaced(self) -> None:
+        _make_pack(self.manager_dir, "pack-a", [("smile.png", PNG, "微笑点头")])
+        adapter = MemeManagerAdapter(data_dir=self.manager_dir, require_plugin=False)
+        path = self.manager_dir / "packs/pack-a/memes/imported/smile.png"
+        first = adapter.list_candidates()[0].content_sha256
+        path.write_bytes(JPEG)
+        second = adapter.list_candidates()[0].content_sha256
+        self.assertNotEqual(first, second)
 
     def test_missing_file_and_updated_description_sync(self) -> None:
         _make_pack(self.manager_dir, "pack-a", [("smile.png", PNG, "微笑点头")])

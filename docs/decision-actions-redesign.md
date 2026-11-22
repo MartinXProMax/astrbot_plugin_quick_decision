@@ -54,7 +54,7 @@
 - 保存 `POST decision-config`，提交 `{"version":7,"decision_questions":[...]}`。后端保存的配置为 `{"version":5,"questions":[...]}`。旧编辑器继续读写旧图。首次保存新版图后，旧编辑器的写请求会被拒绝，避免丢失动作。
 - 预览 `POST decision-preview`，提交 `version: 7`、`scene`、`decision_questions` 和示例 `answers`。返回各批次的 `asked/used/discarded`、有效答案、`reply`、`reply_sources`、`context`、`quote` 和 `tools`。预览仅使用样例消息和图库。
 - 主动场景预览可带 `trigger_event: "timer_elapsed"`，假定全部定时入口同时到期；省略时保留冷场预览。定时轮次的决策日志带同名 `trigger_event` 字段，正文生成使用定时提示，不假定会话已经冷场。
-- `candidate_source` 可取 `options`、`recent_messages`、`memes`。动态候选通过选项 `*` 绑定动作。动作的 `from` 填具体题目 ID，省略时读取本题答案。`add_context` 还可用 `text` 传入固定内容，或用 `label` 为传给会话模型的字段命名。`quote_message` 需要消息候选。`send_meme` 需要图库候选，默认 `when: "on_match"`，随正文配图填 `when: "after_send"`。
+- `candidate_source` 可取 `options`、`recent_messages`、`meme_categories`、`memes`。动态候选通过选项 `*` 绑定动作；默认表情流程先从 `meme_categories` 选择分类，再让 `memes` 题按分类缩小候选。动作的 `from` 填具体题目 ID，省略时读取本题答案。`add_context` 还可用 `text` 传入固定内容，或用 `label` 为传给会话模型的字段命名。`quote_message` 需要消息候选。`send_meme` 需要图库候选，默认 `when: "on_match"`，随正文配图填 `when: "after_send"`。
 - `scenes` 可限定群聊、私聊和冷场场景。`requires_candidates` 可让普通布尔题只在存在特定类型的候选时提问。`private_default` 指定私聊收到消息时的固定选项。`triggers: []` 的题保留为待连接。删除父题时也可一并移除子题对应的触发条件，保留其余来源。
 - 多处请求发言时生成一次，`reply_sources` 保留各个来源。一个消息段支持一个引用目标；多个有效引用绑定同时命中时采用配置顺序中最后一个。相同表情、相同发送时机的调用在本轮合并一次。
 
