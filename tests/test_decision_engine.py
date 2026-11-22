@@ -26,6 +26,7 @@ from astrbot_plugin_quick_decision.decision_engine import (
     ask_decision,
     evaluate_post_reply,
     evaluate_specs,
+    has_on_match_actions,
     preview_workflow,
 )
 from astrbot_plugin_quick_decision.models import (
@@ -78,6 +79,31 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
             if memes is not None
             else [{"id": "cat", "description": "微笑"}],
         )
+
+    def test_on_match_action_probe_only_keeps_immediate_meme_tools(self):
+        settings = PluginSettings({"decision_questions": {"version": 5, "questions": [
+            {
+                "id": "gate", "type": "boolean", "instructions": "开口？",
+                "triggers": [{"event": "message_received"}],
+                "actions": {"true": [{"tool": "request_reply"}], "false": []},
+            },
+            {
+                "id": "picture", "type": "choice", "instructions": "配图？",
+                "triggers": [{"question": "gate", "option": "true"}],
+                "candidate_source": "memes", "options": [
+                    {"id": "none", "criteria": "不配图"},
+                    {"id": "*", "criteria": "{描述}"},
+                ],
+                "actions": {"*": [{"tool": "send_meme", "when": "on_match"}]},
+            },
+        ]}})
+        self.assertTrue(has_on_match_actions(settings.decision_questions, "group_passive"))
+        self.assertFalse(has_on_match_actions(
+            settings.decision_questions, "group_passive",
+            candidate_available={"memes": False},
+        ))
+        settings.decision_questions[1].actions = {"*": [{"tool": "send_meme", "when": "after_send"}]}
+        self.assertFalse(has_on_match_actions(settings.decision_questions, "group_passive"))
 
     async def test_all_48_batch_paths_match_preview_and_gate_effects(self):
         for timings in product((False, True), repeat=4):

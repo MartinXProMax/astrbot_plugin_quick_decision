@@ -1055,6 +1055,49 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(event.is_stopped())
         self.assertTrue(req.conversation.cid)
 
+    async def test_group_cooldown_skips_judgement_without_immediate_tools(self) -> None:
+        self.plugin.config["cooldown_seconds"] = 300
+        event = FakeEvent(
+            umo="aiocqhttp:GroupMessage:cooldown",
+            text="普通群消息",
+            at_or_wake=False,
+            is_private=False,
+        )
+        self.plugin.sessions.ensure(_profile(event)).last_bot_ts = 10**12
+
+        await self.plugin.on_chat_message(event)
+
+        self.assertEqual(self.decision_calls, 0)
+        self.assertTrue(event.is_stopped())
+        log = self.plugin.sessions.recent_logs()[0]
+        self.assertEqual(log["raw"]["skip_reason"], "冷却中跳过")
+
+    async def test_empty_meme_candidates_do_not_keep_cooldown_judgement_alive(self) -> None:
+        self.plugin.config.update(
+            cooldown_seconds=300,
+            decision_questions={"version": 5, "questions": [{
+                "id": "picture", "type": "choice", "instructions": "配图？",
+                "triggers": [{"event": "message_received"}],
+                "candidate_source": "memes",
+                "options": [
+                    {"id": "none", "criteria": "不配图"},
+                    {"id": "*", "criteria": "{描述}"},
+                ],
+                "actions": {"*": [{"tool": "send_meme", "when": "on_match"}]},
+            }]},
+        )
+        event = FakeEvent(
+            umo="aiocqhttp:GroupMessage:empty-memes",
+            text="普通群消息",
+            at_or_wake=False,
+            is_private=False,
+        )
+        self.plugin.sessions.ensure(_profile(event)).last_bot_ts = 10**12
+
+        await self.plugin.on_chat_message(event)
+
+        self.assertEqual(self.decision_calls, 0)
+
     async def test_merged_messages_one_generation_and_full_prompt(self) -> None:
         first = FakeEvent(
             umo="aiocqhttp:FriendMessage:9",

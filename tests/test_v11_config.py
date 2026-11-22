@@ -492,7 +492,6 @@ class DecisionConfigTests(unittest.TestCase):
                 "chat_type",
                 "current_message_at_or_quoted_bot",
                 "recent_messages",
-                "meme_catalog",
             },
         )
         filled = build_state(

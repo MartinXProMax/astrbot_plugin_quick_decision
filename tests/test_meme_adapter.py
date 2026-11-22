@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -244,7 +245,7 @@ class MemeAdapterTests(unittest.TestCase):
         _make_pack(
             self.manager_dir,
             "pack-a",
-            [("smile.png", PNG, "微笑点头"), ("cry.jpg", JPEG, "大哭")],
+            [("smile.png", PNG, "微笑点头"), ("cry.jpg", JPEG, "大哭"), ("blank.png", PNG, "")],
         )
         adapter = MemeManagerAdapter(data_dir=self.manager_dir, require_plugin=False)
         catalog = adapter.described_catalog()
@@ -257,6 +258,16 @@ class MemeAdapterTests(unittest.TestCase):
         self.assertEqual(smile.read_bytes(), PNG)
         self.assertEqual(cry.read_bytes(), JPEG)
         self.assertNotEqual(smile, cry)
+
+    def test_catalog_cache_reloads_only_after_metadata_changes(self) -> None:
+        _make_pack(self.manager_dir, "pack-a", [("smile.png", PNG, "微笑点头")])
+        adapter = MemeManagerAdapter(data_dir=self.manager_dir, require_plugin=False)
+        from astrbot_plugin_quick_decision import meme_adapter as module
+
+        with patch.object(module, "_semantic_captions", wraps=module._semantic_captions) as load:
+            adapter.described_catalog()
+            adapter.described_catalog()
+            self.assertEqual(load.call_count, 1)
 
     def test_missing_file_and_updated_description_sync(self) -> None:
         _make_pack(self.manager_dir, "pack-a", [("smile.png", PNG, "微笑点头")])

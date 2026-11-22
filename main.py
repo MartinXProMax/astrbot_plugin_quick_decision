@@ -16,7 +16,12 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
 from .config_util import PluginSettings
-from .decision_engine import _round_clock, ask_decision, evaluate_post_reply
+from .decision_engine import (
+    _round_clock,
+    ask_decision,
+    evaluate_post_reply,
+    has_on_match_actions,
+)
 from .decision_tools import run_tools, skip_tools
 from .event_utils import (
     event_has_command_handler,
@@ -171,9 +176,45 @@ class QuickDecisionPlugin(Star, WebApiMixin):
 
         runtime = self.sessions.ensure(profile)
         at_or_quoted, scene = self._resolve_passive_scene(event, profile)
+        official_would_run = bool(event.is_at_or_wake_command)
+        skip_reason = self._passive_skip_reason(
+            settings, profile, scene, at_or_quoted, official_would_run
+        )
+        messages = self.sessions.recent_messages(
+            profile.umo, settings.context_message_limit
+        )
+        memes = None
+        immediate_actions = has_on_match_actions(settings.decision_questions, scene)
+        if skip_reason and immediate_actions:
+            memes = self._meme_candidates(settings)
+            immediate_actions = has_on_match_actions(
+                settings.decision_questions,
+                scene,
+                candidate_available={
+                    "memes": bool(memes),
+                    "recent_messages": any(
+                        item.role == "user" and item.message_id for item in messages
+                    ),
+                },
+            )
+        if skip_reason and not immediate_actions:
+            result = DecisionResult(
+                scene=scene,
+                trigger_event="message_received",
+                decision_mode=settings.decision_mode,
+                raw={"skip_reason": skip_reason},
+            )
+            result.dry_run = settings.dry_run
+            runtime.last_decision = result
+            await self._log_decision(profile, result)
+            logger.info("%s：%s", skip_reason, profile.umo)
+            event.stop_event()
+            return
 
         # 决策进行中若仍有新消息，最多再判断两次，保证只发出一轮回复。
         result: DecisionResult | None = None
+        if memes is None:
+            memes = self._meme_candidates(settings)
         for _ in range(3):
             runtime.pending.clear()
             messages = self.sessions.recent_messages(
@@ -186,7 +227,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 is_private=profile.is_private,
                 messages=messages,
                 at_or_quoted=at_or_quoted,
-                memes=self._meme_candidates(settings),
+                memes=memes,
                 umo=profile.umo,
             )
             if not runtime.pending:
@@ -214,7 +255,6 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             event.stop_event()
             return
 
-        official_would_run = bool(event.is_at_or_wake_command)
         if (
             scene == "group_passive"
             and not at_or_quoted
@@ -383,6 +423,28 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             return self.meme_adapter.described_catalog()
         return []
 
+    def _passive_skip_reason(
+        self, settings, profile, scene, at_or_quoted, official_would_run
+    ) -> str | None:
+        if scene != "group_passive" or at_or_quoted or official_would_run:
+            return None
+        if not settings.group_enable_interrupt:
+            return "群聊插话已关闭，跳过判断"
+        if self.sessions.in_cooldown(profile.umo, settings.cooldown_seconds):
+            return "冷却中跳过"
+        return None
+
+    def _proactive_skip_reason(self, settings, profile, scheduled) -> str | None:
+        if not scheduled and not settings.proactive_enabled(profile.is_private):
+            return "冷场主动发言已关闭，跳过判断"
+        if self.sessions.in_cooldown(profile.umo, settings.cooldown_seconds):
+            return "冷却中跳过"
+        if not self.sessions.can_proactive(
+            profile.umo, settings.hourly_proactive_limit(profile.is_private)
+        ):
+            return "每小时主动发言上限已满，跳过判断"
+        return None
+
     def _record_bot_text(self, profile: SessionProfile, text: str) -> None:
         self.sessions.append_message(
             profile,
@@ -510,9 +572,46 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         scene: SceneType = (
             "private_proactive" if profile.is_private else "group_proactive"
         )
+        trigger_event = "timer_elapsed" if scheduled else "silence_elapsed"
+        limit_reason = self._proactive_skip_reason(settings, profile, scheduled)
         messages = self.sessions.recent_messages(
             profile.umo, settings.context_message_limit
         )
+        memes = None
+        immediate_actions = has_on_match_actions(
+            settings.decision_questions,
+            scene,
+            trigger_event=trigger_event,
+            timer_roots=timer_roots,
+        )
+        if limit_reason and immediate_actions:
+            memes = self._meme_candidates(settings)
+            immediate_actions = has_on_match_actions(
+                settings.decision_questions,
+                scene,
+                trigger_event=trigger_event,
+                timer_roots=timer_roots,
+                candidate_available={
+                    "memes": bool(memes),
+                    "recent_messages": any(
+                        item.role == "user" and item.message_id for item in messages
+                    ),
+                },
+            )
+        if limit_reason and not immediate_actions:
+            result = DecisionResult(
+                scene=scene,
+                trigger_event=trigger_event,
+                decision_mode=settings.decision_mode,
+                raw={"skip_reason": limit_reason},
+            )
+            result.dry_run = settings.dry_run
+            runtime.last_decision = result
+            await self._log_decision(profile, result)
+            logger.info("%s：%s", limit_reason, profile.umo)
+            return
+        if memes is None:
+            memes = self._meme_candidates(settings)
         result = await ask_decision(
             self.context,
             settings=settings,
@@ -520,10 +619,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             is_private=profile.is_private,
             messages=messages,
             at_or_quoted=False,
-            memes=self._meme_candidates(settings),
+            memes=memes,
             umo=profile.umo,
             last_activity=runtime.last_activity,
-            trigger_event="timer_elapsed" if scheduled else "silence_elapsed",
+            trigger_event=trigger_event,
             timer_roots=timer_roots,
         )
         result.dry_run = settings.dry_run

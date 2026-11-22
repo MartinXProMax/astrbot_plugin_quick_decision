@@ -11,7 +11,7 @@
 
 判断模型只根据描述选图，适配器不会读取图片像素内容。
 缺依赖时只报告不可用，调用方应改发纯文字，不得回退到旧自制图库。
-每次列出或解析都会重新扫描磁盘，避免插件重载或管理器改描述后留下旧引用。
+按图库注册表和语义元数据的修改时间缓存候选；管理器改描述或图包后会自动失效。
 """
 
 from __future__ import annotations
@@ -243,7 +243,9 @@ def _semantic_captions(pack_dir: Path) -> dict[str, dict[str, Any]]:
     return by_path
 
 
-def iter_pack_images(pack_dir: Path, pack_id: str) -> list[MemeCandidate]:
+def iter_pack_images(
+    pack_dir: Path, pack_id: str, *, include_undesc: bool = False
+) -> list[MemeCandidate]:
     memes_dir = pack_dir / "memes"
     if not memes_dir.is_dir():
         return []
@@ -262,6 +264,8 @@ def iter_pack_images(pack_dir: Path, pack_id: str) -> list[MemeCandidate]:
                 continue
             rec = captions.get(relative_path) or {}
             caption = str(rec.get("caption") or "").strip()
+            if not caption and not include_undesc:
+                continue
             description = caption or "（暂无描述）"
             file_sha = str(rec.get("content_sha256") or "").strip()
             if not ENTRY_ID_RE.match(file_sha):
@@ -314,6 +318,57 @@ class MemeManagerAdapter:
         self.require_plugin = (
             context is not None if require_plugin is None else require_plugin
         )
+        self._registry_cache_key: tuple[str, int | None] | None = None
+        self._registry_cache: list[dict[str, Any]] = []
+        self._candidate_cache: dict[
+            bool, tuple[tuple[Any, ...], list[MemeCandidate]]
+        ] = {}
+
+    @staticmethod
+    def _mtime(path: Path) -> int | None:
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _registry(self, data_dir: Path) -> list[dict[str, Any]]:
+        path = data_dir / "registry.json"
+        key = (str(data_dir), self._mtime(path))
+        if key != self._registry_cache_key:
+            self._registry_cache_key = key
+            self._registry_cache = list_registry_packs(data_dir)
+        return self._registry_cache
+
+    def _candidate_cache_key(
+        self, data_dir: Path, packs: list[dict[str, Any]], include_undesc: bool
+    ) -> tuple[Any, ...]:
+        packs_root = data_dir / "packs"
+        key: list[Any] = [str(data_dir), self._mtime(data_dir / "registry.json")]
+        for item in packs:
+            if not bool(item.get("enabled", True)):
+                continue
+            pack_id = str(item.get("id") or "")
+            pack_dir = _safe_pack_dir(packs_root, pack_id)
+            key.extend(
+                (
+                    pack_id,
+                    self._mtime(pack_dir) if pack_dir else None,
+                    self._mtime(pack_dir / "semantic_metadata.json") if pack_dir else None,
+                    self._mtime(pack_dir / "memes") if pack_dir else None,
+                )
+            )
+            if pack_dir:
+                memes_dir = pack_dir / "memes"
+                if memes_dir.is_dir():
+                    for category_dir in sorted(memes_dir.iterdir()):
+                        if category_dir.is_dir():
+                            key.extend((str(category_dir), self._mtime(category_dir)))
+                            if not include_undesc:
+                                continue
+                            for image in sorted(category_dir.iterdir()):
+                                if image.is_file() and image.suffix.lower() in IMAGE_EXTENSIONS:
+                                    key.extend((str(image), self._mtime(image)))
+        return tuple(key)
 
     def get_registered_star(self) -> Any | None:
         if self.context is None or not hasattr(self.context, "get_registered_star"):
@@ -358,7 +413,7 @@ class MemeManagerAdapter:
                 registered_apis=apis,
                 message=UNAVAILABLE_HINT,
             )
-        packs = list_registry_packs(data_dir)
+        packs = self._registry(data_dir)
         candidates = self.list_candidates()
         pack_summaries = []
         packs_root = data_dir / "packs"
@@ -385,27 +440,35 @@ class MemeManagerAdapter:
             packs=pack_summaries,
         )
 
-    def list_candidates(self) -> list[MemeCandidate]:
+    def list_candidates(self, *, include_undesc: bool = False) -> list[MemeCandidate]:
         if self.require_plugin and self.get_registered_star() is None:
             return []
         data_dir = self.resolve_data_dir()
         if data_dir is None:
             return []
+        packs = self._registry(data_dir)
+        cache_key = self._candidate_cache_key(data_dir, packs, include_undesc)
+        cached = self._candidate_cache.get(include_undesc)
+        if cached and cached[0] == cache_key:
+            return cached[1]
         packs_root = data_dir / "packs"
         candidates: list[MemeCandidate] = []
         seen_ids: set[str] = set()
-        for item in list_registry_packs(data_dir):
+        for item in packs:
             if not bool(item.get("enabled", True)):
                 continue
             pack_id = str(item.get("id") or "")
             pack_dir = _safe_pack_dir(packs_root, pack_id)
             if pack_dir is None:
                 continue
-            for candidate in iter_pack_images(pack_dir, pack_id):
+            for candidate in iter_pack_images(
+                pack_dir, pack_id, include_undesc=include_undesc
+            ):
                 if candidate.id in seen_ids:
                     continue
                 seen_ids.add(candidate.id)
                 candidates.append(candidate)
+        self._candidate_cache[include_undesc] = (cache_key, candidates)
         return candidates
 
     def described_catalog(self) -> list[dict[str, str]]:
@@ -420,7 +483,14 @@ class MemeManagerAdapter:
         for item in self.list_candidates():
             if item.id == meme_id:
                 return item.path if item.path.is_file() else None
+        # Keep previously selected images usable if their description was removed.
+        for item in self.list_candidates(include_undesc=True):
+            if item.id == meme_id:
+                return item.path if item.path.is_file() else None
         return None
 
     def existing_content_hashes(self) -> dict[str, MemeCandidate]:
-        return {item.content_sha256: item for item in self.list_candidates()}
+        return {
+            item.content_sha256: item
+            for item in self.list_candidates(include_undesc=True)
+        }

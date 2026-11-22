@@ -250,7 +250,6 @@ def build_state(
         "chat_type": "private" if is_private else "group",
         "current_message_at_or_quoted_bot": at_or_quoted,
         "recent_messages": [item.to_state_dict() for item in messages],
-        "meme_catalog": [dict(meme) for meme in memes],
     }
     if clock is not None:
         for record, message in zip(state["recent_messages"], messages, strict=True):
@@ -260,6 +259,68 @@ def build_state(
     if context:
         state["custom_context"] = context
     return state
+
+
+def has_on_match_actions(
+    configured,
+    scene: SceneType,
+    *,
+    trigger_event: str = "",
+    timer_roots: set[str] | None = None,
+    candidate_available: dict[str, bool] | None = None,
+) -> bool:
+    """判断本轮可达的问题是否可能产生判断后立即执行的发图动作。"""
+    configured, _ = migrate_actions(configured)
+    event = trigger_event or (
+        "silence_elapsed" if scene.endswith("_proactive") else "message_received"
+    )
+    enabled = {
+        question.id: question
+        for question in configured
+        if question.enabled
+        and question.stage == "pre_reply"
+        and (not question.scenes or scene in question.scenes)
+        and (
+            candidate_available is None
+            or (
+                not question.requires_candidates
+                or candidate_available.get(question.requires_candidates, False)
+            )
+        )
+        and (
+            candidate_available is None
+            or question.candidate_source == "options"
+            or candidate_available.get(question.candidate_source, False)
+        )
+    }
+    reachable = {
+        question.id
+        for question in enabled.values()
+        if any(trigger.get("event") == event for trigger in question.triggers or [])
+        and (timer_roots is None or event != "timer_elapsed" or question.id in timer_roots)
+    }
+    changed = True
+    while changed:
+        changed = False
+        for question in enabled.values():
+            if question.id in reachable:
+                continue
+            if any(
+                trigger.get("question") in reachable
+                for trigger in question.triggers or []
+            ):
+                reachable.add(question.id)
+                changed = True
+    return any(
+        question.id in reachable
+        and any(
+            action.get("tool") == "send_meme"
+            and action.get("when", "on_match") == "on_match"
+            for actions in (question.actions or {}).values()
+            for action in actions
+        )
+        for question in enabled.values()
+    )
 
 
 def _round_clock(context, umo):
