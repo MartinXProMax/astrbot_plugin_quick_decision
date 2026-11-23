@@ -1160,7 +1160,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(first_run.is_stopped())
         self.assertEqual(self.decision_calls, 1)
 
-        # 官方生成尚未结束时，第三条仍被抑制，不会再决策。
+        # 官方生成尚未结束时，第三条挂起；释放后补一轮判断。
         third = FakeEvent(
             umo=first.unified_msg_origin,
             text="第三句",
@@ -1169,10 +1169,87 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             message_id="c",
             timestamp=51,
         )
-        again = await self.plugin.on_chat_message(third)
+        again_task = asyncio.create_task(self.plugin.on_chat_message(third))
+        await asyncio.sleep(0)
+        self.assertFalse(again_task.done())
+        release_official_pipeline(runtime)
+        again = await again_task
         self.assertIsNone(again)
-        self.assertTrue(third.is_stopped())
+        self.assertEqual(self.decision_calls, 2)
+
+    async def test_message_during_official_reply_is_rejudged_after_release(self) -> None:
+        first = FakeEvent(
+            umo="aiocqhttp:GroupMessage:follow-up",
+            text="第一句",
+            message_id="first",
+            timestamp=10,
+        )
+        self.assertIsInstance(await self.plugin.on_chat_message(first), ProviderRequest)
+
+        second = FakeEvent(
+            umo=first.unified_msg_origin,
+            text="追问",
+            message_id="second",
+            timestamp=11,
+        )
+        task = asyncio.create_task(self.plugin.on_chat_message(second))
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+
+        runtime = self.plugin.sessions.get(first.unified_msg_origin)
+        release_official_pipeline(runtime)
+        follow_up = await task
+
+        self.assertIsInstance(follow_up, ProviderRequest)
+        self.assertEqual(self.decision_calls, 2)
+
+    async def test_follow_up_rejudgement_still_obeys_cooldown(self) -> None:
+        first = FakeEvent(
+            umo="aiocqhttp:GroupMessage:follow-up-cooldown",
+            text="第一句",
+            message_id="first",
+            timestamp=10,
+        )
+        self.assertIsInstance(await self.plugin.on_chat_message(first), ProviderRequest)
+
+        second = FakeEvent(
+            umo=first.unified_msg_origin,
+            text="追问",
+            message_id="second",
+            timestamp=11,
+        )
+        task = asyncio.create_task(self.plugin.on_chat_message(second))
+        await asyncio.sleep(0)
+        self.plugin.config["cooldown_seconds"] = 300
+        self.plugin.sessions.get(first.unified_msg_origin).last_bot_ts = 10**12
+        release_official_pipeline(self.plugin.sessions.get(first.unified_msg_origin))
+
+        self.assertIsNone(await task)
+        self.assertTrue(second.is_stopped())
         self.assertEqual(self.decision_calls, 1)
+
+    async def test_cancelled_follow_up_is_removed_from_pending(self) -> None:
+        first = FakeEvent(
+            umo="aiocqhttp:GroupMessage:follow-up-cancel",
+            text="第一句",
+            message_id="first",
+            timestamp=10,
+        )
+        self.assertIsInstance(await self.plugin.on_chat_message(first), ProviderRequest)
+
+        second = FakeEvent(
+            umo=first.unified_msg_origin,
+            text="追问",
+            message_id="second",
+            timestamp=11,
+        )
+        task = asyncio.create_task(self.plugin.on_chat_message(second))
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+        self.assertEqual(self.plugin.sessions.get(first.unified_msg_origin).pending, [])
 
     async def test_none_and_dry_run_do_not_hand_off_or_generate(self) -> None:
         async def none_ask(*_a, **k):

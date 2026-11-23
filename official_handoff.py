@@ -157,6 +157,7 @@ def is_official_pipeline_busy(runtime) -> bool:
 def begin_official_pipeline(runtime, result) -> None:
     runtime.pending_pipeline = result
     runtime.deciding = True
+    runtime.pipeline_released.clear()
 
 
 def release_official_pipeline(runtime) -> None:
@@ -164,6 +165,4 @@ def release_official_pipeline(runtime) -> None:
         return
     runtime.pending_pipeline = None
     runtime.deciding = False
-    pending = getattr(runtime, "pending", None)
-    if pending is not None:
-        pending.clear()
+    runtime.pipeline_released.set()

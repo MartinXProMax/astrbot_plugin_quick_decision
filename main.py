@@ -152,8 +152,26 @@ class QuickDecisionPlugin(Star, WebApiMixin):
 
         if is_official_pipeline_busy(runtime):
             runtime.pending.append(buffered)
-            event.stop_event()
-            return
+            if runtime.pending_pipeline is None:
+                event.stop_event()
+                return
+            try:
+                await runtime.pipeline_released.wait()
+                async with runtime.lock:
+                    if not runtime.pending or is_official_pipeline_busy(runtime):
+                        event.stop_event()
+                        return
+                    runtime.deciding = True
+                    try:
+                        return await self._run_passive_round(event, profile)
+                    finally:
+                        if runtime.pending_pipeline is None:
+                            runtime.deciding = False
+                            runtime.pending.clear()
+            except asyncio.CancelledError:
+                if buffered in runtime.pending:
+                    runtime.pending.remove(buffered)
+                raise
 
         runtime.deciding = True
         try:
@@ -749,7 +767,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         await self._finish_official_send(event)
 
     async def _finish_official_send(self, event, *, stream_text=None, complete=True):
-        # 先根据本事件上的决策记状态并清 pending，再交给钩子发独立表情。
+        # 先根据本事件上的决策记状态并释放流水线，再交给钩子发独立表情。
         # 表情发送会消费 extra，重复进入或其它事件不会再发图。
         decision = event.get_extra("quick_decision")
         if isinstance(decision, DecisionResult) and stream_text is None:

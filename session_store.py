@@ -27,6 +27,7 @@ class SessionRuntime:
     proactive_times: deque[float] = field(default_factory=deque)
     last_decision: DecisionResult | None = None
     pending_pipeline: DecisionResult | None = None
+    pipeline_released: asyncio.Event = field(default_factory=asyncio.Event)
     known: bool = True
 
     @property
