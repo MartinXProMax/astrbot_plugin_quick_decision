@@ -785,6 +785,9 @@ class PluginSettings:
         self.decision_log_limit = _as_int(
             data.get("decision_log_limit"), 200, minimum=1
         )
+        self.decision_log_include_content = _as_bool(
+            data.get("decision_log_include_content"), True
+        )
         self.decision_custom_context = str(
             data.get("decision_custom_context") or ""
         ).strip()

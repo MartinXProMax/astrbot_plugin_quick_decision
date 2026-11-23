@@ -86,6 +86,8 @@ def _install_astrbot_stubs() -> None:
     provider.DecisionBooleanQuestion = DecisionBooleanQuestion
     provider.DecisionChoiceAnswer = DecisionChoiceAnswer
     provider.DecisionBooleanAnswer = DecisionBooleanAnswer
+    provider.DecisionProvider = type("DecisionProvider", (), {})
+    provider.ProviderType = types.SimpleNamespace(DECISION="decision")
     provider.DecisionError = DecisionError
     provider.ProviderRequest = type("ProviderRequest", (), {})
     provider.LLMResponse = type("LLMResponse", (), {})

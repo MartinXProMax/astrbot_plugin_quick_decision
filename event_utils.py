@@ -42,6 +42,15 @@ def event_profile(event: AstrMessageEvent) -> SessionProfile:
     )
 
 
+def event_session_name(event: AstrMessageEvent) -> str:
+    """返回适合日志展示的会话名称，取不到时留空让调用方回退。"""
+    if event.is_private_chat():
+        return str(event.get_sender_name() or "").strip()
+    message_obj = getattr(event, "message_obj", None)
+    group = getattr(message_obj, "group", None)
+    return str(getattr(group, "group_name", "") or getattr(message_obj, "group_name", "") or "").strip()
+
+
 def _plain_text(components: list | None) -> str:
     if not components:
         return ""

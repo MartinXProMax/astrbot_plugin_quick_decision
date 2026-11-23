@@ -100,6 +100,17 @@ class BufferedMessage:
         return item
 
 
+def decision_log_context(messages, *, evaluated_at, at_or_quoted=False, last_activity=None, timer_roots=None):
+    """保存有长度限制的判断输入，供日志重放使用。"""
+    return {
+        "messages": [dict(asdict(m), text=m.text[:500], quote_text=m.quote_text[:80]) for m in messages],
+        "at_or_quoted": at_or_quoted,
+        "last_activity": last_activity,
+        "timer_roots": sorted(timer_roots) if timer_roots is not None else None,
+        "evaluated_at": evaluated_at,
+    }
+
+
 QUESTION_ROLES = {
     "answer": "记录答案",
     "action": "控制发言",
@@ -260,6 +271,7 @@ class DecisionResult:
     followup_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
     reply_sources: list[str] = field(default_factory=list)
     context_fields: dict[str, Any] = field(default_factory=dict)
+    log_context: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.use_meme and self.meme_id and not self.tool_calls:

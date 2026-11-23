@@ -186,6 +186,23 @@ h1 {
   flex-wrap: wrap;
 }
 
+.status-hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.status-hint.is-success {
+  color: var(--ok);
+}
+
+.status-hint.is-error {
+  color: var(--danger);
+}
+
+#health-banner {
+  margin: 0 0 18px;
+}
+
 .chips {
   display: flex;
   flex-wrap: wrap;
@@ -1876,6 +1893,11 @@ textarea.is-invalid {
   padding: 3px 8px;
 }
 
+.inline-select input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
+
 .log-toolbar {
   display: flex;
   flex-wrap: wrap;
@@ -1914,10 +1936,23 @@ textarea.is-invalid {
   padding: 5px 10px;
 }
 
+#log-session {
+  flex: 0 1 190px;
+  min-width: 150px;
+  padding: 5px 10px;
+}
+
 .log-count {
   margin-top: 8px;
   color: var(--faint);
   font-size: 12.5px;
+}
+
+.log-stats {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 .log-list {
@@ -2097,6 +2132,53 @@ textarea.is-invalid {
   text-overflow: ellipsis;
   white-space: nowrap;
   max-width: 100%;
+}
+
+.log-message {
+  margin-top: 7px;
+  padding: 6px 10px;
+  border-left: 3px solid var(--line-strong);
+  background: var(--sunken);
+  border-radius: 0 6px 6px 0;
+  color: var(--muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.log-message b {
+  margin-right: 6px;
+  color: var(--ink);
+  font-weight: 650;
+}
+
+.log-message.is-reply {
+  border-left-color: var(--chat-line);
+  background: var(--chat-soft);
+}
+
+.log-replay {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--judge-line);
+  border-radius: var(--r-md);
+  background: var(--judge-soft);
+}
+
+.log-replay > h4,
+.log-replay section > h4 {
+  margin: 0;
+  color: var(--judge);
+}
+
+.log-replay .prob-question {
+  margin: 4px 0;
+  background: var(--surface);
+}
+
+.log-replay-error {
+  color: var(--danger);
 }
 
 .log-error {

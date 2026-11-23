@@ -202,10 +202,13 @@ def install_group_quote_guard(event, decision: DecisionResult, *, on_stream_end=
             raise
         if receipt is False:
             decision.text_sent = False
-        elif streaming:
-            stream_text.extend(c.text for c in payload.chain if isinstance(c, Plain) and c.text)
-        elif any(isinstance(c, Plain) and (c.text or "").strip() for c in payload.chain):
-            event.set_extra("_qd_text_receipt", True)
+        else:
+            delivered = "".join(c.text for c in payload.chain if isinstance(c, Plain) and c.text)
+            if streaming:
+                stream_text.append(delivered)
+            elif delivered.strip():
+                event.set_extra("_qd_text_receipt", True)
+                event.set_extra("_qd_sent_text", (event.get_extra("_qd_sent_text", "") + delivered)[:80])
         return receipt
 
     async def send(message, *args, **kwargs):

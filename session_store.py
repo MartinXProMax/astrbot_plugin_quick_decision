@@ -28,6 +28,8 @@ class SessionRuntime:
     last_decision: DecisionResult | None = None
     pending_pipeline: DecisionResult | None = None
     pipeline_released: asyncio.Event = field(default_factory=asyncio.Event)
+    display_name: str = ""
+    name_checked_at: float = 0.0
     known: bool = True
 
     @property
@@ -199,9 +201,15 @@ class SessionStore:
                 data = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(data, dict):
+                continue
             if umo and data.get("umo") != umo:
                 continue
             items.append(data)
             if len(items) >= limit:
                 break
         return items
+
+    def find_log(self, round_id: str) -> dict | None:
+        return next((row for row in self.recent_logs(limit=self.log_limit)
+                     if round_id and row.get("round_id") == round_id), None)

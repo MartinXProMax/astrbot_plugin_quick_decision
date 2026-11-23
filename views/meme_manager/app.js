@@ -1,4 +1,5 @@
 import { probabilityRows } from "./log-probabilities.mjs";
+import { logHasIssue, sessionLabel, summarizeLogs } from "./log-summary.mjs";
 import * as wf from "./workflow-model.mjs";
 
 const bridge = window.AstrBotPluginView;
@@ -193,6 +194,9 @@ const state = {
   preview: { scene: "group_passive", trigger_event: "silence_elapsed", choices: new WeakMap(), result: null, stale: false, revision: 0 },
   logs: [],
   logFilter: "all",
+  logSession: "",
+  logSessions: [],
+  replays: new Map(),
 };
 
 function getMode() {
@@ -1657,7 +1661,37 @@ function renderStatusChips(status) {
       adapter.available ? `${count} 张表情可用` : "只发文字",
     ),
   );
+  const provider = status.decision_provider || {};
+  chips.push(
+    h("span", {
+      class: cls("chip", provider.state === "configured" ? "is-ok" : "is-off"),
+      title: [provider.message, provider.id].filter(Boolean).join(" · "),
+    }, provider.message || "判断提供商状态未知"),
+  );
   $("status-chips").replaceChildren(...chips);
+}
+
+function renderHealth(status) {
+  const banner = $("health-banner");
+  const count = Number(status.recent_log_count || 0);
+  const rate = Number(status.recent_failure_rate || 0);
+  const warnings = [];
+  if (status.provider_required && status.decision_provider?.state === "missing") {
+    warnings.push("未配置有效的判断提供商。请在 AstrBot“模型提供商 → 判断”中配置，并检查插件的判断提供商 ID。");
+  }
+  if (status.provider_test && !status.provider_test.ok) {
+    warnings.push(`判断提供商测试失败：${status.provider_test.error}`);
+  }
+  if (count >= 5 && rate >= 0.5) {
+    warnings.push(`最近 ${count} 次模型判断的失败率为 ${percent.format(rate)}，请检查判断提供商或点击“测试判断提供商”。`);
+  }
+  if (warnings.length) {
+    banner.hidden = false;
+    banner.textContent = warnings.join(" ");
+  } else {
+    banner.hidden = true;
+    banner.textContent = "";
+  }
 }
 
 function renderAdapter(adapter) {
@@ -1705,9 +1739,11 @@ async function loadStatus() {
   try {
     const status = await bridge.apiGet("status");
     renderStatusChips(status);
+    renderHealth(status);
     renderAdapter(status.meme_adapter || {});
   } catch (error) {
     $("status-chips").replaceChildren(h("span", { class: "chip is-off" }, "状态读取失败"));
+    $("health-banner").hidden = true;
     $("adapter").dataset.state = "error";
     $("adapter-title").textContent = "读取插件状态失败";
     $("adapter-msg").textContent = `${error.message}。可以稍后点刷新重试。`;
@@ -1784,6 +1820,57 @@ function callText(call, statusLabels) {
   return parts.join(" · ");
 }
 
+function replayCharts(title, raw, mode) {
+  const entries = Object.entries(raw || {});
+  return h("section", { class: "prob-question" },
+    h("h4", null, title),
+    entries.length
+      ? entries.map(([id, answer]) => renderProbabilityChart(id, answer, mode === "random" || answer?.decision_mode === "random"))
+      : h("p", { class: "hint" }, "没有可展示的概率分布。"),
+  );
+}
+
+function replayOutput(replay, item) {
+  if (replay.loading) return h("p", { class: "hint" }, "正在调用判断提供商…");
+  if (replay.error) return h("p", { class: "log-replay-error" }, `重放失败：${replay.error}`);
+  const data = replay.data;
+  const fresh = data.new || {};
+  return [
+    h("h4", null, `重放结果 · ${fresh.duration_ms ?? "—"} ms`),
+    h("p", { class: "hint" }, `使用已记录的 ${data.message_count} 条近期消息（每条最多 500 字）、原判断时间和当前图库；回复后判断使用已发送正文的前 80 字。仅判断，不发送消息或执行动作。`),
+    fresh.error ? h("p", { class: "log-replay-error" }, fresh.error) : null,
+    fresh.post_decision?.error ? h("p", { class: "log-replay-error" }, fresh.post_decision.error) : null,
+    replayCharts("当前草稿概率", { ...fresh.raw, ...fresh.post_decision?.raw }, fresh.decision_mode),
+    replayCharts("原日志概率", { ...data.old?.raw, ...data.old?.post_decision?.raw }, item.decision_mode),
+    h("p", { class: "log-meta" }, `原结果：${ACTION_LABELS[normalizeLogAction(data.old?.action)] || data.old?.action || "—"}；新结果：${ACTION_LABELS[normalizeLogAction(fresh.action)] || fresh.action || "—"}`),
+  ];
+}
+
+async function replayLog(item) {
+  if (state.replays.get(item.round_id)?.loading) return;
+  if (!state.loaded) {
+    state.replays.set(item.round_id, { error: "请先成功读取判断配置，再使用当前草稿重放。" });
+    renderLogs();
+    return;
+  }
+  state.replays.set(item.round_id, { loading: true });
+  renderLogs();
+  try {
+    const data = await bridge.apiPost("decision-replay", {
+      version: 8,
+      round_id: item.round_id,
+      decision_mode: getMode(),
+      decision_custom_context: $("custom-context").value,
+      decision_questions: collectQuestions(),
+    });
+    state.replays.set(item.round_id, { data });
+  } catch (error) {
+    state.replays.set(item.round_id, { error: error.message });
+  } finally {
+    renderLogs();
+  }
+}
+
 function renderLog(item) {
   const action = normalizeLogAction(item.action);
   const isRandom = item.decision_mode === "random";
@@ -1845,7 +1932,7 @@ function renderLog(item) {
     answer_type: "答案类型无效", unknown_option: "未知选项", batch_error: "请求失败",
   };
   const batches = [...(item.batches || []), ...(post?.batches || [])];
-  const detail = Array.isArray(item.batches) || calls.length || hints.length || hasRaw || item.target_message_id || item.degraded || post
+  const detail = Array.isArray(item.batches) || calls.length || hints.length || hasRaw || item.target_message_id || item.degraded || post || item.replay_context
     ? h(
       "details",
       { class: "log-detail" },
@@ -1867,6 +1954,15 @@ function renderLog(item) {
       ...calls.map((call) => h("p", { class: "log-meta" }, callText(call, statusLabels),
         call.sources?.length ? `（${call.sources.join("、")}）` : "", call.reason ? ` · ${call.reason}` : "")),
       !hasRaw && item.degraded ? h("p", { class: "hint" }, "判断失败，本轮没有可展示的概率。") : null,
+      item.replay_context
+        ? (() => {
+          const replay = state.replays.get(item.round_id);
+          const button = h("button", { type: "button", class: "btn btn-outline", disabled: replay?.loading,
+            title: "调用判断模型；随机题仍按草稿模式抽样。不会发送消息或执行动作。",
+            onclick: () => replayLog(item) }, replay?.loading ? "正在用当前草稿判断…" : "用当前草稿重新判断");
+          return h("div", null, button, replay && h("div", { class: "log-replay" }, replayOutput(replay, item)));
+        })()
+        : null,
     )
     : null;
 
@@ -1889,15 +1985,18 @@ function renderLog(item) {
 
   return h(
     "li",
-    { class: "log", dataset: { action } },
+    { class: "log", dataset: { action, round: item.round_id || item.time } },
     h("div", { class: "log-time" }, h("strong", null, time.clock)),
     h(
       "div",
       { class: "log-body" },
       main,
       sub,
+      item.trigger_text ? h("p", { class: "log-message" }, h("b", null, "触发"), item.trigger_text) : null,
+      item.reply_text ? h("p", { class: "log-message is-reply" }, h("b", null, item.reply_complete === false ? "部分回复" : "回复"), item.reply_text) : null,
+      item.raw?.skip_reason ? h("p", { class: "log-meta" }, item.raw.skip_reason) : null,
       item.error ? h("p", { class: "log-error" }, item.error) : null,
-      item.umo ? h("p", { class: "log-umo", title: item.umo }, item.umo) : null,
+      item.umo ? h("p", { class: "log-umo", title: item.umo }, sessionLabel(item.umo, item.session_name)) : null,
       detail,
     ),
   );
@@ -1905,11 +2004,6 @@ function renderLog(item) {
 
 function questionText(id) {
   return state.questions.find((q) => q.id.trim() === id)?.instructions.trim() || undefined;
-}
-
-function logHasIssue(item) {
-  return !!(item.error || item.degraded || item.post_decision?.error
-    || (item.tool_calls || []).some((call) => call.status === "failed" || call.status === "interrupted"));
 }
 
 const LOG_FILTERS = {
@@ -1922,7 +2016,8 @@ const LOG_FILTERS = {
 function logSearchText(item) {
   const answers = { ...(item.answers || item.custom_answers), ...item.post_decision?.answers };
   return [
-    item.umo, SCENE_LABELS[item.scene], ACTION_LABELS[normalizeLogAction(item.action)], item.meme_id,
+    item.umo, item.session_name, item.trigger_text, item.reply_text,
+    SCENE_LABELS[item.scene], ACTION_LABELS[normalizeLogAction(item.action)], item.meme_id,
     item.error, item.post_decision?.error, item.target_message_id,
     ...Object.entries(answers).flatMap(([key, value]) => [key, formatAnswer(value), `${key}=${formatAnswer(value)}`]),
     ...(item.session_hints || []),
@@ -1933,13 +2028,26 @@ function logSearchText(item) {
 
 function clearLogFilters() {
   state.logFilter = "all";
+  state.logSession = "";
   $("log-search").value = "";
-  renderLogs();
+  loadLogs();
   $("log-search").focus();
 }
 
 function renderLogs() {
+  const expanded = new Set([...$("logs").querySelectorAll(".log")]
+    .filter((node) => node.querySelector(".log-detail")?.open).map((node) => node.dataset.round));
   const logs = state.logs;
+  const sessionSelect = $("log-session");
+  const sessions = new Map(state.logSessions.map((s) => [s.umo, sessionLabel(s.umo, s.name)]));
+  const selectedSession = state.logSession;
+  if (selectedSession && !sessions.has(selectedSession)) {
+    const previousName = sessionSelect.value === selectedSession ? sessionSelect.selectedOptions[0]?.textContent : "";
+    sessions.set(selectedSession, previousName || sessionLabel(selectedSession));
+  }
+  sessionSelect.replaceChildren(h("option", { value: "" }, "全部会话"),
+    ...[...sessions.entries()].map(([umo, name]) => h("option", { value: umo }, name)));
+  sessionSelect.value = sessions.has(selectedSession) ? selectedSession : "";
   const terms = $("log-search").value.trim().toLowerCase().split(/\s+/).filter(Boolean);
   for (const button of $("log-filter").querySelectorAll("[data-filter]")) {
     const key = button.dataset.filter;
@@ -1960,10 +2068,20 @@ function renderLogs() {
     items.push(renderLog(item));
   }
   $("logs").replaceChildren(...items);
+  for (const node of $("logs").querySelectorAll(".log")) {
+    if (expanded.has(node.dataset.round)) {
+      const detail = node.querySelector(".log-detail");
+      if (detail) detail.open = true;
+    }
+  }
   const filtered = shown.length !== logs.length;
   $("log-count").textContent = !logs.length ? "" : filtered
     ? `符合条件 ${shown.length} 条，共 ${logs.length} 条`
     : `共 ${logs.length} 条`;
+  const stats = summarizeLogs(logs);
+  $("log-stats").textContent = logs.length
+    ? `${state.logSession ? "本会话" : "全部会话"}最近 ${stats.count} 条 · 决策发言率 ${percent.format(stats.speakingRate)} · 平均判断耗时 ${stats.averageMs === null ? "—" : `${stats.averageMs} ms`} · 失败率 ${percent.format(stats.failureRate)}`
+    : "";
   const empty = $("logs-empty");
   empty.hidden = shown.length > 0;
   if (!logs.length) {
@@ -1974,22 +2092,34 @@ function renderLogs() {
   }
 }
 
-async function loadLogs() {
+let loadingLogs = false;
+async function loadLogs({ automatic = false } = {}) {
+  if (loadingLogs) return;
+  if (automatic && document.activeElement?.closest("#logs")) return;
+  if (automatic && (!$("log-auto-refresh").checked || document.hidden || [...state.replays.values()].some((r) => r.loading))) return;
+  loadingLogs = true;
   const limit = Number($("log-limit").value) || 20;
+  const umo = state.logSession;
   try {
-    const data = await bridge.apiGet("logs", { limit });
+    const data = await bridge.apiGet("logs", { limit, umo });
+    if (umo !== state.logSession) return;
+    if (automatic && JSON.stringify(state.logs) === JSON.stringify(data.logs || [])
+        && JSON.stringify(state.logSessions) === JSON.stringify(data.sessions || [])) return;
     state.logs = data.logs || [];
+    state.logSessions = data.sessions || [];
     renderLogs();
   } catch (error) {
-    state.logs = [];
-    renderLogs();
-    $("logs-empty").textContent = `读取日志失败：${error.message}`;
+    $("log-count").textContent = `读取日志失败：${error.message}`;
+  } finally {
+    loadingLogs = false;
+    if (umo !== state.logSession) loadLogs();
   }
 }
 
 // ---------- 页面 ----------
 
 let currentTab = "decision";
+let logRefreshTimer = 0;
 
 function setTab(name, { focus = false } = {}) {
   currentTab = name;
@@ -2002,7 +2132,14 @@ function setTab(name, { focus = false } = {}) {
     button.tabIndex = active ? 0 : -1;
     if (active && focus) button.focus();
   }
-  if (name === "logs") loadLogs();
+  window.clearInterval(logRefreshTimer);
+  if (name === "logs") {
+    loadLogs();
+    logRefreshTimer = window.setInterval(() => {
+      loadLogs({ automatic: true });
+      if (!document.hidden) loadStatus();
+    }, 10000);
+  }
 }
 
 async function reload() {
@@ -2092,6 +2229,27 @@ $("tab-btn-decision").addEventListener("keydown", onTabKey);
 $("tab-btn-logs").addEventListener("keydown", onTabKey);
 $("log-limit").addEventListener("change", loadLogs);
 $("log-search").addEventListener("input", renderLogs);
+$("log-session").addEventListener("change", (event) => {
+  state.logSession = event.target.value;
+  loadLogs();
+});
+$("test-provider").addEventListener("click", async () => {
+  const button = $("test-provider");
+  const result = $("provider-test-result");
+  button.disabled = true;
+  result.textContent = "正在测试…";
+  try {
+    const data = await bridge.apiPost("test-provider", {});
+    result.textContent = data.ok ? `可用（${data.duration_ms} ms）` : `失败：${data.error || "未知错误"}`;
+    result.className = data.ok ? "status-hint is-success" : "status-hint is-error";
+    await loadStatus();
+  } catch (error) {
+    result.textContent = `测试失败：${error.message}`;
+    result.className = "status-hint is-error";
+  } finally {
+    button.disabled = false;
+  }
+});
 for (const button of $("log-filter").querySelectorAll("[data-filter]")) {
   button.addEventListener("click", () => {
     state.logFilter = button.dataset.filter;

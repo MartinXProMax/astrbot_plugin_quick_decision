@@ -35,6 +35,7 @@ from .models import (
     DecisionResult,
     SceneType,
     ToolCall,
+    decision_log_context,
 )
 from .workflow_actions import ACTIONS, migrate_actions
 
@@ -855,6 +856,7 @@ async def ask_decision(
     last_activity: float | None = None,
     trigger_event: str = "",
     timer_roots: set[str] | None = None,
+    evaluation_time: float | None = None,
 ) -> DecisionResult:
     """按当前模式评估本轮问题。失败时返回带 error 的结果。"""
     started = time.monotonic()
@@ -865,11 +867,13 @@ async def ask_decision(
     outcomes = {}
     batches = []
     state = None
+    now, zone = _round_clock(context, umo)
+    round_clock = (evaluation_time if evaluation_time is not None else now, zone)
     try:
-        clock = _round_clock(context, umo) if scene == "group_passive" else None
+        clock = round_clock if scene == "group_passive" else None
         all_specs = _build_specs(
             settings.decision_questions, scene, messages, memes, settings,
-            context=context, umo=umo, last_activity=last_activity, stage=None, clock=clock,
+            context=context, umo=umo, last_activity=last_activity, stage=None, clock=round_clock,
             trigger_event=trigger_event, timer_roots=timer_roots,
         )
         specs = [s for s in all_specs if s.stage == "pre_reply"]
@@ -915,4 +919,7 @@ async def ask_decision(
     result.decision_mode = _result_mode(
         all_specs if "all_specs" in locals() else specs, settings.decision_mode
     )
+    if settings.decision_log_include_content:
+        result.log_context = decision_log_context(messages, evaluated_at=round_clock[0], at_or_quoted=at_or_quoted,
+                                                  last_activity=last_activity, timer_roots=timer_roots)
     return result

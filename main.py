@@ -27,6 +27,7 @@ from .decision_tools import run_tools, skip_tools
 from .event_utils import (
     event_has_command_handler,
     event_profile,
+    event_session_name,
     event_timestamp,
     inspect_mentions,
     is_self_message,
@@ -34,7 +35,7 @@ from .event_utils import (
 )
 from .meme_adapter import UNAVAILABLE_HINT, MemeManagerAdapter
 from .meme_migrate import maybe_migrate_legacy_library
-from .models import BufferedMessage, DecisionResult, SceneType, SessionProfile
+from .models import BufferedMessage, DecisionResult, SceneType, SessionProfile, decision_log_context
 from .official_handoff import (
     begin_official_pipeline,
     build_inbound_user_prompt,
@@ -64,6 +65,12 @@ from .session_store import SessionStore
 from .web_api import WebApiMixin
 
 PLUGIN_NAME = "astrbot_plugin_quick_decision"
+LOG_TEXT_LIMIT = 120
+
+
+def _log_text(value: str, limit: int = LOG_TEXT_LIMIT) -> str:
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
 
 def _next_timer_at(trigger, now, zone):
@@ -147,9 +154,15 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         runtime = self.sessions.append_message(
             profile, buffered, self.settings.context_message_limit
         )
+        runtime.display_name = event_session_name(event) or runtime.display_name
         if not self.settings.enabled:
             return
-
+        if (not profile.is_private and not runtime.display_name and callable(getattr(event, "get_group", None))
+                and time.time() - runtime.name_checked_at > 300):
+            runtime.name_checked_at = time.time()
+            task = asyncio.create_task(self._resolve_session_name(event, runtime))
+            self._post_tasks.add(task)
+            task.add_done_callback(self._post_tasks.discard)
         if is_official_pipeline_busy(runtime):
             runtime.pending.append(buffered)
             if runtime.pending_pipeline is None:
@@ -180,6 +193,19 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             if runtime.pending_pipeline is None:
                 runtime.deciding = False
                 runtime.pending.clear()
+
+    async def _resolve_session_name(self, event, runtime) -> None:
+        get_group = getattr(event, "get_group", None)
+        if callable(get_group):
+            try:
+                group = await asyncio.wait_for(get_group(), timeout=3)
+                runtime.display_name = str(getattr(group, "group_name", "") or runtime.display_name)
+                if runtime.display_name:
+                    logs = self.sessions.recent_logs(limit=1, umo=runtime.profile.umo)
+                    if logs and logs[0].get("round_id"):
+                        await self.sessions.update_round_log(logs[0]["round_id"], session_name=runtime.display_name)
+            except Exception:  # noqa: BLE001
+                logger.debug("无法读取会话名称：%s", runtime.profile.umo)
 
     async def _run_passive_round(
         self, event: AstrMessageEvent, profile: SessionProfile
@@ -422,20 +448,18 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         self._schedule_post_decision(result, text, profile.umo, platform_name)
 
         sent_texts: list[str] = []
-        sent = await send_decision_message(
-            self.context,
-            umo=profile.umo,
-            text=text,
-            resolver=self.meme_adapter,
-            decision=result,
-            dry_run=False,
-            platform_name=platform_name,
-            sent_texts=sent_texts,
-        )
-        if sent and sent_texts:
-            self._record_bot_text(profile, "\n".join(sent_texts))
-            if result.action == "proactive":
-                self.sessions.mark_proactive(profile.umo)
+        try:
+            await send_decision_message(
+                self.context, umo=profile.umo, text=text, resolver=self.meme_adapter,
+                decision=result, dry_run=False, platform_name=platform_name, sent_texts=sent_texts,
+            )
+        finally:
+            if sent_texts:
+                reply_text = "\n".join(sent_texts)
+                self._record_bot_text(profile, reply_text)
+                await self._update_log_reply(result, reply_text, complete=result.text_sent is True)
+                if result.action == "proactive":
+                    self.sessions.mark_proactive(profile.umo)
 
     def _meme_candidates(self, settings):
         by_id = {q.id: q for q in settings.decision_questions}
@@ -483,40 +507,59 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         self.sessions.mark_bot_sent(profile.umo)
 
     async def _log_decision(
-        self, profile: SessionProfile, result: DecisionResult
+        self, profile: SessionProfile, result: DecisionResult, *, timer_roots=None
     ) -> None:
         if not result.should_speak():
             skip_tools(result, "本轮不发言", when="after_send")
         if not result.round_id:
             result.round_id = uuid4().hex
-        await self.sessions.append_log(
-            {
-                "round_id": result.round_id,
-                "tool_calls": [asdict(c) for c in result.tool_calls.values()],
-                "answers": result.answers,
-                "batches": result.batches,
-                "outcomes": {key: o.reason for key, o in result.outcomes.items() if not o.has_answer},
-                "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "umo": profile.umo,
-                "scene": result.scene,
-                "trigger_event": result.trigger_event,
-                "decision_mode": result.decision_mode,
-                "action": result.action,
-                "reply_sources": result.reply_sources,
-                "length": result.length,
-                "custom_answers": result.custom_answers,
-                "session_hints": result.session_hints,
-                "use_meme": result.use_meme,
-                "meme_id": result.meme_id,
-                "target_message_id": result.target_message_id,
-                "duration_ms": result.duration_ms,
-                "error": result.error,
-                "degraded": result.degraded,
-                "dry_run": result.dry_run,
-                "official_llm": result.official_llm,
-                "raw": result.raw,
-            }
+        runtime = self.sessions.get(profile.umo)
+        log_context = result.log_context or decision_log_context(
+            self.sessions.recent_messages(profile.umo, self.settings.context_message_limit),
+            evaluated_at=time.time(), last_activity=runtime.last_activity if runtime else None, timer_roots=timer_roots,
         )
+        trigger = next((m for m in reversed(log_context["messages"]) if m["role"] == "user"), None)
+        record = {
+            "round_id": result.round_id,
+            "tool_calls": [asdict(c) for c in result.tool_calls.values()],
+            "answers": result.answers,
+            "batches": result.batches,
+            "outcomes": {key: o.reason for key, o in result.outcomes.items() if not o.has_answer},
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "umo": profile.umo,
+            "scene": result.scene,
+            "trigger_event": result.trigger_event,
+            "decision_mode": result.decision_mode,
+            "action": result.action,
+            "reply_sources": result.reply_sources,
+            "length": result.length,
+            "custom_answers": result.custom_answers,
+            "session_hints": result.session_hints,
+            "use_meme": result.use_meme,
+            "meme_id": result.meme_id,
+            "target_message_id": result.target_message_id,
+            "duration_ms": result.duration_ms,
+            "error": result.error,
+            "degraded": result.degraded,
+            "dry_run": result.dry_run,
+            "official_llm": result.official_llm,
+            "raw": result.raw,
+            "session_name": runtime.display_name if runtime else "",
+            "reply_sent": None if result.should_speak() and not result.dry_run else False,
+        }
+        if self.settings.decision_log_include_content:
+            record["replay_context"] = log_context
+            if trigger:
+                record.update(trigger_text=_log_text(trigger["text"]),
+                              trigger_sender=trigger["sender_name"] or trigger["sender_id"])
+        await self.sessions.append_log(record)
+
+    async def _update_log_reply(self, result: DecisionResult, text: str, *, complete=True) -> None:
+        if result.round_id and text:
+            fields = {"reply_sent": True, "reply_complete": complete}
+            if self.settings.decision_log_include_content:
+                fields["reply_text"] = _log_text(text, 80)
+            await self.sessions.update_round_log(result.round_id, **fields)
 
     # --- 定时判断与冷场主动发言 ---
 
@@ -630,7 +673,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             )
             result.dry_run = settings.dry_run
             runtime.last_decision = result
-            await self._log_decision(profile, result)
+            await self._log_decision(profile, result, timer_roots=timer_roots)
             logger.info("%s：%s", limit_reason, profile.umo)
             return
         if memes is None:
@@ -748,6 +791,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if getattr(result, "is_llm_result", lambda: False)() and not event.get_extra("_qd_streaming"):
             decision.text_sent = None
             event.set_extra("_qd_text_receipt", False)
+            event.set_extra("_qd_sent_text", "")
             event.set_extra("_qd_undecorated_text", "".join(c.text for c in result.chain if isinstance(c, Plain)))
         is_private = event.is_private_chat()
         settings = self.settings
@@ -780,6 +824,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if isinstance(decision, DecisionResult) and stream_text is None and official_generation_failed(event):
             stream_text, complete = "", False
         runtime = self.sessions.get(event.unified_msg_origin)
+        reply_text = ""
         if runtime is not None and isinstance(decision, DecisionResult):
             text = stream_text or ""
             result = event.get_result()
@@ -791,6 +836,12 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 ).strip()
             if text:
                 self._record_bot_text(runtime.profile, text)
+                if stream_text is not None:
+                    reply_text = text
+                else:
+                    reply_text = event.get_extra("_qd_sent_text") or (
+                        text if official_text_was_sent(event) and decision.text_sent is not False else ""
+                    )
                 if stream_text is not None and complete:
                     self._schedule_post_decision(decision, text, event.unified_msg_origin, platform_name_from_event(event))
             elif stream_text is None:
@@ -806,6 +857,8 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             )
         finally:
             if isinstance(decision, DecisionResult):
+                if reply_text:
+                    await self._update_log_reply(decision, reply_text, complete=complete and decision.text_sent is not False)
                 await self._finish_tool_log(decision)
 
     async def _cancel_official_round(self, event, decision, reason):
@@ -819,6 +872,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             result.text_sent = False
         if not result.text_sent:
             skip_tools(result, reason, when="after_send")
+        if result.round_id and not result.text_sent:
+            row = self.sessions.find_log(result.round_id)
+            if row and not row.get("reply_sent"):
+                await self.sessions.update_round_log(result.round_id, reply_sent=False)
         await self._update_tool_log(result)
 
     async def _update_tool_log(self, result):

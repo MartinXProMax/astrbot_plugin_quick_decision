@@ -19,12 +19,15 @@
           <div id="status-chips" class="chips" aria-live="polite">
             <span class="chip">正在读取状态…</span>
           </div>
+          <button id="test-provider" type="button" class="btn btn-ghost">测试判断提供商</button>
+          <span id="provider-test-result" class="status-hint" role="status"></span>
           <button id="refresh" type="button" class="btn btn-ghost">
             <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7" /><path d="M20 4v7h-7" /></svg>
             <span id="refresh-label">刷新</span>
           </button>
         </div>
       </header>
+      <div id="health-banner" class="banner banner-danger" role="alert" hidden></div>
 
       <nav class="tabs" role="tablist" aria-label="插件页面分段">
         <button id="tab-btn-decision" type="button" role="tab" class="tab active" data-tab="decision" aria-selected="true" aria-controls="panel-decision">判断配置</button>
@@ -176,6 +179,7 @@
               </label>
             </div>
             <div class="log-toolbar">
+              <label class="inline-select" title="操作日志内的按钮或详情时暂停自动刷新，移开焦点后继续"><input id="log-auto-refresh" type="checkbox" checked />每 10 秒刷新</label>
               <div id="log-filter" class="seg" role="group" aria-label="按结果筛选">
                 <button type="button" data-filter="all" aria-pressed="true">全部</button>
                 <button type="button" data-filter="speak" aria-pressed="false">发言</button>
@@ -183,8 +187,12 @@
                 <button type="button" data-filter="issue" aria-pressed="false">失败或降级</button>
               </div>
               <input id="log-search" type="search" placeholder="搜索会话、问题、答案或错误" aria-label="搜索决策日志" autocomplete="off" />
+              <select id="log-session" aria-label="按会话筛选">
+                <option value="">全部会话</option>
+              </select>
             </div>
             <p id="log-count" class="log-count" aria-live="polite"></p>
+            <p id="log-stats" class="log-stats" aria-live="polite"></p>
             <ol id="logs" class="log-list"></ol>
             <p id="logs-empty" class="empty" hidden>还没有决策记录。机器人收到消息并完成一次判断后，结果会出现在这里。</p>
           </section>
