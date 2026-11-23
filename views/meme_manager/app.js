@@ -725,6 +725,7 @@ function renderStats() {
 // ---------- 问题卡片 ----------
 
 function renderQuestions(focus) {
+  const { scrollX, scrollY } = window;
   disarm();
   const root = $("questions");
   if (!state.questions.length) {
@@ -743,7 +744,9 @@ function renderQuestions(focus) {
   renderStats();
   refreshChangeMarks();
   if (NEEDS_AUTOSIZE) root.querySelectorAll("textarea.autosize").forEach(autosize);
-  if (focus) document.querySelector(focus)?.focus();
+  // 重建卡片、恢复文本框高度期间页面可能短暂变矮，浏览器会截短滚动位置。
+  window.scrollTo({ left: scrollX, top: scrollY, behavior: "instant" });
+  if (focus) document.querySelector(focus)?.focus({ preventScroll: true });
 }
 
 function refreshEditor(focus) {
