@@ -2,20 +2,21 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 import json
 import math
 import re
+from copy import deepcopy
 from graphlib import CycleError, TopologicalSorter
 from typing import Any
 
+from .candidate_sources import migrate_candidate_sources, source_question
 from .decision_tools import TOOLS
-from .workflow_actions import WORKFLOW_EVENTS, validate_actions
 from .models import (
     QUESTION_ROLES,
     DecisionQuestion,
     DecisionQuestionOption,
 )
+from .workflow_actions import WORKFLOW_EVENTS, validate_actions
 
 ACTION_CRITERIA_GROUP = {
     "none": "现在不适合发言，保持沉默",
@@ -243,6 +244,7 @@ def default_questions(legacy=None):
     if legacy is None:
         meme = next(q for q in questions if q.id == "meme_id")
         meme.triggers = [{"question": "meme_category", "option": "*"}]
+        meme.candidate_source = {"question": "meme_category"}
         category = DecisionQuestion(
             "meme_category",
             "choice",
@@ -422,7 +424,7 @@ def _parse_one_question(
         "decision_mode": decision_mode,
         "use_threshold": not legacy and _as_bool(item.get("use_threshold"), False),
         "branches": {} if legacy else item.get("branches", {}),
-        "candidate_source": str(item.get("candidate_source") or "options"),
+        "candidate_source": deepcopy(item.get("candidate_source", "options")),
         "requires_candidates": str(item.get("requires_candidates") or ""),
     }
     if qtype == "choice":
@@ -561,7 +563,7 @@ def parse_decision_questions(
                 question.actions = item.get("actions", {})
                 if not isinstance(question.actions, dict):
                     return [], f"问题 {question.id} 的 actions 应为对象"
-                for key in ("candidate_source", "default_option", "private_default", "requires_candidates"):
+                for key in ("default_option", "private_default", "requires_candidates"):
                     if key in item:
                         if not isinstance(item[key], str):
                             return [], f"问题 {question.id} 的 {key} 应为字符串"
@@ -629,6 +631,9 @@ def _validate_triggers(questions, action_format=False):
         seen = set()
         if action_format and (error := validate_actions(q, by_id)):
             return f"问题 {q.id}：{error}"
+        source_id = source_question(q.candidate_source)
+        if source_id and (q.enabled or source_id in by_id):
+            graph.add(q.id, source_id)
         if q.role == "action" and (len(q.triggers) != 1 or not isinstance(q.triggers[0], dict)
                                    or "event" not in q.triggers[0]):
             return f"控制发言题 {q.id} 需要一个事件入口"
@@ -636,6 +641,8 @@ def _validate_triggers(questions, action_format=False):
             if not isinstance(t, dict) or type(t.get("ask_with_parent", False)) is not bool:
                 return f"问题 {q.id} 的生效条件或提问时机无效"
             early = t.get("ask_with_parent", False)
+            if source_id and early:
+                return f"问题 {q.id} 需要等待候选来源的答案，不能同批提前提问"
             if "event" in t:
                 event = t["event"]
                 events = WORKFLOW_EVENTS if action_format else EVENTS
@@ -704,15 +711,19 @@ def load_questions(value, *, strict=False):
     if isinstance(value, dict) and "version" in value:
         if (
             type(value.get("version")) is not int
-            or value["version"] not in (2, 3, 4, 5)
+            or value["version"] not in (2, 3, 4, 5, 6)
             or not isinstance(value.get("questions"), list)
         ):
             return [], "无法识别的问题配置版本或格式"
         if value["version"] >= 3:
             questions, warning = parse_decision_questions(value["questions"], strict=True, legacy=False, trigger_format=True,
-                                                         action_format=value["version"] == 5)
-            if warning or value["version"] >= 4:
+                                                         action_format=value["version"] >= 5)
+            if warning:
                 return questions, warning
+            if value["version"] >= 4:
+                if value["version"] < 6:
+                    questions = migrate_candidate_sources(questions)
+                return questions, None
         else:
             old, warning = parse_decision_questions(value["questions"], strict=strict, legacy=False)
             questions, migrated_warning = migrate_questions(old)

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  candidateSourceChoices, candidateSourceIssue, candidateType, configureCandidateCatalogs, previewCandidateItems,
   actionAvailability, changeSource, changeStage, changeType, deleteOption, deleteQuestion, findSlot,
   normalizeQuestions, possibleScenes, questionIssues, questionsForScene, replySources, roots, runChange, serializeQuestion,
   sourceChoices, templateQuestion, validate, wouldCycle,
@@ -240,4 +241,89 @@ test("模板生成普通题，选消息题自带交给会话模型和引用", ()
   assert.deepEqual(saved.triggers, []);
   const meme = serializeQuestion(templateQuestion("meme", questions));
   assert.deepEqual(meme.actions, { "*": [{ tool: "send_meme", when: "after_send" }] });
+});
+
+const CANDIDATE_GRAPH = [
+  base("category", { ...options("none", "*"), candidate_source: "meme_categories", triggers: [{ event: "message_received" }] }),
+  base("image", { ...options("none", "*"), candidate_source: { question: "category" },
+    triggers: [{ question: "category", option: "*" }], actions: { "*": [{ tool: "send_meme", when: "after_send" }] } }),
+];
+
+test("候选引用随重命名保存，图片类型可供发图动作使用", () => {
+  const questions = normalizeQuestions(CANDIDATE_GRAPH);
+  assert.equal(validate(questions, CATALOG), null);
+  assert.equal(candidateType(questions[1]), "memes");
+  questions[0].id = "图库分组";
+  assert.deepEqual(serializeQuestion(questions[1]).candidate_source, { question: "图库分组" });
+  assert.deepEqual(candidateSourceChoices(questions, questions[1]), [questions[0]]);
+});
+
+test("删除候选来源后保持失效引用，停用受影响题或修复来源后可以保存", () => {
+  const questions = normalizeQuestions(CANDIDATE_GRAPH);
+  const [category, image] = questions;
+  runChange(questions, CATALOG, deleteQuestion(questions, category));
+  assert.match(candidateSourceIssue(image, questions), /已删除/);
+  assert.equal(validate(questions, CATALOG).field, "source");
+  assert.deepEqual(serializeQuestion(image).candidate_source, { question: "category" });
+  assert.equal(image.options[1].actions.length, 1);
+  image.enabled = false;
+  assert.equal(validate(questions, CATALOG), null);
+  image.enabled = true;
+  runChange(questions, CATALOG, changeSource(image, "memes"));
+  image.triggers = [{ event: "message_received" }];
+  assert.equal(candidateSourceIssue(image, questions), null);
+  assert.equal(validate(questions, CATALOG), null);
+});
+
+test("候选引用禁止同批提前提问，并参与混合循环及阶段校验", () => {
+  const questions = normalizeQuestions(CANDIDATE_GRAPH);
+  const [category, image] = questions;
+  image.triggers[0].ask_with_parent = true;
+  assert.equal(validate(questions, CATALOG).field, "timing");
+  runChange(questions, CATALOG, () => () => {});
+  assert.equal(image.triggers[0].ask_with_parent, false);
+  category.triggers = [{ parent: image, option: image.options[1], ask_with_parent: false }];
+  assert.equal(wouldCycle(questions, image, category), true);
+  assert.match(candidateSourceIssue(image, questions), /循环/);
+  category.triggers = [{ event: "reply_generated" }];
+  category.stage = "post_reply";
+  assert.match(candidateSourceIssue(image, questions), /正文生成后/);
+});
+
+test("预览的示例选项随来源选项变化，来源无选择、停用或删除时没有下级", () => {
+  const questions = normalizeQuestions(CANDIDATE_GRAPH);
+  const [category, image] = questions;
+  const catalogs = { meme_categories: [
+    { id: "开心", description: "开心", children: [{ id: "smile", description: "微笑" }] },
+    { id: "难过", description: "难过", children: [{ id: "cry", description: "流泪" }] },
+  ] };
+  const choices = new Map();
+  assert.deepEqual(previewCandidateItems(image, catalogs, choices), []);
+  choices.set(category, "开心");
+  assert.deepEqual(previewCandidateItems(image, catalogs, choices).map((item) => item.id), ["smile"]);
+  choices.set(category, "难过");
+  assert.deepEqual(previewCandidateItems(image, catalogs, choices).map((item) => item.id), ["cry"]);
+  category.enabled = false;
+  assert.deepEqual(previewCandidateItems(image, catalogs, choices), []);
+  image.candidate_from = null;
+  assert.deepEqual(previewCandidateItems(image, catalogs, choices), []);
+});
+
+test("候选来源的场景限制也约束依赖题", () => {
+  const [category, image] = normalizeQuestions(CANDIDATE_GRAPH);
+  image.triggers = [{ event: "message_received" }];
+  category.scenes = ["private_passive"];
+  assert.deepEqual([...possibleScenes(image)], ["private_passive"]);
+});
+
+test("非图库的下级候选复用同一来源、类型与删除规则", () => {
+  configureCandidateCatalogs({ folders: { label: "文件夹", children: "documents" }, documents: { label: "文件" } });
+  const questions = normalizeQuestions([
+    base("folder", { ...options("none", "*"), candidate_source: "folders", triggers: [{ event: "message_received" }] }),
+    base("file", { ...options("none", "*"), candidate_source: { question: "folder" }, triggers: [{ event: "message_received" }] }),
+  ]);
+  assert.equal(candidateType(questions[1]), "documents");
+  assert.deepEqual(candidateSourceChoices(questions, questions[1]), [questions[0]]);
+  assert.equal(validate(questions, CATALOG), null);
+  assert.equal(actionAvailability(questions, CATALOG, questions[1], questions[1].options[1], "send_meme"), "需要一道从图库表情中选择的题");
 });

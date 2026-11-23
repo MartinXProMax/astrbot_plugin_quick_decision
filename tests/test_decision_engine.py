@@ -58,6 +58,16 @@ def message(mid: str) -> BufferedMessage:
 
 
 
+def flat_gallery(settings):
+    """旧批次/权重回归显式使用全部图片，不经过分类。"""
+    settings.decision_questions = [q for q in settings.decision_questions if q.id != "meme_category"]
+    for question in settings.decision_questions:
+        if question.id == "meme_id":
+            question.candidate_source = "memes"
+            question.triggers = [{"question": "use_meme", "option": "true"}]
+    return settings
+
+
 class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
     async def ask(
         self,
@@ -135,7 +145,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_all_48_batch_paths_match_preview_and_gate_effects(self):
         for timings in product((False, True), repeat=4):
-            settings = PluginSettings({})
+            settings = flat_gallery(PluginSettings({}))
             questions = {q.id: q for q in settings.decision_questions}
             for key, early in zip(("target_message_id", "length", "use_meme", "meme_id"), timings, strict=True):
                 for trigger in questions[key].triggers:
@@ -669,7 +679,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.tool_calls)
 
     async def test_random_workflow_deduplicates_shared_child_and_follows_fixed_reply(self):
-        settings = PluginSettings({"decision_mode": "random"})
+        settings = flat_gallery(PluginSettings({"decision_mode": "random"}))
         by_id = {q.id: q for q in settings.decision_questions}
         action, length, gate, meme = (by_id[key] for key in ("action", "length", "use_meme", "meme_id"))
         meme.triggers.append({"question": action.id, "option": "reply"})
@@ -691,7 +701,7 @@ class UnifiedDecisionTests(unittest.IsolatedAsyncioTestCase):
             {"action": choice("reply", reply=1), "use_meme": DecisionBooleanAnswer(probability=1)},
             DecisionError("timeout"),
         ]))
-        result = await self.ask(service)
+        result = await self.ask(service, settings=flat_gallery(PluginSettings({})))
         self.assertTrue(result.failed)
         self.assertFalse(result.should_speak())
         self.assertFalse(result.tool_calls)

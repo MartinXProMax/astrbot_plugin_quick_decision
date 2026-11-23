@@ -146,7 +146,7 @@ class DecisionQuestion:
     decision_mode: Literal["model", "random"] | None = None
     # None 表示读入旧编辑器格式，空字典表示一道无动作的普通题。
     actions: dict[str, list[dict]] | None = None
-    candidate_source: str = "options"
+    candidate_source: str | dict[str, str] = "options"
     requires_candidates: str = ""
     private_default: str = ""
     default_option: str = ""

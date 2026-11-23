@@ -5,8 +5,8 @@ from __future__ import annotations
 import math
 import random
 import time
-from copy import deepcopy
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -21,8 +21,14 @@ from astrbot.api.provider import (
     DecisionError,
 )
 
+from .candidate_sources import (
+    candidate_type,
+    catalog_name,
+    example_catalogs,
+    meme_catalogs,
+    source_question,
+)
 from .config_util import PluginSettings, default_questions
-from .workflow_actions import ACTIONS, migrate_actions
 from .models import (
     BufferedMessage,
     DecisionOutcome,
@@ -30,6 +36,7 @@ from .models import (
     SceneType,
     ToolCall,
 )
+from .workflow_actions import ACTIONS, migrate_actions
 
 Question = DecisionBooleanQuestion | DecisionChoiceQuestion
 
@@ -57,8 +64,12 @@ class DecisionSpec:
     parents: list[tuple[str, str, bool]] = field(default_factory=list)
     target_texts: dict[str, str] = field(default_factory=dict)
     candidate_descriptions: dict[str, str] = field(default_factory=dict)
-    candidate_groups: dict[str, str] = field(default_factory=dict)
-    candidate_filter_parent: str = ""
+    candidate_items: dict[str, dict] = field(default_factory=dict)
+    source_question: str = ""
+    choice_options: list[tuple] = field(default_factory=list)
+    instructions: str = ""
+    eligible: bool = True
+    unavailable_reason: str = ""
     stage: str = "pre_reply"
     decision_mode: Literal["model", "random"] = "model"
 
@@ -276,6 +287,7 @@ def has_on_match_actions(
     event = trigger_event or (
         "silence_elapsed" if scene.endswith("_proactive") else "message_received"
     )
+    by_id = {question.id: question for question in configured}
     enabled = {
         question.id: question
         for question in configured
@@ -291,26 +303,24 @@ def has_on_match_actions(
         )
         and (
             candidate_available is None
-            or question.candidate_source == "options"
-            or candidate_available.get(question.candidate_source, False)
+            or catalog_name(question.candidate_source) == "options"
+            or candidate_available.get(candidate_type(question, by_id), False)
         )
     }
-    reachable = {
-        question.id
-        for question in enabled.values()
-        if any(trigger.get("event") == event for trigger in question.triggers or [])
-        and (timer_roots is None or event != "timer_elapsed" or question.id in timer_roots)
-    }
+    reachable = set()
     changed = True
     while changed:
         changed = False
         for question in enabled.values():
             if question.id in reachable:
                 continue
-            if any(
-                trigger.get("question") in reachable
-                for trigger in question.triggers or []
-            ):
+            parent_id = source_question(question.candidate_source)
+            if parent_id and parent_id not in reachable:
+                continue
+            if any(trigger.get("question") in reachable or (
+                trigger.get("event") == event
+                and (timer_roots is None or event != "timer_elapsed" or question.id in timer_roots)
+            ) for trigger in question.triggers or []):
                 reachable.add(question.id)
                 changed = True
     return any(
@@ -369,38 +379,24 @@ def _question_info(context, umo, scene, last_activity, clock=None):
 
 def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
                  context=None, umo="", last_activity=None, stage="pre_reply", clock=None,
-                 trigger_event="", timer_roots=None):
+                 trigger_event="", timer_roots=None, catalogs=None):
     specs = []
     info = None
     event = trigger_event or ("silence_elapsed" if scene.endswith("_proactive") else "message_received")
     candidates = {m.message_id: m for m in messages[-8:] if m.role == "user" and m.message_id}
     configured, _ = migrate_actions(configured)
-    categories = {
-        str(meme.get("category") or "").strip()
-        for meme in memes
-        if str(meme.get("category") or "").strip()
-    }
-    available = {
-        "recent_messages": bool(candidates if targets is None else targets),
-        "meme_categories": bool(categories),
-        "memes": bool(memes),
-    }
-    source_by_id = {question.id: question.candidate_source for question in configured}
-    parent_triggers = {
-        question.id: [
-            (trigger["question"], trigger["option"], trigger.get("ask_with_parent", False))
-            for trigger in question.triggers
-            if "question" in trigger
-        ]
-        for question in configured
-    }
+    catalogs = deepcopy(catalogs) if catalogs is not None else meme_catalogs(memes)
+    available = {key: bool(items) for key, items in catalogs.items()}
+    available["recent_messages"] = bool(candidates if targets is None else targets)
+    by_id = {question.id: question for question in configured}
     successors = {}
     for child in configured:
         if not child.enabled or (child.scenes and scene not in child.scenes) or (
-            child.requires_candidates and not available[child.requires_candidates]
+            child.requires_candidates and not available.get(child.requires_candidates, False)
         ) or (
-            child.candidate_source != "options"
-            and not available.get(child.candidate_source, False)
+            catalog_name(child.candidate_source) != "options"
+            and not source_question(child.candidate_source)
+            and not available.get(catalog_name(child.candidate_source), False)
         ):
             continue
         for trigger in child.triggers:
@@ -409,24 +405,9 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
     for item in configured:
         if not item.enabled or (stage is not None and item.stage != stage):
             continue
-        if item.candidate_source == "meme_categories" and not categories:
-            continue
         in_scene = not item.scenes or scene in item.scenes
         parents = [(t["question"], t["option"], t.get("ask_with_parent", False))
                    for t in item.triggers if "question" in t and in_scene]
-        if item.candidate_source == "memes" and not categories:
-            parents = [
-                replacement
-                for parent, option, early in parents
-                for replacement in (
-                    [
-                        (grandparent, option, early or inherited_early)
-                        for grandparent, option, inherited_early in parent_triggers.get(parent, [])
-                    ]
-                    if source_by_id.get(parent) == "meme_categories"
-                    else [(parent, option, early)]
-                )
-            ]
         root_event = "reply_generated" if item.stage == "post_reply" else event
         root = in_scene and any(t.get("event") == root_event for t in item.triggers)
         if root_event == "timer_elapsed" and timer_roots is not None:
@@ -437,19 +418,12 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
         default = fixed or item.default_option or (False if item.type == "boolean" and item.use_threshold else None)
         if item.type == "boolean" and isinstance(default, str):
             default = default == "true"
-        eligible = in_scene and (not item.requires_candidates or available[item.requires_candidates])
+        eligible = in_scene and (not item.requires_candidates or available.get(item.requires_candidates, False))
         spec = DecisionSpec(
-            id=item.id, kind="fixed" if fixed and eligible else item.type, candidate_source=item.candidate_source,
+            id=item.id, kind="fixed" if fixed and eligible else item.type, candidate_source=candidate_type(item, by_id),
             question=None, default=default, actions=deepcopy(item.actions), aliases=item.aliases.copy(),
             is_root=root, parents=parents, stage=item.stage,
-            candidate_filter_parent=(
-                next(
-                    (parent for parent, _, _ in parents if source_by_id.get(parent) == "meme_categories"),
-                    "",
-                )
-                if categories
-                else ""
-            ),
+            source_question=source_question(item.candidate_source), eligible=eligible,
             decision_mode=item.decision_mode or settings.decision_mode,
             threshold=settings.choice_threshold if item.use_threshold else (0.5 if item.type == "boolean" else 0.0),
             temperature=0.0 if item.type == "boolean" and item.use_threshold else settings.choice_temperature,
@@ -458,7 +432,7 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
         if fixed or not eligible:
             continue
 
-        def effect(key):
+        def effect(key, item=item, spec=spec):
             parts = []
             for action in item.actions.get(key, ()):
                 name = action["tool"]
@@ -466,7 +440,7 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
                 if name == "add_context":
                     if "text" in action:
                         parts.append("会话提示：" + action["text"])
-                    elif source == item.id and item.candidate_source == "recent_messages" and key == "*":
+                    elif source == item.id and spec.candidate_source == "recent_messages" and key == "*":
                         parts.append("将选中消息的发送人和原文交给会话模型，同时提供发送时间")
                     else:
                         parts.append(f"将 {source} 的答案交给会话模型")
@@ -498,81 +472,63 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
             spec.allowed = frozenset({"true", "false"})
             spec.option_weights = {"true": item.true_weight, "false": item.false_weight}
             continue
-        dynamic = {}
-        if item.candidate_source == "recent_messages":
+        spec.instructions = prompt
+        spec.choice_options = [
+            (option.id, option.criteria, option.weight, effect(option.id))
+            for option in item.options
+        ]
+        items = catalogs.get(catalog_name(item.candidate_source), [])
+        if catalog_name(item.candidate_source) == "recent_messages":
             if targets is not None:
-                dynamic = spec.target_texts = dict(targets)
+                spec.target_texts = dict(targets)
+                items = [{"id": key, "description": value} for key, value in targets.items()]
             else:
                 clock = clock or _round_clock(context, umo)
+                items = []
                 for mid, msg in candidates.items():
                     header = f"回复 {msg.sender_name or msg.sender_id} · {_sent_time_label(msg.sent_at, clock)}："
-                    dynamic[mid] = header + (msg.text[:40] or "（无文本）")
                     spec.target_texts[mid] = header + (msg.text or "（无文本）")
-        elif item.candidate_source == "memes":
-            dynamic = {m["id"]: m["description"] for m in memes}
-            spec.candidate_groups = {
-                str(meme["id"]): str(meme.get("category") or "")
-                for meme in memes
-                if meme.get("id")
-            }
-        elif item.candidate_source == "meme_categories":
-            dynamic = {category: category for category in sorted(categories)}
-        reserved = {o.id for o in item.options} | set(item.aliases)
-        dynamic = {k: v for k, v in dynamic.items() if k not in reserved}
-        spec.candidate_descriptions = dynamic
-        if item.candidate_source != "options" and not dynamic:
-            continue
-        criteria = {}
-        for opt in item.options:
-            expanded = item.candidate_source != "options" and opt.id == "*"
-            entries = dynamic if expanded else {opt.id: opt.criteria}
-            for key, label in entries.items():
-                if expanded and key in {default, "*"}:
-                    continue
-                if expanded and "{描述}" in opt.criteria:
-                    label = opt.criteria.replace("{描述}", label)
-                elif expanded:
-                    label = f"{opt.criteria}：{label}"
-                criteria[key] = f"{label}。选中后：{effect(opt.id)}"
-                spec.option_weights[key] = opt.weight
-        if len(criteria) >= 2:
-            spec.question = DecisionChoiceQuestion(
-                instructions=prompt, criteria=criteria
-            )
-            spec.allowed = frozenset(criteria)
-            for alias, canonical in spec.aliases.items():
-                if canonical in criteria and alias not in criteria:
-                    spec.allowed |= {alias}
-                    spec.option_weights[alias] = spec.option_weights[canonical]
+                    items.append({"id": mid, "description": header + (msg.text[:40] or "（无文本）")})
+        if not spec.source_question:
+            _set_candidates(spec, items)
     return specs
 
 
-def _filter_candidate_spec(spec: DecisionSpec, outcomes: dict[str, DecisionOutcome]) -> None:
-    if not spec.candidate_filter_parent or not spec.candidate_groups or spec.question is None:
+def _set_candidates(spec, items):
+    reserved = {key for key, _, _, _ in spec.choice_options} | set(spec.aliases)
+    spec.candidate_items = {item["id"]: item for item in items if item["id"] not in reserved}
+    spec.candidate_descriptions = {key: item["description"] for key, item in spec.candidate_items.items()}
+    spec.question = None
+    spec.allowed = frozenset()
+    spec.option_weights = {}
+    if not spec.eligible or (spec.candidate_source != "options" and not spec.candidate_items):
         return
-    parent = outcomes.get(spec.candidate_filter_parent)
-    category = parent.value if parent and parent.has_answer else None
-    if not isinstance(category, str) or not category:
-        return
-    allowed = {key for key, group in spec.candidate_groups.items() if group == category}
-    if not allowed:
-        return
-    criteria = {
-        key: value
-        for key, value in spec.question.criteria.items()
-        if key not in spec.candidate_groups or key in allowed
-    }
-    spec.question = DecisionChoiceQuestion(
-        instructions=spec.question.instructions,
-        criteria=criteria,
-    )
-    spec.allowed = frozenset(criteria)
-    spec.option_weights = {
-        key: value for key, value in spec.option_weights.items() if key in spec.allowed
-    }
-    spec.candidate_descriptions = {
-        key: value for key, value in spec.candidate_descriptions.items() if key in allowed
-    }
+    criteria = {}
+    for key, description, weight, effect in spec.choice_options:
+        expanded = spec.candidate_source != "options" and key == "*"
+        entries = spec.candidate_descriptions if expanded else {key: description}
+        for option_id, label in entries.items():
+            if expanded:
+                label = description.replace("{描述}", label) if "{描述}" in description else f"{description}：{label}"
+            criteria[option_id] = f"{label}。选中后：{effect}"
+            spec.option_weights[option_id] = weight
+    if len(criteria) >= 2:
+        spec.question = DecisionChoiceQuestion(instructions=spec.instructions, criteria=criteria)
+        spec.allowed = frozenset(criteria)
+        for alias, canonical in spec.aliases.items():
+            if canonical in criteria and alias not in criteria:
+                spec.allowed |= {alias}
+                spec.option_weights[alias] = spec.option_weights[canonical]
+
+
+def _resolve_candidate_source(spec, inputs):
+    source, value = inputs.get(spec.source_question, (None, None))
+    chosen = source.candidate_items.get(value) if source is not None and isinstance(value, str) else None
+    children = chosen.get("children", []) if chosen else []
+    if spec.kind != "fixed":
+        _set_candidates(spec, children)
+    if not children or (spec.kind != "fixed" and spec.question is None):
+        spec.unavailable_reason = "no_child_candidates" if chosen else "candidate_source_unavailable"
 
 
 def _option_key(spec, outcome):
@@ -585,44 +541,60 @@ def _option_key(spec, outcome):
     return spec.aliases.get(outcome.value, outcome.value)
 
 
-def _workflow(specs, outcomes, batches, *, assumed=None):
+def _preview_outcome(spec, choices):
+    possible = [key for key, weight in spec.option_weights.items() if weight > 0 and key not in spec.aliases]
+    key = choices.get(spec.id)
+    if key == "*" and spec.candidate_descriptions:
+        key = next(iter(spec.candidate_descriptions))
+    if not possible:
+        return DecisionOutcome(spec.default, status="fallback", reason="no_selectable_option")
+    if key not in possible:
+        key = possible[0]
+    return DecisionOutcome(key == "true" if spec.kind == "boolean" else key)
+
+
+def _workflow(specs, outcomes, batches, *, assumed=None, prior_inputs=None):
     """先结算已激活的答案。同批预问只在自己的来源命中时使用。"""
     selected = {}
     remaining = list(specs)
     while remaining:
-        ready = [s for s in remaining if s.is_root or
-                 any(selected.get(parent) == option for parent, option, _ in s.parents)]
+        inputs = {**(prior_inputs or {}), **_action_inputs(specs, outcomes)}
+        waiting = {s.id for s in remaining}
+        ready = [s for s in remaining
+                 if (s.is_root or any(selected.get(parent) == option for parent, option, _ in s.parents))
+                 and (not s.source_question or s.source_question not in waiting)]
         if not ready:
             break
         for spec in ready:
-            _filter_candidate_spec(spec, outcomes)
+            if spec.source_question:
+                _resolve_candidate_source(spec, inputs)
         local = [s for s in ready if s.question is None or s.decision_mode == "random"]
         if local:
             for spec in local:
                 if spec.question is None:
                     outcome = _evaluate_answer(spec, _MISSING)
                 elif assumed is not None:
-                    outcome = assumed[spec.id]
+                    outcome = _preview_outcome(spec, assumed)
                 else:
                     outcome = _evaluate_random(spec)
                 outcomes[spec.id] = outcome
-                selected[spec.id] = (
-                    "*"
-                    if spec.question is None and spec.candidate_source == "meme_categories"
-                    else _option_key(spec, outcome)
-                )
+                if spec.unavailable_reason:
+                    outcome = outcomes[spec.id] = DecisionOutcome(None, status="skipped", reason=spec.unavailable_reason)
+                selected[spec.id] = _option_key(spec, outcome)
                 remaining.remove(spec)
             continue
         required = {s.id for s in ready}
         included = set(required)
         while True:
-            more = {s.id for s in remaining if s.question is not None and s.decision_mode == "model"
+            more = {s.id for s in remaining if not s.source_question and s.question is not None and s.decision_mode == "model"
                     and any(early and parent in included for parent, _, early in s.parents)}
             if more <= included:
                 break
             included.update(more)
         batch = [s for s in remaining if s.id in included]
         record = {"asked": [s.id for s in batch], "used": [], "discarded": []}
+        if assumed is not None:
+            record["candidates"] = {s.id: dict(s.candidate_descriptions) for s in batch if s.candidate_source != "options"}
         batches.append(record)
         answers = yield batch
         pending = list(batch)
@@ -632,7 +604,7 @@ def _workflow(specs, outcomes, batches, *, assumed=None):
                 for parent, option, early in s.parents)]
             if not layer:
                 break
-            evaluated = assumed if assumed is not None else _evaluate_answers(layer, answers)
+            evaluated = {s.id: _preview_outcome(s, assumed) for s in layer} if assumed is not None else _evaluate_answers(layer, answers)
             for spec in layer:
                 outcome = evaluated[spec.id]
                 if outcome.raw:
@@ -652,8 +624,8 @@ def _workflow(specs, outcomes, batches, *, assumed=None):
         outcomes[spec.id] = DecisionOutcome(None, status="skipped", reason=reason)
 
 
-async def _run_workflow(context, specs, outcomes, batches, state, provider_id):
-    workflow = _workflow(specs, outcomes, batches)
+async def _run_workflow(context, specs, outcomes, batches, state, provider_id, prior_inputs=None):
+    workflow = _workflow(specs, outcomes, batches, prior_inputs=prior_inputs)
     batch = next(workflow, None)
     while batch:
         previous = dict((state or {}).get("previous_answers", {}))
@@ -689,26 +661,8 @@ def _activate_post(specs, outcomes, post_specs):
 def preview_workflow(settings, scene, choices, *, trigger_event=""):
     """以示例候选和用户指定的有效答案预览，不调用提供商或工具。"""
     message = BufferedMessage("sample_message", "user", "示例用户", "user", "示例消息")
-    sample_memes = [{"id": "sample_meme", "description": "示例表情"}]
-    if "meme_category" in choices:
-        sample_memes[0]["category"] = "示例分类"
-    specs = _build_specs(settings.decision_questions, scene, [message],
-                         sample_memes, settings, stage=None,
-                         trigger_event=trigger_event)
-    assumed = {}
-    for spec in specs:
-        if spec.question is None:
-            continue
-        key = choices.get(spec.id)
-        if key == "*" and spec.candidate_descriptions:
-            key = next(iter(spec.candidate_descriptions))
-        possible = [k for k, weight in spec.option_weights.items() if weight > 0 and k not in spec.aliases]
-        if not possible:
-            assumed[spec.id] = DecisionOutcome(spec.default, status="fallback", reason="no_selectable_option")
-            continue
-        if key not in possible:
-            key = possible[0]
-        assumed[spec.id] = DecisionOutcome(key == "true" if spec.kind == "boolean" else key)
+    specs = _build_specs(settings.decision_questions, scene, [message], [], settings,
+                         stage=None, trigger_event=trigger_event, catalogs=example_catalogs())
     batches, outcomes = [], {}
     before = [s for s in specs if s.stage == "pre_reply"]
     after = [s for s in specs if s.stage == "post_reply"]
@@ -717,7 +671,7 @@ def preview_workflow(settings, scene, choices, *, trigger_event=""):
         if stage == "post_reply" and (not plan.should_speak() or not _activate_post(before, outcomes, after)):
             break
         start = len(batches)
-        for _ in _workflow(group, outcomes, batches, assumed=assumed):
+        for _ in _workflow(group, outcomes, batches, assumed=choices, prior_inputs=_action_inputs(before, outcomes) if stage == "post_reply" else None):
             pass
         for record in batches[start:]:
             record["stage"] = stage
@@ -725,7 +679,10 @@ def preview_workflow(settings, scene, choices, *, trigger_event=""):
             plan = _assemble_result(before, dict(outcomes), scene=scene)
         else:
             _apply_actions(after, outcomes, plan, _action_inputs(before, outcomes))
-    return {"batches": batches, "answers": {key: o.value for key, o in outcomes.items() if o.has_answer},
+    return {"batches": batches,
+            "skipped": {key: {"no_child_candidates": "选中项没有下级候选", "candidate_source_unavailable": "候选来源没有有效选择"}.get(outcome.reason, "触发条件未命中或本轮无候选")
+                        for key, outcome in outcomes.items() if not outcome.has_answer},
+            "answers": {key: o.value for key, o in outcomes.items() if o.has_answer},
             "reply": plan.action, "reply_sources": plan.reply_sources, "quote": plan.target_message_id,
             "context": {"message": plan.target_summary, "answers": plan.custom_answers,
                         "fields": plan.context_fields, "hints": plan.session_hints},
@@ -751,7 +708,7 @@ async def evaluate_post_reply(context, plan: PostDecisionPlan, text: str, previo
     outcomes = {}
     report = {"batches": []}
     try:
-        await _run_workflow(context, plan.specs, outcomes, report["batches"], state, plan.provider_id)
+        await _run_workflow(context, plan.specs, outcomes, report["batches"], state, plan.provider_id, plan.inputs)
     except Exception as exc:
         report["error"] = str(exc) or type(exc).__name__
         logger.warning("输出后判断失败：%s", report["error"])
@@ -768,8 +725,6 @@ async def evaluate_post_reply(context, plan: PostDecisionPlan, text: str, previo
 
 def _build_questions(scene, messages, memes, configured=None):
     settings = PluginSettings({})
-    if memes and not any(meme.get("category") for meme in memes):
-        memes = [{**meme, "category": "default"} for meme in memes]
     specs = _build_specs(
         default_questions() if configured is None else configured,
         scene,
@@ -777,6 +732,13 @@ def _build_questions(scene, messages, memes, configured=None):
         memes,
         settings,
     )
+    by_id = {s.id: s for s in specs}
+    for _ in specs:
+        for spec in specs:
+            parent = by_id.get(spec.source_question)
+            if parent:
+                items = [child for candidate in parent.candidate_items.values() for child in candidate.get("children", [])]
+                _set_candidates(spec, items)
     return {s.id: s.question for s in specs if s.question is not None}
 
 

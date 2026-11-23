@@ -726,8 +726,8 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
 
         payload = self.plugin._decision_config_payload()
         self.assertNotIn("builtin_questions", payload)
-        self.assertEqual(payload["version"], 6)
-        self.assertIn("send_meme", payload["tools"])
+        self.assertEqual(payload["version"], 8)
+        self.assertIn("send_meme", payload["actions"])
         ids = {q["id"] for q in payload["decision_questions"]}
         messages = [BufferedMessage("msg1", "u1", "User", "user", "Hello")]
         asked = set()
@@ -832,12 +832,15 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_old_editor_cannot_erase_post_reply_stage(self):
         from astrbot_plugin_quick_decision import web_api
+        from test_decision_engine import flat_gallery
 
         class Config(dict):
             save_config = AsyncMock()
             save_config_async = save_config
 
         self.plugin.config = Config(self.plugin.config)
+        legacy = flat_gallery(self.plugin.settings)
+        self.plugin.config["decision_questions"] = {"version": 4, "questions": [q.to_dict() for q in legacy.decision_questions]}
         payload = self.plugin._decision_config_payload()
         payload["version"] = 6
         length = next(q for q in payload["decision_questions"] if q["id"] == "length")
@@ -861,12 +864,15 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_question_mode_override_requires_new_editor(self):
         from astrbot_plugin_quick_decision import web_api
+        from test_decision_engine import flat_gallery
 
         class Config(dict):
             save_config = AsyncMock()
             save_config_async = save_config
 
         self.plugin.config = Config(self.plugin.config)
+        legacy = flat_gallery(self.plugin.settings)
+        self.plugin.config["decision_questions"] = {"version": 4, "questions": [q.to_dict() for q in legacy.decision_questions]}
         payload = self.plugin._decision_config_payload()
         payload["version"] = 6
         question = next(q for q in payload["decision_questions"] if q["id"] == "length")
@@ -939,12 +945,12 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             save_config_async = AsyncMock()
             save_config = save_config_async
         self.plugin.config = Config(self.plugin.config)
-        request = SimpleNamespace(method="GET", query={"version": "7"}, json=AsyncMock())
+        request = SimpleNamespace(method="GET", query={"version": "8"}, json=AsyncMock())
         with (patch.object(web_api, "request", request),
               patch.object(web_api, "json_response", side_effect=lambda body: body),
               patch.object(web_api, "error_response", side_effect=lambda msg, status_code: status_code)):
             initial = await self.plugin.web_decision_config()
-            self.assertEqual(initial["version"], 7)
+            self.assertEqual(initial["version"], 8)
             self.assertTrue(all("role" not in q for q in initial["default_questions"]))
             self.assertEqual(set(initial["actions"]), {"request_reply", "add_context", "quote_message", "send_meme"})
             request.method = "POST"
@@ -1253,7 +1259,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         from astrbot_plugin_quick_decision.decision_engine import ask_decision
 
         self.main_mod.ask_decision = ask_decision
-        questions = self.plugin._decision_config_payload()["decision_questions"]
+        questions = [q.to_dict() for q in self.plugin.settings.decision_questions]
         action = next(q for q in questions if q["role"] == "action")
         action["ask_private"] = True
         self.plugin.config["decision_questions"] = {"version": 3, "questions": questions}
@@ -1527,7 +1533,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
 
         self.main_mod.ask_decision = ask_decision
         self.plugin.context.get_config = lambda umo: {"timezone": "UTC"}
-        questions = self.plugin._decision_config_payload()["decision_questions"]
+        questions = [q.to_dict() for q in self.plugin.settings.decision_questions]
         gate = next(q for q in questions if q["id"] == "idle_action")
         gate["instructions"] = "是否应该开口？"
         length = next(q for q in questions if q["id"] == "length")
@@ -1587,7 +1593,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         from astrbot.api.provider import DecisionChoiceAnswer
 
         self.main_mod.ask_decision = self._orig_ask
-        gate = next(q for q in self.plugin._decision_config_payload()["decision_questions"] if q["id"] == "idle_action")
+        gate = next(q.to_dict() for q in self.plugin.settings.decision_questions if q.id == "idle_action")
         post = {"id": "check", "type": "boolean", "stage": "post_reply", "instructions": "在问候吗？"}
         post["triggers"] = [{"event": "silence_elapsed"}]
         self.plugin.config["decision_questions"] = {"version": 3, "questions": [gate, post]}

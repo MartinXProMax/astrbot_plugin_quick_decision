@@ -17,6 +17,45 @@ const PRE_EVENTS = new Set(["message_received", "silence_elapsed", "timer_elapse
 // 与后端 send_meme 的缺省时机一致，省略 when 即为判断后立即发送。
 const DEFAULT_WHEN = "on_match";
 
+const CANDIDATE_CATALOGS = {
+  options: { label: "固定选项" }, recent_messages: { label: "最近用户消息" },
+  meme_categories: { label: "图库分类", children: "memes" }, memes: { label: "全部图库图片" },
+};
+export function configureCandidateCatalogs(catalogs) {
+  Object.assign(CANDIDATE_CATALOGS, catalogs || {});
+}
+export function candidateType(q, child = false, seen = new Set()) {
+  if (!q || seen.has(q)) return "";
+  seen.add(q);
+  const type = q.candidate_source === "question" ? candidateType(q.candidate_from, true, seen) : q.candidate_source;
+  return child ? CANDIDATE_CATALOGS[type]?.children || "" : type;
+}
+export function candidateSourceChoices(questions, q) {
+  return questions.filter((parent) => parent !== q && parent.enabled && candidateType(parent, true)
+    && !(q.stage === "pre_reply" && parent.stage === "post_reply") && !wouldCycle(questions, q, parent));
+}
+export function candidateSourceIssue(q, questions) {
+  if (q.candidate_source !== "question" || !q.enabled) return null;
+  if (!q.candidate_from || !questions.includes(q.candidate_from)) return "候选来源已删除或尚未设置，请重新选择来源问题";
+  if (!q.candidate_from.enabled) return "候选来源问题已停用";
+  if (q.stage === "pre_reply" && q.candidate_from.stage === "post_reply") return "不能读取正文生成后才有的候选";
+  if (!candidateType(q.candidate_from, true)) return "来源问题不能提供下级候选";
+  if (wouldCycle(questions, q, q.candidate_from)) return "候选来源与触发条件会形成循环";
+  return null;
+}
+
+export function previewCandidateItems(q, catalogs, choices, seen = new Set()) {
+  if (!q || !q.enabled || seen.has(q)) return [];
+  seen.add(q);
+  if (q.candidate_source !== "question") return catalogs[q.candidate_source] || [];
+  const parent = q.candidate_from;
+  if (!parent?.enabled) return [];
+  const items = previewCandidateItems(parent, catalogs, choices, seen);
+  const first = slotsOf(parent).find((ref) => ref.weight > 0);
+  const key = choices.get(parent) ?? (first ? keyOf(first) : "");
+  return (key === "*" ? items[0] : items.find((item) => item.id === key))?.children || [];
+}
+
 // ---------- 选项 ----------
 
 export function keyOf(ref) {
@@ -77,7 +116,10 @@ export function normalizeQuestions(rawList) {
       use_threshold: !!raw?.use_threshold,
       decision_mode: raw?.decision_mode === "model" || raw?.decision_mode === "random" ? raw.decision_mode : "inherit",
       stage: raw?.stage === "post_reply" ? "post_reply" : "pre_reply",
-      candidate_source: typeof raw?.candidate_source === "string" && raw.candidate_source ? raw.candidate_source : "options",
+      candidate_source: raw?.candidate_source?.question ? "question"
+        : raw?.candidate_source?.catalog || raw?.candidate_source || "options",
+      candidate_from: null,
+      candidate_from_id: raw?.candidate_source?.question || "",
       requires_candidates: typeof raw?.requires_candidates === "string" ? raw.requires_candidates : "",
       scenes: Array.isArray(raw?.scenes) ? SCENE_KEYS.filter((s) => raw.scenes.includes(s)) : [],
       options: [],
@@ -98,6 +140,7 @@ export function normalizeQuestions(rawList) {
   const byId = new Map(questions.map((q) => [q.id, q]));
   questions.forEach((q, index) => {
     const raw = list[index] || {};
+    q.candidate_from = byId.get(q.candidate_from_id) || null;
     q.triggers = (Array.isArray(raw.triggers) ? raw.triggers : []).flatMap((t) => {
       if (typeof t?.event === "string") return [{ ...t }];
       const parent = byId.get(t?.question);
@@ -168,7 +211,8 @@ export function serializeQuestion(q) {
   }
   if (q.stage === "post_reply") data.stage = "post_reply";
   if (q.decision_mode !== "inherit") data.decision_mode = q.decision_mode;
-  if (q.candidate_source !== "options") data.candidate_source = q.candidate_source;
+  if (q.candidate_source !== "options") data.candidate_source = q.candidate_source === "question"
+    ? { question: q.candidate_from?.id.trim() || q.candidate_from_id || "" } : q.candidate_source;
   if (q.requires_candidates) data.requires_candidates = q.requires_candidates;
   if (q.scenes.length) data.scenes = SCENE_KEYS.filter((s) => q.scenes.includes(s));
   if (q.default_option) data.default_option = keyOf(q.default_option);
@@ -198,7 +242,9 @@ export function wouldCycle(questions, child, parent) {
     if (q === parent) return true;
     if (seen.has(q)) continue;
     seen.add(q);
-    for (const link of childLinks(questions, q)) stack.push(link.child);
+    for (const child of questions) {
+      if (child.candidate_from === q || child.triggers.some((t) => t.parent === q)) stack.push(child);
+    }
   }
   return false;
 }
@@ -212,7 +258,7 @@ export function findCycle(questions) {
     if (visiting.has(q)) return [...path.slice(path.indexOf(q)), q];
     visiting.add(q);
     path.push(q);
-    for (const { child } of childLinks(questions, q)) {
+    for (const child of questions.filter((item) => item.candidate_from === q || item.triggers.some((t) => t.parent === q))) {
       const cycle = walk(child);
       if (cycle) return cycle;
     }
@@ -241,7 +287,9 @@ export function possibleScenes(q, memo = new Map()) {
     const scenes = t.event ? EVENT_SCENES[t.event] || [] : t.parent.enabled ? possibleScenes(t.parent, memo) : [];
     for (const scene of scenes) found.add(scene);
   }
-  const result = q.scenes.length ? new Set([...found].filter((s) => q.scenes.includes(s))) : found;
+  const sourceScenes = q.candidate_source === "question"
+    ? q.candidate_from?.enabled ? possibleScenes(q.candidate_from, memo) : new Set() : found;
+  const result = new Set([...found].filter((s) => sourceScenes.has(s) && (!q.scenes.length || q.scenes.includes(s))));
   memo.set(q, result);
   return result;
 }
@@ -253,7 +301,7 @@ export function sourceChoices(questions, catalog, q, ref, toolName) {
   const tool = catalog[toolName];
   if (!tool) return [];
   const ok = (source) => !(q.stage === "pre_reply" && source.stage === "post_reply")
-    && (!tool.source || (source.candidate_source === tool.source && (source !== q || isWildcard(ref))));
+    && (!tool.source || (candidateType(source) === tool.source && (source !== q || isWildcard(ref))));
   const list = ok(q) ? [null] : [];
   for (const other of questions) if (other !== q && ok(other)) list.push(other);
   return list;
@@ -265,7 +313,7 @@ export function actionAvailability(questions, catalog, q, ref, toolName) {
   if (!tool.stages.includes(q.stage)) return q.stage === "post_reply" ? "正文已生成，不能再使用" : "只能在正文生成后使用";
   if (toolName === "request_reply" && ref.actions.some((a) => a.tool === toolName)) return "已添加";
   if (tool.source && !sourceChoices(questions, catalog, q, ref, toolName).length) {
-    if (isDynamic(q) && q.candidate_source === tool.source && !isWildcard(ref)) return "固定选项没有选中的候选";
+    if (isDynamic(q) && candidateType(q) === tool.source && !isWildcard(ref)) return "固定选项没有选中的候选";
     return tool.source === "recent_messages" ? "需要一道从最近用户消息中选择的题" : "需要一道从图库表情中选择的题";
   }
   return null;
@@ -287,7 +335,8 @@ function structuralActionIssue(questions, catalog, q, ref, action) {
   const source = action.from ?? q;
   if (!questions.includes(source)) return "引用的题目已删除";
   if (q.stage === "pre_reply" && source.stage === "post_reply") return "不能引用正文生成后才有的答案";
-  if (tool.source && (source.candidate_source !== tool.source || (source === q && !isWildcard(ref)))) {
+  const unresolvedDisabled = !source.enabled && source.candidate_source === "question" && !candidateType(source);
+  if (tool.source && ((!unresolvedDisabled && candidateType(source) !== tool.source) || (source === q && !isWildcard(ref)))) {
     return tool.source === "recent_messages" ? "需要从最近用户消息中选择的题" : "需要从图库表情中选择的题";
   }
   return null;
@@ -354,8 +403,13 @@ export function questionIssues(q, questions, catalog, labelOf = keyOf) {
   if (isDynamic(q) && (q.type !== "choice" || !q.options.some(isWildcard))) {
     issues.push({ field: "source", message: `${name}使用动态候选，需要选择题和「每条候选」行` });
   }
+  const sourceIssue = candidateSourceIssue(q, questions);
+  if (sourceIssue) issues.push({ field: "source", message: `${name}：${sourceIssue}` });
   const seenTriggers = new Set();
   q.triggers.forEach((t, i) => {
+    if (q.candidate_source === "question" && t.ask_with_parent) {
+      issues.push({ t: i, field: "timing", message: `${name}需要等待候选来源的答案，不能同批提前提问` });
+    }
     const key = triggerKey(t);
     if (seenTriggers.has(key)) issues.push({ t: i, field: "trigger", message: `${name}有重复的触发来源` });
     seenTriggers.add(key);
@@ -461,7 +515,7 @@ function applyRemovals(removals) {
 // 跨阶段的上游只能命中后再问。这是调整，不算移除。
 function fixTiming(questions) {
   for (const q of questions) {
-    for (const t of q.triggers) if (t.parent && t.parent.stage !== q.stage) t.ask_with_parent = false;
+    for (const t of q.triggers) if (q.candidate_source === "question" || (t.parent && t.parent.stage !== q.stage)) t.ask_with_parent = false;
   }
 }
 
@@ -566,19 +620,22 @@ export function changeType(q, type) {
 
 export function changeSource(q, source) {
   return () => {
-    const saved = { source: q.candidate_source, requires: q.requires_candidates, options: q.options };
+    const saved = { source: q.candidate_source, requires: q.requires_candidates, options: q.options, from: q.candidate_from, fromId: q.candidate_from_id };
     let undoType = () => {};
     if (source !== "options") {
       if (q.type === "boolean") undoType = toChoice(q);
       if (!q.options.some(isWildcard)) q.options = [...q.options, newOption("*", "{描述}")];
-      if (!q.requires_candidates || q.requires_candidates === saved.source) q.requires_candidates = source;
+      if (!q.requires_candidates || q.requires_candidates === saved.source) q.requires_candidates = source === "question" ? "" : source;
     } else {
       q.options = q.options.filter((o) => !isWildcard(o));
       if (q.requires_candidates === saved.source) q.requires_candidates = "";
     }
     q.candidate_source = source;
+    if (source !== "question") { q.candidate_from = null; q.candidate_from_id = ""; }
     return () => {
       q.candidate_source = saved.source;
+      q.candidate_from = saved.from;
+      q.candidate_from_id = saved.fromId;
       q.requires_candidates = saved.requires;
       q.options = saved.options;
       undoType();

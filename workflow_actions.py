@@ -2,18 +2,14 @@
 
 from copy import deepcopy
 
+from .candidate_sources import CATALOGS, candidate_type, catalog_name, source_question
 
 WORKFLOW_EVENTS = {
     "message_received": "收到消息", "silence_elapsed": "达到冷场时长",
     "timer_elapsed": "定时触发",
     "reply_generated": "本轮正文生成完成",
 }
-SOURCES = {
-    "options": "固定选项",
-    "recent_messages": "最近用户消息",
-    "meme_categories": "图库分类",
-    "memes": "图库表情",
-}
+SOURCES = {key: value["label"] for key, value in CATALOGS.items()}
 SCENES = ("group_passive", "private_passive", "group_proactive", "private_proactive")
 ACTIONS = {
     "request_reply": {"label": "调用会话模型发言", "stages": ["pre_reply"], "parameters": []},
@@ -76,7 +72,9 @@ def migrate_actions(questions):
         if role == "target":
             q.candidate_source, q.default_option = "recent_messages", "latest"
         if role == "meme":
-            q.candidate_source, q.default_option = "memes", "none"
+            if not source_question(q.candidate_source):
+                q.candidate_source = "memes"
+            q.default_option = "none"
         slots = ([(o.id, o.session_hint, o.tool) for o in q.options] if q.type == "choice" else
                  [(k, getattr(q, k + "_session_hint"), getattr(q, k + "_tool")) for k in ("true", "false")])
         for key, hint, tool in slots:
@@ -107,14 +105,31 @@ def migrate_actions(questions):
 
 def validate_actions(q, by_id):
     keys = {o.id for o in q.options} if q.type == "choice" else {"true", "false"}
-    if q.candidate_source not in SOURCES or (q.requires_candidates and q.requires_candidates not in ("recent_messages", "meme_categories", "memes")):
+    raw = q.candidate_source
+    parent_id = source_question(raw)
+    if isinstance(raw, dict) and (set(raw) not in ({"catalog"}, {"question"}) or
+                                 not all(isinstance(value, str) and value.strip() for value in raw.values())):
+        return "候选来源需要 catalog 或 question 中的一个非空名称"
+    if not isinstance(raw, (str, dict)) or (not parent_id and catalog_name(raw) not in CATALOGS):
         return "候选来源无效"
-    if q.candidate_source != "options" and (q.type != "choice" or "*" not in keys):
+    if parent_id and q.enabled:
+        parent = by_id.get(parent_id)
+        if parent is None:
+            return "候选来源问题已删除，请重新选择"
+        if not parent.enabled:
+            return "候选来源问题已停用"
+        if parent.stage == "post_reply" and q.stage == "pre_reply":
+            return "不能读取正文生成后才有的候选"
+        if not candidate_type(parent, by_id, child=True):
+            return "来源问题不能提供下级候选"
+    if q.requires_candidates and (q.requires_candidates not in CATALOGS or q.requires_candidates == "options"):
+        return "候选来源无效"
+    if catalog_name(q.candidate_source) != "options" and (q.type != "choice" or "*" not in keys):
         return "动态候选需要选择题和 * 选项"
     if not isinstance(q.scenes, list) or any(s not in SCENES for s in q.scenes):
         return "场景无效"
     for value in (q.private_default, q.default_option):
-        if value and (value not in keys or (value == "*" and q.candidate_source != "options")):
+        if value and (value not in keys or (value == "*" and catalog_name(q.candidate_source) != "options")):
             return "默认选项无效"
     if not isinstance(q.aliases, dict) or any(not isinstance(k, str) or k in keys or not isinstance(v, str)
                                                or v not in keys for k, v in q.aliases.items()):
@@ -137,8 +152,10 @@ def validate_actions(q, by_id):
             source = by_id.get(action.get("from", q.id))
             if not source or (q.stage == "pre_reply" and source.stage == "post_reply"):
                 return "引用的答案不存在或尚未生成"
-            if "source" in tool and (source.candidate_source != tool["source"] or (source is q and key != "*")):
-                return "动作参数与候选类型不匹配"
+            if "source" in tool:
+                unresolved_disabled = not source.enabled and source_question(source.candidate_source) and not candidate_type(source, by_id)
+                if (not unresolved_disabled and candidate_type(source, by_id) != tool["source"]) or (source is q and key != "*"):
+                    return "动作参数与候选类型不匹配"
             if "when" in action and action["when"] not in tool["when"]:
                 return "工具执行时机无效"
     return None

@@ -385,6 +385,7 @@ class MemeAdapterTests(unittest.TestCase):
                     confidence=0.8,
                 ),
                 "use_meme": DecisionBooleanAnswer(probability=0.9),
+                "meme_category": DecisionChoiceAnswer(choice="未分类", probability=1, probabilities={"未分类": 1}, confidence=1),
                 "meme_id": DecisionChoiceAnswer(
                     choice="a" * 64,
                     probability=0.95,
@@ -408,6 +409,7 @@ class MemeAdapterTests(unittest.TestCase):
                     confidence=0.6,
                 ),
                 "use_meme": DecisionBooleanAnswer(probability=0.9),
+                "meme_category": DecisionChoiceAnswer(choice="未分类", probability=1, probabilities={"未分类": 1}, confidence=1),
                 "meme_id": DecisionChoiceAnswer(
                     choice="a" * 64,
                     probability=0.95,

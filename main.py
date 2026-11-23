@@ -15,6 +15,7 @@ from astrbot.api.platform import MessageType
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
+from .candidate_sources import candidate_type
 from .config_util import PluginSettings
 from .decision_engine import (
     _round_clock,
@@ -419,7 +420,9 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 self.sessions.mark_proactive(profile.umo)
 
     def _meme_candidates(self, settings):
-        if any(q.enabled and (q.candidate_source == "memes" or q.requires_candidates == "memes" or q.role == "meme")
+        by_id = {q.id: q for q in settings.decision_questions}
+        if any(q.enabled and (candidate_type(q, by_id) in ("memes", "meme_categories")
+                              or q.requires_candidates in ("memes", "meme_categories") or q.role == "meme")
                for q in settings.decision_questions):
             return self.meme_adapter.described_catalog()
         return []

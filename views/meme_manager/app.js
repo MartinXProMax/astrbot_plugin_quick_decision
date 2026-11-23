@@ -177,6 +177,7 @@ const state = {
   catalog: {},
   events: {},
   sources: {},
+  examples: {},
   storedVersion: null,
   saved: { mode: "model", context: "", questions: [] },
   savedSnapshot: "",
@@ -298,7 +299,9 @@ function setSaveState(kind, text) {
   $("config-msg").textContent = text || SAVE_MESSAGES[kind] || "";
   $("discard").hidden = !(kind === "dirty" || kind === "notice" || kind === "error") || !isDirty();
   // 判断配置没读到时禁止保存，避免用空表单覆盖已有配置。
-  $("save-config").disabled = kind === "saving" || !state.loaded;
+  const sourceError = state.questions.map((q) => wf.candidateSourceIssue(q, state.questions)).find(Boolean);
+  $("save-config").disabled = kind === "saving" || !state.loaded || !!sourceError;
+  $("save-config").title = sourceError || "";
 }
 
 function updateDirty() {
@@ -356,9 +359,9 @@ function qIndexOf(question) {
 function slotLabel(q, ref) {
   if (ref.side) return ref.side === "true" ? "是" : "否";
   if (wf.isWildcard(ref)) {
-    if (q.candidate_source === "memes") return "每张候选表情";
-    if (q.candidate_source === "meme_categories") return "每个图库分类";
-    return "每条候选消息";
+    if (wf.candidateType(q) === "memes") return "每张候选表情";
+    if (wf.candidateType(q) === "meme_categories") return "每个图库分类";
+    return wf.candidateType(q) === "recent_messages" ? "每条候选消息" : "每个下级候选";
   }
   return ref.id.trim() || "未命名选项";
 }
@@ -566,14 +569,17 @@ function previewFields() {
   const selects = list.map((q) => {
     const slots = wf.slotsOf(q).filter((ref) => ref.weight > 0);
     if (!slots.length) return null;
-    const options = Object.fromEntries(slots.map((ref) => [wf.keyOf(ref),
-      wf.isWildcard(ref) ? (q.candidate_source === "memes" ? "示例表情" : "示例消息") : slotLabel(q, ref)]));
+    const items = wf.previewCandidateItems(q, state.examples, state.preview.choices);
+    const options = Object.fromEntries(slots.flatMap((ref) => wf.isWildcard(ref)
+      ? items.map((item) => [item.id, item.description]) : [[wf.keyOf(ref), slotLabel(q, ref)]]));
+    if (!Object.keys(options).length) return h("p", { class: "hint" }, `${qName(q)}：本轮无可选候选，将跳过。`);
     let key = state.preview.choices.get(q);
     if (!Object.hasOwn(options, key)) key = Object.keys(options)[0];
     state.preview.choices.set(q, key);
     return fieldSelect(qName(q), options, key, (value) => {
       state.preview.choices.set(q, value);
       markPreviewStale();
+      previewFields();
     });
   });
   fields.replaceChildren(...[
@@ -634,7 +640,11 @@ function renderPreviewResult() {
     previewRow("判断请求", h("b", null, `${data.batches.length} 次`),
       data.batches.map((b, i) => h("p", { class: "pv-batch" },
         `第 ${i + 1} 批 · ${b.stage === "post_reply" ? "正文后" : "正文前"} · 问 ${b.asked.join("、") || "—"}`,
+        Object.entries(b.candidates || {}).map(([id, candidates]) => h("small", { class: "pv-note" },
+          ` · ${id} 候选：${Object.values(candidates).join("、") || "无"}`)),
         b.discarded?.length > 0 && [" · 丢弃 ", b.discarded.map((id, j) => [j ? "、" : "", h("s", null, id)])]))),
+    previewRow("跳过的问题", Object.entries(data.skipped || {}).length
+      ? Object.entries(data.skipped).map(([id, reason]) => h("p", null, `${id}：${reason}`)) : "无"),
     previewRow("有效答案", answers.length
       ? answers.map(([id, value]) => h("span", { class: "tag tag-judge" }, h("b", null, id), formatPreviewAnswer(id, value)))
       : "无"),
@@ -667,7 +677,7 @@ async function runPreview() {
     const event = state.preview.scene.endsWith("_proactive") ? state.preview.trigger_event : "message_received";
     const list = wf.questionsForScene(state.questions, state.preview.scene, event);
     const data = await bridge.apiPost("decision-preview", {
-      version: 7,
+      version: 8,
       scene: state.preview.scene,
       trigger_event: event,
       decision_mode: getMode(),
@@ -783,7 +793,9 @@ function renderQuestion(question, qIndex) {
     h("span", { class: "q-index" }, qIndex + 1),
     h("span", { class: "q-name mono", dataset: { nameOf: qIndex } }, qName(question)),
     h("span", { class: "q-tag" }, TYPE_LABELS[question.type]),
-    wf.isDynamic(question) && h("span", { class: "q-tag is-source" }, SOURCE_TAGS[question.candidate_source] || question.candidate_source),
+    wf.isDynamic(question) && h("span", { class: "q-tag is-source" },
+      question.candidate_source === "question" ? "来自其他问题" : SOURCE_TAGS[question.candidate_source] || question.candidate_source),
+    wf.candidateSourceIssue(question, state.questions) && h("span", { class: "q-tag is-issue" }, "候选来源待设置"),
     question.stage === "post_reply" && h("span", { class: "q-tag is-post" }, "正文后"),
     question.decision_mode !== "inherit" && h("span", { class: "q-tag" }, question.decision_mode === "random" ? "随机" : "模型"),
     pending && h("span", { class: "q-tag is-pending" }, "待连接"),
@@ -800,7 +812,9 @@ function renderQuestion(question, qIndex) {
     confirmButton(`删除问题 ${qName(question)}`, () => deleteQuestion(question), {
       onArm: () => {
         const loss = wf.runChange(state.questions, state.catalog, wf.deleteQuestion(state.questions, question), { commit: false });
-        if (loss.total) setSaveState("notice", `删除「${qName(question)}」会同时移除 ${wf.describeLoss(loss)}，失去来源的子题进入待连接`);
+        const dependents = state.questions.filter((q) => q.candidate_from === question);
+        const sourceWarning = dependents.length ? `；${dependents.map(qName).join("、")} 正在使用它的候选，删除后需重新选择来源或停用这些题` : "";
+        setSaveState("notice", `删除「${qName(question)}」${loss.total ? `会同时移除 ${wf.describeLoss(loss)}，失去触发来源的子题进入待连接` : ""}${sourceWarning}`);
       },
       onDisarm: () => {
         if ($("savebar").dataset.state === "notice") setSaveState(isDirty() ? "dirty" : "clean", isDirty() ? describeChanges() : "");
@@ -848,6 +862,12 @@ function renderSummary(question) {
   return h("div", { class: "q-summary", onclick: () => toggleQuestion(question) },
     h("p", { class: cls("q-preview", !question.instructions.trim() && "is-empty") },
       question.instructions.trim() || "还没有填写要问判断模型的问题"),
+    question.candidate_source === "question" && h("p", { class: "note" }, "候选：来自 ",
+      h("button", { type: "button", class: "btn btn-text", onclick: (event) => {
+        event.stopPropagation();
+        if (state.questions.includes(question.candidate_from)) revealQuestion(question.candidate_from);
+        else revealQuestion(question);
+      } }, h("span", { dataset: { nameOf: qIndexOf(question.candidate_from) } }, question.candidate_from ? qName(question.candidate_from) : "已删除的来源")), " 选中项的下级候选"),
     h("div", { class: "q-chips" }, renderEntry(question), h("span", { class: "q-chips-sep", "aria-hidden": "true" }), chips),
   );
 }
@@ -922,7 +942,7 @@ function triggerChoices(q, current) {
         match: (t) => t.option === ref,
         make: () => ({
           parent, option: ref,
-          ask_with_parent: parent.stage === q.stage && (current?.parent ? current.ask_with_parent : true),
+          ask_with_parent: q.candidate_source !== "question" && parent.stage === q.stage && (current?.parent ? current.ask_with_parent : true),
         }),
       });
     }
@@ -967,6 +987,7 @@ function renderWhen(q, qIndex) {
     }
     if (t.parent) {
       if (t.parent.stage !== q.stage) timing = h("span", { class: "note-inline" }, "需等正文生成，命中后再问");
+      else if (q.candidate_source === "question") timing = h("span", { class: "note-inline" }, "需要等待候选来源的答案，不能同批提前提问");
       else if (random) timing = h("span", { class: "note-inline" }, "本地随机，无需等批");
       else {
         timing = segmented("提问时机", [["with", "随上游同批"], ["after", "命中后再问"]], t.ask_with_parent ? "with" : "after",
@@ -1023,7 +1044,7 @@ function renderWhen(q, qIndex) {
             const select = h("select", { onchange: (e) => { q.requires_candidates = e.target.value; refreshEditor(); } },
               h("option", { value: "" }, "不限"),
               h("option", { value: "recent_messages" }, "有最近用户消息时"),
-              h("option", { value: "memes" }, "有图库表情时"));
+              h("option", { value: "memes" }, "有图库表情时"), h("option", { value: "meme_categories" }, "有图库分类时"));
             select.value = q.requires_candidates;
             return select;
           })()),
@@ -1044,11 +1065,25 @@ function renderAsk(q, qIndex) {
   const typeSeg = segmented("题型", [["boolean", "是否题"], ["choice", "选择题"]], q.type,
     (type, el) => confirmChange(`type:${qIndex}:${type}`, el, wf.changeType(q, type), `改为${TYPE_LABELS[type]}`),
     { disabled: wf.isDynamic(q) ? { boolean: "动态候选需要选择题" } : {}, extra: "type-seg" });
-  const sources = Object.entries(state.sources).length ? Object.entries(state.sources)
-    : [["options", "固定选项"], ["recent_messages", "最近用户消息"], ["meme_categories", "图库分类"], ["memes", "图库表情"]];
-  const sourceSeg = segmented("候选来源", sources, q.candidate_source,
-    (source, el) => confirmChange(`source:${qIndex}:${source}`, el, wf.changeSource(q, source), `改为「${state.sources[source] || source}」`),
-    { extra: "source-seg", field: "source" });
+  const sources = [...Object.entries(state.sources), ["question", "其他问题选中项的下级候选"]];
+  const sourceSeg = h("select", {
+    "aria-label": "候选来源", dataset: { field: "source" },
+    onchange: (event) => confirmChange(`source:${qIndex}:${event.target.value}`, event.target,
+      wf.changeSource(q, event.target.value), `修改候选来源`),
+  }, sources.map(([key, label]) => h("option", { value: key }, label)));
+  sourceSeg.value = q.candidate_source;
+  const sourceIssue = wf.candidateSourceIssue(q, state.questions);
+  const fromChoices = wf.candidateSourceChoices(state.questions, q);
+  const fromSelect = q.candidate_source === "question" && h("select", {
+    "aria-label": "来源问题", dataset: { field: "source" },
+    onchange: (event) => {
+      q.candidate_from = event.target.value === "" ? null : state.questions[Number(event.target.value)] || null;
+      q.candidate_from_id = q.candidate_from?.id || "";
+      refreshEditor();
+    },
+  }, h("option", { value: "" }, "请选择来源问题"),
+    fromChoices.map((parent) => h("option", { value: String(qIndexOf(parent)) }, qName(parent))));
+  if (fromSelect) fromSelect.value = fromChoices.includes(q.candidate_from) ? String(qIndexOf(q.candidate_from)) : "";
 
   const id = `q${qIndex}-instructions`;
   const input = h("textarea", {
@@ -1077,7 +1112,14 @@ function renderAsk(q, qIndex) {
     h("div", { class: "settings-grid ask-grid" },
       h("label", { class: "setting" }, h("span", { class: "field-label" }, "题目 ID"), idInput),
       h("div", { class: "setting" }, h("span", { class: "field-label" }, "题型"), typeSeg),
-      h("div", { class: "setting is-wide" }, h("span", { class: "field-label" }, "候选来源"), sourceSeg)),
+      h("div", { class: "setting is-wide" }, h("span", { class: "field-label" }, "候选来源"), sourceSeg),
+      fromSelect && h("label", { class: "setting is-wide" }, h("span", { class: "field-label" }, "来源问题"), fromSelect)),
+    q.candidate_source === "question" && h("p", { class: sourceIssue ? "log-error" : "note" },
+      sourceIssue || "等待来源问题选择完成，再从选中项的下级候选中选择。"),
+    sourceIssue && h("button", { type: "button", class: "btn btn-text", onclick: () => fromSelect?.focus() }, "重新选择来源"),
+    q.candidate_source === "question" && state.questions.includes(q.candidate_from) && h("button", {
+      type: "button", class: "btn btn-text", onclick: () => revealQuestion(q.candidate_from),
+    }, "查看来源问题"),
     h("div", { class: "q-prompt" },
       h("div", { class: "field-row" }, h("label", { class: "field-label is-judge", for: id }, "问判断模型"), tokens),
       input),
@@ -1244,7 +1286,7 @@ function isAncestor(source, q, seen = new Set()) {
 
 function answerDescription(q, ref) {
   if (wf.isWildcard(ref)) {
-    return q.candidate_source === "memes" ? "选中表情的描述" : "选中的消息（发送人、时间和原文）";
+    return wf.candidateType(q) === "recent_messages" ? "选中的消息（发送人、时间和原文）" : "选中候选的描述";
   }
   return `本题答案「${slotLabel(q, ref)}」`;
 }
@@ -1491,6 +1533,7 @@ function duplicateQuestion(question) {
   const used = new Set(state.questions.map((q) => q.id.trim()));
   const raw = { ...wf.serializeQuestion(question), id: wf.nextId(`${question.id.trim()}_copy`, used), triggers: [], actions: {} };
   const [copy] = wf.normalizeQuestions([raw]);
+  copy.candidate_from = question.candidate_from;
   copy.triggers = question.triggers.map((t) => ({ ...t }));
   wf.slotsOf(question).forEach((ref, i) => {
     wf.slotsOf(copy)[i].actions = ref.actions.map((a) => ({ ...a }));
@@ -1526,13 +1569,15 @@ function fillForm(saved) {
 }
 
 function applyConfig(data, fallbackQuestions) {
-  if (data.version !== 7 || !data.actions || !Array.isArray(data.default_questions)) {
+  if (data.version !== 8 || !data.actions || !Array.isArray(data.default_questions)) {
     throw new Error("插件版本与页面不匹配，请重载插件后刷新页面");
   }
   state.defaults = data.default_questions;
   state.catalog = data.actions;
   state.events = data.events;
   state.sources = data.candidate_sources || {};
+  wf.configureCandidateCatalogs(data.candidate_catalogs);
+  state.examples = data.candidate_examples || {};
   state.storedVersion = data.stored_version ?? null;
   const questions = data.decision_questions ?? fallbackQuestions;
   state.saved = {
@@ -1552,7 +1597,7 @@ function showConfigWarning(text) {
 }
 
 async function loadDecisionConfig() {
-  const data = await bridge.apiGet("decision-config", { version: 7 });
+  const data = await bridge.apiGet("decision-config", { version: 8 });
   applyConfig(data);
   showConfigWarning(data.warning);
   setSaveState("clean");
@@ -1567,7 +1612,7 @@ async function saveDecisionConfig() {
     return;
   }
   const payload = {
-    version: 7,
+    version: 8,
     decision_mode: getMode(),
     decision_custom_context: $("custom-context").value,
     decision_questions: collectQuestions(),

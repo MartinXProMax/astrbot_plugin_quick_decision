@@ -1,6 +1,6 @@
 # 从空配置重建发言流程
 
-版本 5 判断配置的设计和后端接口。旧实现的对照基线为 `e800ef8`。验收从一份空的判断配置开始。管理员新建普通题、选择触发条件、给选项绑定动作，就能重建默认群聊回复、冷场发言和指定消息引用。题目和选项都允许自行命名。
+版本 6 判断配置的设计和后端接口。旧实现的对照基线为 `e800ef8`。验收从一份空的判断配置开始。管理员新建普通题、选择触发条件、给选项绑定动作，就能重建默认群聊回复、冷场发言和指定消息引用。题目和选项都允许自行命名。
 
 ## 当前实现在哪一步失去可配置性
 
@@ -50,11 +50,13 @@
 
 ## 编辑器对接
 
-- 读取 `GET decision-config?version=7`。返回 `events`、`candidate_sources`、`actions`、`default_questions` 和当前的 `decision_questions`。旧配置在此投影为完整的版本 5 配置，读取不会写盘。目录中的 `stages`、`parameters`、`source` 和 `when` 说明动作可用阶段、参数和候选类型。
-- 保存 `POST decision-config`，提交 `{"version":7,"decision_questions":[...]}`。后端保存的配置为 `{"version":5,"questions":[...]}`。旧编辑器继续读写旧图。首次保存新版图后，旧编辑器的写请求会被拒绝，避免丢失动作。
-- 预览 `POST decision-preview`，提交 `version: 7`、`scene`、`decision_questions` 和示例 `answers`。返回各批次的 `asked/used/discarded`、有效答案、`reply`、`reply_sources`、`context`、`quote` 和 `tools`。预览仅使用样例消息和图库。
+- 读取 `GET decision-config?version=8`。返回 `events`、`candidate_sources`、`candidate_catalogs`、`candidate_examples`、`actions`、`default_questions` 和当前的 `decision_questions`。旧配置在此投影为完整的版本 6 配置，读取不会写盘。目录中的 `stages`、`parameters`、`source` 和 `when` 说明动作可用阶段、参数和候选类型。
+- 保存 `POST decision-config`，提交 `{"version":8,"decision_questions":[...]}`。后端保存的配置为 `{"version":6,"questions":[...]}`。旧编辑器继续读写不含候选引用的旧图。配置含有候选引用时，包括旧图读入后自动迁移出的引用，接口会声明需要版本 8 并拒绝旧编辑器写入，避免首次保存前就丢失引用。
+- 预览 `POST decision-preview`，提交 `version: 8`、`scene`、`decision_questions` 和示例 `answers`。返回各批次的 `asked/used/discarded`、本批展开的 `candidates`、跳过问题及原因 `skipped`、有效答案、`reply`、`reply_sources`、`context`、`quote` 和 `tools`。预览仅使用样例消息和图库。
 - 主动场景预览可带 `trigger_event: "timer_elapsed"`，假定全部定时入口同时到期；省略时保留冷场预览。定时轮次的决策日志带同名 `trigger_event` 字段，正文生成使用定时提示，不假定会话已经冷场。
-- `candidate_source` 可取 `options`、`recent_messages`、`meme_categories`、`memes`。动态候选通过选项 `*` 绑定动作；默认表情流程先从 `meme_categories` 选择分类，再让 `memes` 题按分类缩小候选。动作的 `from` 填具体题目 ID，省略时读取本题答案。`add_context` 还可用 `text` 传入固定内容，或用 `label` 为传给会话模型的字段命名。`quote_message` 需要消息候选。`send_meme` 需要图库候选，默认 `when: "on_match"`，随正文配图填 `when: "after_send"`。
+- `candidate_source` 可取目录名 `options`、`recent_messages`、`meme_categories`、`memes`（也接受 `{"catalog":"目录名"}`），或 `{"question":"来源题ID"}`。后者只展开来源题选中候选的 `children`，必须等来源答案，不能同批提前问；触发条件仍独立配置。来源没有有效选择或选中项没有下级时跳过，不退回完整目录。默认 `meme_id` 引用 `meme_category`；旧图仅在图片题有唯一分类上游时迁移为显式引用。重命名同步引用，删除来源保留失效引用，启用的依赖题必须修复或停用才能保存。候选依赖和触发依赖共同校验循环，生成前的题不能读取生成后来源。
+- 候选目录在 `candidate_sources.py::CATALOGS` 声明标签及下级类型 `children`；运行时目录提供 `id`、`description` 和可选 `children` 列表。工作流按选中候选展开下级，新增非图库目录也沿用相同引用与调度规则，无需在工作流里按题目 ID 分支。
+- 动态候选通过选项 `*` 绑定动作。动作的 `from` 填具体题目 ID，省略时读取本题答案。`add_context` 还可用 `text` 传入固定内容，或用 `label` 为传给会话模型的字段命名。`quote_message` 需要消息候选。`send_meme` 需要图库候选，默认 `when: "on_match"`，随正文配图填 `when: "after_send"`。
 - `scenes` 可限定群聊、私聊和冷场场景。`requires_candidates` 可让普通布尔题只在存在特定类型的候选时提问。`private_default` 指定私聊收到消息时的固定选项。`triggers: []` 的题保留为待连接。删除父题时也可一并移除子题对应的触发条件，保留其余来源。
 - 多处请求发言时生成一次，`reply_sources` 保留各个来源。一个消息段支持一个引用目标；多个有效引用绑定同时命中时采用配置顺序中最后一个。相同表情、相同发送时机的调用在本轮合并一次。
 
