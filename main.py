@@ -143,6 +143,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self.sessions.flush_logs()
         logger.info("快速决策插件已卸载。")
 
     # --- 消息监听与决策 ---

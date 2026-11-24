@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from astrbot.api import logger
+
 from .models import BufferedMessage, DecisionResult, SessionProfile
+
+# 合并一轮决策内的多次日志变更后再写盘。
+LOG_FLUSH_DELAY = 1.0
 
 
 @dataclass
@@ -40,15 +46,31 @@ class SessionRuntime:
 
 
 class SessionStore:
-    """内存会话状态。重启后聊天缓冲会丢失，表情库不受影响。"""
+    """内存会话状态。重启后聊天缓冲会丢失，表情库不受影响。
 
-    def __init__(self, data_dir: Path, log_limit: int = 200) -> None:
+    决策日志首次使用时载入内存，此后读写都不碰文件；变更合并后在后台线程整份写回，
+    文件仍是每行一条完整记录。
+    """
+
+    def __init__(
+        self, data_dir: Path, log_limit: int = 200, *, flush_delay: float = LOG_FLUSH_DELAY
+    ) -> None:
         self.data_dir = data_dir
         self.log_path = data_dir / "decision_logs.jsonl"
         self.log_limit = log_limit
         self._sessions: dict[str, SessionRuntime] = {}
         self._session_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-        self._log_lock = asyncio.Lock()
+        # 每项为（序列化后的行, 解析后的记录），按写入顺序排列。
+        self._log_entries: list[tuple[str, dict]] | None = None
+        self._log_dirty = False
+        self._log_version = 0
+        self._flush_delay = flush_delay
+        self._flush_task: asyncio.Task[None] | None = None
+        self._flush_now = asyncio.Event()
+        self._write_lock = asyncio.Lock()
+        # 写盘线程可能在协程被取消后仍在运行，用版本号保证旧快照不会覆盖新快照。
+        self._file_lock = threading.Lock()
+        self._written_version = 0
 
     def get(self, umo: str) -> SessionRuntime | None:
         return self._sessions.get(umo)
@@ -151,67 +173,109 @@ class SessionStore:
             return True
         return runtime.silence_evaluated_at_user_ts == runtime.last_user_ts
 
-    async def append_log(self, record: dict) -> None:
-        line = json.dumps(record, ensure_ascii=False)
-        async with self._log_lock:
+    # --- 决策日志 ---
+
+    def _entries(self) -> list[tuple[str, dict]]:
+        if self._log_entries is None:
+            entries: list[tuple[str, dict]] = []
             try:
-                existing: list[str] = []
-                if self.log_path.exists():
-                    existing = self.log_path.read_text(encoding="utf-8").splitlines()
-                existing.append(line)
-                existing = existing[-self.log_limit :]
-                tmp = self.log_path.with_suffix(".jsonl.tmp")
-                tmp.write_text("\n".join(existing) + "\n", encoding="utf-8")
-                tmp.replace(self.log_path)
-            except OSError:
-                return
+                text = self.log_path.read_text(encoding="utf-8", errors="replace") if self.log_path.exists() else ""
+            except OSError as exc:
+                logger.warning("无法读取决策日志：%s", exc)
+                text = ""
+            for line in text.splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    entries.append((line, row))
+            self._log_entries = entries
+            self._trim_logs()
+        return self._log_entries
+
+    def _trim_logs(self) -> None:
+        overflow = len(self._log_entries) - max(self.log_limit, 1)
+        if overflow > 0:
+            del self._log_entries[:overflow]
+
+    async def append_log(self, record: dict) -> None:
+        # 先序列化再解析：不合法的记录在改动缓存前报错，缓存也不与调用方共用对象。
+        line = json.dumps(record, ensure_ascii=False)
+        self._entries().append((line, json.loads(line)))
+        self._trim_logs()
+        self._schedule_flush()
 
     async def update_tool_log(self, round_id: str, calls: list[dict]) -> None:
         await self.update_round_log(round_id, tool_calls=calls)
 
     async def update_round_log(self, round_id: str, **fields) -> None:
-        async with self._log_lock:
-            try:
-                lines = self.log_path.read_text(encoding="utf-8").splitlines()
-                for i in range(len(lines) - 1, -1, -1):
-                    try:
-                        row = json.loads(lines[i])
-                    except ValueError:
-                        continue
-                    if isinstance(row, dict) and row.get("round_id") == round_id:
-                        row.update(fields)
-                        lines[i] = json.dumps(row, ensure_ascii=False)
-                        tmp = self.log_path.with_suffix(".jsonl.tmp")
-                        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-                        tmp.replace(self.log_path)
-                        break
-            except OSError:
+        entries = self._entries()
+        for i in range(len(entries) - 1, -1, -1):
+            if entries[i][1].get("round_id") == round_id:
+                line = json.dumps({**entries[i][1], **fields}, ensure_ascii=False)
+                entries[i] = (line, json.loads(line))
+                self._schedule_flush()
                 return
 
     def recent_logs(self, limit: int = 20, umo: str | None = None) -> list[dict]:
-        if not self.log_path.exists():
-            return []
-        try:
-            lines = self.log_path.read_text(encoding="utf-8").splitlines()
-        except OSError:
-            return []
+        """按新到旧返回日志。顶层字典是副本，嵌套内容与缓存共用，只读。"""
         items: list[dict] = []
-        for line in reversed(lines):
-            if not line.strip():
+        for _, row in reversed(self._entries()):
+            if umo and row.get("umo") != umo:
                 continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(data, dict):
-                continue
-            if umo and data.get("umo") != umo:
-                continue
-            items.append(data)
+            items.append(dict(row))
             if len(items) >= limit:
                 break
         return items
 
     def find_log(self, round_id: str) -> dict | None:
-        return next((row for row in self.recent_logs(limit=self.log_limit)
-                     if round_id and row.get("round_id") == round_id), None)
+        """返回指定回合的日志，规则同 recent_logs。"""
+        if not round_id:
+            return None
+        return next((dict(row) for _, row in reversed(self._entries())
+                     if row.get("round_id") == round_id), None)
+
+    def _schedule_flush(self) -> None:
+        self._log_dirty = True
+        self._log_version += 1
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_now.clear()
+            self._flush_task = asyncio.get_running_loop().create_task(self._flush_later())
+
+    async def _flush_later(self) -> None:
+        try:
+            await asyncio.wait_for(self._flush_now.wait(), self._flush_delay)
+        except TimeoutError:
+            pass
+        await self._write_pending()
+
+    async def _write_pending(self) -> None:
+        async with self._write_lock:
+            while self._log_dirty:
+                self._log_dirty = False
+                version = self._log_version
+                text = "".join(line + "\n" for line, _ in self._entries())
+                try:
+                    await asyncio.to_thread(self._write_log_file, version, text)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("决策日志写入失败，下次变更时重试：%s", exc)
+                    return
+
+    def _write_log_file(self, version: int, text: str) -> None:
+        with self._file_lock:
+            if version <= self._written_version:
+                return
+            tmp = self.log_path.with_suffix(".jsonl.tmp")
+            tmp.write_text(text, encoding="utf-8")
+            tmp.replace(self.log_path)
+            self._written_version = version
+
+    async def flush_logs(self) -> None:
+        """立即写入尚未落盘的日志，插件卸载时调用。"""
+        task = self._flush_task
+        if task is not None and not task.done():
+            self._flush_now.set()
+            # wait 不会因本协程被取消而取消写盘任务，也不抛出任务内的异常。
+            await asyncio.wait({task})
+        await self._write_pending()
