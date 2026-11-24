@@ -99,6 +99,15 @@ class TimerTriggerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin._self_generate_and_send.await_count, 1)
         self.assertEqual(next(iter(self.runtime.timer_due.values())), 1360)
 
+    async def test_waiting_follow_up_runs_before_due_timer(self):
+        await self.check(1000)
+        # 挂起的追问持有会话锁，等待期间到期的定时题不能抢先占用会话。
+        async with self.runtime.lock:
+            await self.check(1060)
+        self.assertIsNone(self.runtime.last_decision)
+        await self.check(1061)
+        self.assertEqual(self.runtime.last_decision.answers, {"timer": True})
+
     async def test_scene_filter_config_change_disable_and_idle_cleanup(self):
         self.set_questions(dict(timer_question(), scenes=["group_proactive"]))
         private = self.plugin.sessions.ensure(SessionProfile("private", True))

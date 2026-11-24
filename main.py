@@ -38,12 +38,15 @@ from .meme_migrate import maybe_migrate_legacy_library
 from .models import BufferedMessage, DecisionResult, SceneType, SessionProfile, decision_log_context
 from .official_handoff import (
     begin_official_pipeline,
+    begin_proactive_round,
     build_inbound_user_prompt,
     collect_event_media_urls,
+    end_proactive_round,
     is_official_pipeline_busy,
     make_official_llm_request,
     release_official_pipeline,
     resolve_session_conversation,
+    session_release_event,
     should_use_default_official_agent,
     suppress_default_official_agent,
 )
@@ -165,12 +168,15 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             task.add_done_callback(self._post_tasks.discard)
         if is_official_pipeline_busy(runtime):
             runtime.pending.append(buffered)
-            if runtime.pending_pipeline is None:
+            if session_release_event(runtime) is None:
+                # 被动回合仍在防抖或判断，会合并这条消息后重新判断。
                 event.stop_event()
                 return
             try:
-                await runtime.pipeline_released.wait()
+                # 先持锁再等待：释放后到本回合开始之间，定时与冷场检查不会抢占会话。
                 async with runtime.lock:
+                    while runtime.pending and (released := session_release_event(runtime)) is not None:
+                        await released.wait()
                     if not runtime.pending or is_official_pipeline_busy(runtime):
                         event.stop_event()
                         return
@@ -593,20 +599,20 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             for key, trigger in timers.items():
                 if key not in runtime.timer_due:
                     runtime.timer_due[key] = _next_timer_at(trigger, now, zone)
-            if is_official_pipeline_busy(runtime):
+            if is_official_pipeline_busy(runtime) or runtime.lock.locked():
                 continue
             due = {key for key, deadline in runtime.timer_due.items() if deadline <= now}
             if not due:
                 continue
             for key in due:
                 runtime.timer_due[key] = _next_timer_at(timers[key], now, zone)
-            runtime.deciding = True
+            begin_proactive_round(runtime)
             try:
                 await self._run_proactive(runtime, timer_roots={key[0] for key in due})
             except Exception:  # noqa: BLE001
                 logger.exception("定时判断失败：%s", runtime.profile.umo)
             finally:
-                runtime.deciding = False
+                end_proactive_round(runtime)
 
     async def _check_silence(self) -> None:
         settings = self.settings
@@ -616,17 +622,17 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         now = time.time()
         for runtime in self.sessions.all_sessions():
             profile = runtime.profile
-            if runtime.deciding or not runtime.last_user_ts:
+            if is_official_pipeline_busy(runtime) or runtime.lock.locked() or not runtime.last_user_ts:
                 continue
             if self.sessions.silence_already_evaluated(profile.umo):
                 continue
             if now - runtime.last_activity < settings.silence_seconds(profile.is_private):
                 continue
-            runtime.deciding = True
+            begin_proactive_round(runtime)
             try:
                 await self._run_proactive(runtime)
             finally:
-                runtime.deciding = False
+                end_proactive_round(runtime)
 
     async def _run_proactive(self, runtime, *, timer_roots=None) -> None:
         profile: SessionProfile = runtime.profile

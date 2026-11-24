@@ -166,3 +166,27 @@ def release_official_pipeline(runtime) -> None:
     runtime.pending_pipeline = None
     runtime.deciding = False
     runtime.pipeline_released.set()
+
+
+def begin_proactive_round(runtime) -> None:
+    runtime.proactive_running = True
+    runtime.deciding = True
+    runtime.proactive_released.clear()
+
+
+def end_proactive_round(runtime) -> None:
+    runtime.proactive_running = False
+    runtime.deciding = False
+    runtime.proactive_released.set()
+
+
+def session_release_event(runtime):
+    """返回占用会话的官方流水线或主动回合的结束信号。
+
+    进行中的被动回合会自行合并新消息并重新判断，此时返回 None。
+    """
+    if getattr(runtime, "pending_pipeline", None) is not None:
+        return runtime.pipeline_released
+    if getattr(runtime, "proactive_running", False):
+        return runtime.proactive_released
+    return None

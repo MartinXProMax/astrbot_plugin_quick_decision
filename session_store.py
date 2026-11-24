@@ -28,6 +28,8 @@ class SessionRuntime:
     last_decision: DecisionResult | None = None
     pending_pipeline: DecisionResult | None = None
     pipeline_released: asyncio.Event = field(default_factory=asyncio.Event)
+    proactive_running: bool = False
+    proactive_released: asyncio.Event = field(default_factory=asyncio.Event)
     display_name: str = ""
     name_checked_at: float = 0.0
     known: bool = True

@@ -1284,6 +1284,72 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.plugin.sessions.get(first.unified_msg_origin).pending, [])
 
+    async def test_mention_during_proactive_round_is_judged_after_it_ends(self) -> None:
+        import time
+
+        from astrbot_plugin_quick_decision.event_utils import event_profile
+
+        event = FakeEvent(
+            umo="aiocqhttp:GroupMessage:proactive-busy",
+            text="在吗",
+            message_id="during",
+            timestamp=10,
+            at_or_wake=True,
+        )
+        runtime = self.plugin.sessions.ensure(event_profile(event))
+        runtime.last_user_ts = time.time() - 3600
+        gate = asyncio.Event()
+
+        async def slow_proactive(*_a, **_k):
+            await gate.wait()
+
+        self.plugin._run_proactive = slow_proactive
+        silence = asyncio.create_task(self.plugin._check_silence())
+        await asyncio.sleep(0)
+        self.assertTrue(runtime.deciding)
+
+        # 冷场回合判断、生成、发送期间，@ 消息挂起而不是被丢弃。
+        task = asyncio.create_task(self.plugin.on_chat_message(event))
+        await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        self.assertFalse(event.is_stopped())
+
+        gate.set()
+        await silence
+        self.assertIsNone(await task)
+        self.assertFalse(event.is_stopped())
+        self.assertEqual(self.decision_calls, 1)
+        self.assertIsNotNone(runtime.pending_pipeline)
+
+    async def test_cancelled_wait_for_proactive_round_is_removed_from_pending(self) -> None:
+        import time
+
+        from astrbot_plugin_quick_decision.event_utils import event_profile
+
+        event = FakeEvent(umo="aiocqhttp:GroupMessage:proactive-cancel", text="在吗", message_id="x", timestamp=10)
+        runtime = self.plugin.sessions.ensure(event_profile(event))
+        runtime.last_user_ts = time.time() - 3600
+        gate = asyncio.Event()
+
+        async def slow_proactive(*_a, **_k):
+            await gate.wait()
+
+        self.plugin._run_proactive = slow_proactive
+        silence = asyncio.create_task(self.plugin._check_silence())
+        await asyncio.sleep(0)
+        task = asyncio.create_task(self.plugin.on_chat_message(event))
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        gate.set()
+        await silence
+
+        self.assertEqual(runtime.pending, [])
+        self.assertFalse(runtime.lock.locked())
+        self.assertFalse(runtime.deciding)
+        self.assertEqual(self.decision_calls, 0)
+
     async def test_none_and_dry_run_do_not_hand_off_or_generate(self) -> None:
         async def none_ask(*_a, **k):
             self.decision_calls += 1
