@@ -720,9 +720,15 @@ def _make_plugin(tmp: str, *, config=None, conv_mgr=None):
     )
     plugin._silence_task = None
     plugin._post_tasks = set()
+    plugin._proactive_tasks = set()
     plugin._generate_calls: list = []
     plugin._send_calls: list = []
     return plugin, main_mod
+
+
+async def _drain_proactive(plugin) -> None:
+    """等待已启动的定时与冷场回合全部结束。"""
+    await asyncio.gather(*list(getattr(plugin, "_proactive_tasks", ())))
 
 
 class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
@@ -1344,6 +1350,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             await task
         gate.set()
         await silence
+        await _drain_proactive(self.plugin)
 
         self.assertEqual(runtime.pending, [])
         self.assertFalse(runtime.lock.locked())
@@ -1727,6 +1734,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             runtime.last_bot_ts = now - 2301
         with patch("time.time", return_value=now):
             await self.plugin._check_silence()
+            await _drain_proactive(self.plugin)
         self.assertEqual(service.await_count, 2)
         for root in service.await_args_list:
             action_prompt = root.args[0][gate["id"]].instructions

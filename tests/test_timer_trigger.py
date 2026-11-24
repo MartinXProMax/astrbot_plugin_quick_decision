@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from test_official_inbound_handoff import _make_plugin
+from test_official_inbound_handoff import _drain_proactive, _make_plugin
 from test_decision_engine import DecisionBooleanAnswer, message
 from astrbot_plugin_quick_decision import web_api
 from astrbot_plugin_quick_decision.config_util import PluginSettings, load_questions
@@ -40,6 +40,7 @@ class TimerTriggerTests(unittest.IsolatedAsyncioTestCase):
     async def check(self, now):
         with patch("time.time", return_value=now):
             await self.plugin._check_timers()
+            await _drain_proactive(self.plugin)
 
     def test_reject_invalid_schedules_and_wrong_phase(self):
         invalid = ({}, {"interval_seconds": True}, {"interval_seconds": 14},
@@ -107,6 +108,61 @@ class TimerTriggerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.runtime.last_decision)
         await self.check(1061)
         self.assertEqual(self.runtime.last_decision.answers, {"timer": True})
+
+    async def test_slow_session_does_not_delay_other_sessions(self):
+        other = self.plugin.sessions.ensure(SessionProfile("other", False))
+        other.last_user_ts = 1000
+        gate = asyncio.Event()
+        finished = []
+
+        async def run(runtime, **_):
+            if runtime is self.runtime:
+                await gate.wait()
+            finished.append(runtime.profile.umo)
+
+        self.plugin._run_proactive = run
+        await self.check(1000)
+        with patch("time.time", return_value=1060):
+            # 检查本身不等待回合结束；被卡住的会话不影响其他会话按时执行。
+            await asyncio.wait_for(self.plugin._check_timers(), timeout=0.5)
+            for _ in range(3):
+                await asyncio.sleep(0)
+        self.assertEqual(finished, ["other"])
+        self.assertTrue(self.runtime.deciding)
+        self.assertFalse(other.deciding)
+        gate.set()
+        await _drain_proactive(self.plugin)
+        self.assertEqual(finished, ["other", "group"])
+        self.assertFalse(self.runtime.deciding)
+
+    async def test_concurrent_rounds_are_capped_and_the_rest_stay_due(self):
+        limit = self.main.PROACTIVE_CONCURRENCY
+        extra = [self.plugin.sessions.ensure(SessionProfile(f"s{i}", False)) for i in range(limit)]
+        for runtime in extra:
+            runtime.last_user_ts = 1000
+        gate = asyncio.Event()
+        started = []
+
+        async def run(runtime, **_):
+            started.append(runtime.profile.umo)
+            await gate.wait()
+
+        self.plugin._run_proactive = run
+        await self.check(1000)
+        with patch("time.time", return_value=1060):
+            await self.plugin._check_timers()
+            await asyncio.sleep(0)
+        left_out = extra[-1]
+        self.assertEqual(len(started), limit)
+        self.assertNotIn(left_out.profile.umo, started)
+        self.assertFalse(left_out.deciding)
+        # 达到上限的会话保持到期，不跳过这一次定时。
+        self.assertEqual(next(iter(left_out.timer_due.values())), 1060)
+        gate.set()
+        await _drain_proactive(self.plugin)
+        await self.check(1061)
+        self.assertEqual(started[-1], left_out.profile.umo)
+        self.assertEqual(len(started), limit + 1)
 
     async def test_scene_filter_config_change_disable_and_idle_cleanup(self):
         self.set_questions(dict(timer_question(), scenes=["group_proactive"]))

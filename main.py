@@ -69,6 +69,8 @@ from .web_api import WebApiMixin
 
 PLUGIN_NAME = "astrbot_plugin_quick_decision"
 LOG_TEXT_LIMIT = 120
+# 同时进行的定时与冷场回合上限；超出的会话保持到期，留到下次检查。
+PROACTIVE_CONCURRENCY = 4
 
 
 def _log_text(value: str, limit: int = LOG_TEXT_LIMIT) -> str:
@@ -99,6 +101,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         )
         self._silence_task: asyncio.Task[None] | None = None
         self._post_tasks: set[asyncio.Task[None]] = set()
+        self._proactive_tasks: set[asyncio.Task[None]] = set()
         self.register_plugin_web_apis()
 
     @property
@@ -136,9 +139,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 await self._silence_task
             except asyncio.CancelledError:
                 pass
-        for task in self._post_tasks:
+        tasks = [*self._post_tasks, *self._proactive_tasks]
+        for task in tasks:
             task.cancel()
-        await asyncio.gather(*self._post_tasks, return_exceptions=True)
+        await asyncio.gather(*tasks, return_exceptions=True)
         logger.info("快速决策插件已卸载。")
 
     # --- 消息监听与决策 ---
@@ -602,17 +606,11 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             if is_official_pipeline_busy(runtime) or runtime.lock.locked():
                 continue
             due = {key for key, deadline in runtime.timer_due.items() if deadline <= now}
-            if not due:
+            if not due or len(self._proactive_tasks) >= PROACTIVE_CONCURRENCY:
                 continue
             for key in due:
                 runtime.timer_due[key] = _next_timer_at(timers[key], now, zone)
-            begin_proactive_round(runtime)
-            try:
-                await self._run_proactive(runtime, timer_roots={key[0] for key in due})
-            except Exception:  # noqa: BLE001
-                logger.exception("定时判断失败：%s", runtime.profile.umo)
-            finally:
-                end_proactive_round(runtime)
+            self._start_proactive(runtime, timer_roots={key[0] for key in due})
 
     async def _check_silence(self) -> None:
         settings = self.settings
@@ -628,11 +626,26 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 continue
             if now - runtime.last_activity < settings.silence_seconds(profile.is_private):
                 continue
-            begin_proactive_round(runtime)
-            try:
-                await self._run_proactive(runtime)
-            finally:
-                end_proactive_round(runtime)
+            if len(self._proactive_tasks) >= PROACTIVE_CONCURRENCY:
+                continue
+            self._start_proactive(runtime)
+
+    def _start_proactive(self, runtime, *, timer_roots=None) -> None:
+        """在后台执行主动回合，避免一个会话的判断或生成拖慢其他会话。"""
+        # 同步占用会话，后续检查和新消息立刻能看到本会话正忙。
+        begin_proactive_round(runtime)
+        task = asyncio.create_task(self._proactive_round(runtime, timer_roots))
+        self._proactive_tasks.add(task)
+        task.add_done_callback(self._proactive_tasks.discard)
+
+    async def _proactive_round(self, runtime, timer_roots) -> None:
+        try:
+            await self._run_proactive(runtime, timer_roots=timer_roots)
+        except Exception:  # noqa: BLE001
+            kind = "定时判断" if timer_roots is not None else "冷场主动发言"
+            logger.exception("%s失败：%s", kind, runtime.profile.umo)
+        finally:
+            end_proactive_round(runtime)
 
     async def _run_proactive(self, runtime, *, timer_roots=None) -> None:
         profile: SessionProfile = runtime.profile
