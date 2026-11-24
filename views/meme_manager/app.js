@@ -1,5 +1,6 @@
 import { probabilityRows } from "./log-probabilities.mjs";
 import { logHasIssue, sessionLabel, summarizeLogs } from "./log-summary.mjs";
+import * as sm from "./settings-model.mjs";
 import * as wf from "./workflow-model.mjs";
 
 const bridge = window.AstrBotPluginView;
@@ -1646,7 +1647,7 @@ function renderStatusChips(status) {
   const chips = [
     status.enabled
       ? h("span", { class: "chip is-ok" }, "已启用")
-      : h("span", { class: "chip is-off", title: "插件配置中已关闭快速决策" }, "已关闭"),
+      : h("span", { class: "chip is-off", title: "「插件设置」中已关闭快速决策" }, "已关闭"),
   ];
   if (status.dry_run) {
     chips.push(
@@ -2116,14 +2117,223 @@ async function loadLogs({ automatic = false } = {}) {
   }
 }
 
+// ---------- 插件设置 ----------
+
+const settingsState = { sections: [], fields: [], values: {}, saved: {}, loaded: false, saving: false };
+
+const SETTINGS_MESSAGES = {
+  clean: "与插件配置一致",
+  dirty: "有未保存的更改",
+  saving: "正在保存…",
+  saved: "已保存到插件配置，立即生效",
+  error: "保存失败",
+};
+
+function settingChanges() {
+  return sm.changedValues(settingsState.fields, settingsState.values, settingsState.saved);
+}
+
+function settingsDirty() {
+  return settingsState.loaded && Object.keys(settingChanges()).length > 0;
+}
+
+function setSettingsSaveState(kind, text) {
+  $("settings-savebar").dataset.state = kind;
+  $("settings-msg").textContent = text || SETTINGS_MESSAGES[kind] || "";
+  $("settings-discard").hidden = kind === "saving" || !settingsDirty();
+  $("settings-save").disabled = kind === "saving" || !settingsState.loaded;
+}
+
+// 标出改过和无效的项，并刷新保存栏。只改类名和文字，不重建输入框。
+function updateSettingsDirty() {
+  if (settingsState.saving) return;
+  const changes = settingChanges();
+  for (const field of settingsState.fields) {
+    const row = $("settings-sections").querySelector(`.set-row[data-key="${field.key}"]`);
+    if (!row) continue;
+    const error = sm.fieldError(field, settingsState.values[field.key]);
+    row.classList.toggle("is-changed", Object.hasOwn(changes, field.key));
+    row.classList.toggle("has-error", !!error);
+    const note = row.querySelector(".set-error");
+    note.hidden = !error;
+    note.textContent = error;
+  }
+  if (Object.keys(changes).length) setSettingsSaveState("dirty", sm.describeChanges(settingsState.fields, changes));
+  else if (["dirty", "error"].includes($("settings-savebar").dataset.state)) setSettingsSaveState("clean");
+}
+
+function settingId(field) {
+  return `set-${field.key.replace(/\W/g, "-")}`;
+}
+
+function settingControl(field) {
+  const id = settingId(field);
+  const value = settingsState.values[field.key];
+  const set = (next) => {
+    settingsState.values[field.key] = next;
+    updateSettingsDirty();
+  };
+  if (field.type === "bool") {
+    const text = h("span", null, value ? "开启" : "关闭");
+    return h("label", { class: "switch" },
+      h("input", {
+        id, type: "checkbox", checked: value,
+        onchange: (event) => {
+          text.textContent = event.target.checked ? "开启" : "关闭";
+          set(event.target.checked);
+        },
+      }),
+      text);
+  }
+  if (field.options) {
+    const group = h("div", { class: "seg", role: "group", "aria-labelledby": `${id}-label` },
+      field.options.map((option) => h("button", {
+        type: "button",
+        "aria-pressed": String(option.value === value),
+        title: option.value,
+        onclick: (event) => {
+          for (const button of group.querySelectorAll("button")) {
+            button.setAttribute("aria-pressed", String(button === event.currentTarget));
+          }
+          set(option.value);
+        },
+      }, option.label)));
+    return group;
+  }
+  if (field.type === "int" || field.type === "float") {
+    // min、max、step 要先于 value 设置，否则滑块会先按默认的 0–100 截断数值。
+    const bounds = { min: field.min, max: field.max, step: field.step ?? (field.type === "int" ? 1 : "any") };
+    const number = h("input", {
+      id, type: "number", ...bounds, value: value ?? "",
+      inputmode: field.type === "int" ? "numeric" : "decimal",
+    });
+    const range = field.min != null && field.max != null
+      && h("input", { type: "range", ...bounds, value: value ?? field.min, tabindex: -1, "aria-hidden": "true" });
+    const duration = field.unit === "秒" && field.max >= 60 && h("small", { class: "set-duration" }, sm.formatDuration(value));
+    const sync = (next) => {
+      if (duration) duration.textContent = sm.formatDuration(next);
+      set(next);
+    };
+    number.addEventListener("input", () => {
+      const next = Number.isFinite(number.valueAsNumber) ? number.valueAsNumber : null;
+      if (range && next !== null) range.value = next;
+      sync(next);
+    });
+    range?.addEventListener("input", () => {
+      number.value = range.value;
+      sync(range.valueAsNumber);
+    });
+    return h("div", { class: "set-number" },
+      range,
+      // 没有单位时也保留占位，让各行的输入框右端对齐。
+      h("span", { class: "set-number-box" }, number, h("span", { class: "set-unit", "aria-hidden": field.unit ? undefined : "true" }, field.unit)),
+      duration);
+  }
+  return h("input", {
+    id, type: "text", class: "mono", value: value ?? "", maxlength: field.max_length,
+    placeholder: field.key === "decision_provider_id" ? "留空使用默认判断提供商" : undefined,
+    spellcheck: "false", autocomplete: "off",
+    oninput: (event) => set(event.target.value),
+  });
+}
+
+function renderSettingRow(field) {
+  const id = settingId(field);
+  // 分段按钮没有单一的输入框可关联，标题改用 aria-labelledby 指向它。
+  const label = field.options
+    ? h("span", { class: "set-label", id: `${id}-label` }, field.label)
+    : h("label", { class: "set-label", id: `${id}-label`, for: id }, field.label);
+  label.append(h("span", { class: "q-change set-change" }, "已修改"));
+  return h("div", { class: "set-row", dataset: { key: field.key, type: field.type } },
+    h("div", { class: "set-text" },
+      label,
+      field.hint && h("p", { class: "set-hint" }, field.hint),
+      h("p", { class: "set-error", hidden: true })),
+    h("div", { class: "set-control" }, settingControl(field)));
+}
+
+function renderSettings() {
+  $("settings-sections").replaceChildren(...settingsState.sections.map((section) =>
+    h("section", { class: "block", dataset: { section: section.id } },
+      h("div", { class: "block-head" }, h("h2", null, section.title)),
+      section.hint && h("p", { class: "hint" }, section.hint),
+      h("div", { class: "set-list" }, section.fields.map(renderSettingRow)))));
+  updateSettingsDirty();
+}
+
+function applySettings(data) {
+  settingsState.sections = Array.isArray(data.sections) ? data.sections : [];
+  settingsState.fields = settingsState.sections.flatMap((section) => section.fields);
+  settingsState.saved = { ...data.values };
+  settingsState.values = { ...data.values };
+  settingsState.loaded = true;
+  renderSettings();
+}
+
+async function loadSettings() {
+  try {
+    applySettings(await bridge.apiGet("settings"));
+    setSettingsSaveState("clean");
+  } catch (error) {
+    if (!settingsState.loaded) {
+      $("settings-sections").replaceChildren(h("p", { class: "log-error" }, `读取插件设置失败：${error.message}。可以稍后点刷新重试。`));
+    }
+    setSettingsSaveState("error", `读取插件设置失败：${error.message}`);
+  }
+}
+
+async function saveSettings() {
+  if (settingsState.saving || !settingsState.loaded) return;
+  const changes = settingChanges();
+  if (!Object.keys(changes).length) {
+    setSettingsSaveState("clean");
+    return;
+  }
+  const invalid = settingsState.fields.find((field) => Object.hasOwn(changes, field.key) && sm.fieldError(field, changes[field.key]));
+  if (invalid) {
+    setSettingsSaveState("error", `「${invalid.label}」${sm.fieldError(invalid, changes[invalid.key])}`);
+    const row = $("settings-sections").querySelector(`.set-row[data-key="${invalid.key}"]`);
+    row?.scrollIntoView({ block: "center", behavior: "smooth" });
+    row?.querySelector("input, button")?.focus({ preventScroll: true });
+    return;
+  }
+  settingsState.saving = true;
+  setSettingsSaveState("saving");
+  // 保存期间锁住表单，避免返回的配置覆盖正在输入的内容。
+  $("settings-form").disabled = true;
+  try {
+    const data = await bridge.apiPost("settings", { changes });
+    settingsState.saving = false;
+    applySettings(data);
+    setSettingsSaveState("saved");
+    if (Object.hasOwn(changes, "decision_provider_id")) {
+      $("provider-test-result").textContent = "";
+      $("provider-test-result").className = "status-hint";
+    }
+    await loadStatus();
+  } catch (error) {
+    setSettingsSaveState("error", `保存失败：${error.message}`);
+  } finally {
+    settingsState.saving = false;
+    $("settings-form").disabled = false;
+  }
+}
+
+function onDiscardSettings() {
+  settingsState.values = { ...settingsState.saved };
+  renderSettings();
+  setSettingsSaveState("clean");
+}
+
 // ---------- 页面 ----------
 
+const TABS = ["decision", "logs", "settings"];
 let currentTab = "decision";
 let logRefreshTimer = 0;
 
 function setTab(name, { focus = false } = {}) {
   currentTab = name;
-  for (const tab of ["decision", "logs"]) {
+  for (const tab of TABS) {
     const active = tab === name;
     const button = $(`tab-btn-${tab}`);
     $(`panel-${tab}`).hidden = !active;
@@ -2142,21 +2352,33 @@ function setTab(name, { focus = false } = {}) {
   }
 }
 
+async function reloadDecisionConfig() {
+  if (isDirty()) {
+    setSaveState("dirty", "有未保存的更改，刷新时保留了你的编辑");
+    return;
+  }
+  try {
+    await loadDecisionConfig();
+  } catch (error) {
+    setSaveState("error", `读取判断配置失败：${error.message}`);
+  }
+}
+
+async function reloadSettings() {
+  if (settingsDirty()) {
+    setSettingsSaveState("dirty", "有未保存的更改，刷新时保留了你的编辑");
+    return;
+  }
+  await loadSettings();
+}
+
 async function reload() {
   const button = $("refresh");
   button.disabled = true;
   try {
     await loadStatus();
     if (currentTab === "logs") await loadLogs();
-    if (isDirty()) {
-      setSaveState("dirty", "有未保存的更改，刷新时保留了你的编辑");
-      return;
-    }
-    try {
-      await loadDecisionConfig();
-    } catch (error) {
-      setSaveState("error", `读取判断配置失败：${error.message}`);
-    }
+    await Promise.all([reloadDecisionConfig(), reloadSettings()]);
   } finally {
     button.disabled = false;
   }
@@ -2167,6 +2389,7 @@ function renderContext(context) {
   document.title = bridge.t("views.meme_manager.title", "快速决策");
   $("tab-btn-decision").textContent = bridge.t("views.meme_manager.tab_decision", "判断配置");
   $("tab-btn-logs").textContent = bridge.t("views.meme_manager.tab_logs", "决策日志");
+  $("tab-btn-settings").textContent = bridge.t("views.meme_manager.tab_settings", "插件设置");
   $("refresh-label").textContent = bridge.t("views.meme_manager.refresh", "刷新");
   document.documentElement.dataset.theme = context?.isDark ? "dark" : "light";
 }
@@ -2215,7 +2438,8 @@ function onDiscard() {
 function onTabKey(event) {
   if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
   event.preventDefault();
-  setTab(currentTab === "decision" ? "logs" : "decision", { focus: true });
+  const step = event.key === "ArrowRight" ? 1 : -1;
+  setTab(TABS[(TABS.indexOf(currentTab) + step + TABS.length) % TABS.length], { focus: true });
 }
 
 const context = await bridge.ready();
@@ -2223,10 +2447,12 @@ renderContext(context);
 bridge.onContext(renderContext);
 
 $("refresh").addEventListener("click", reload);
-$("tab-btn-decision").addEventListener("click", () => setTab("decision"));
-$("tab-btn-logs").addEventListener("click", () => setTab("logs"));
-$("tab-btn-decision").addEventListener("keydown", onTabKey);
-$("tab-btn-logs").addEventListener("keydown", onTabKey);
+for (const tab of TABS) {
+  $(`tab-btn-${tab}`).addEventListener("click", () => setTab(tab));
+  $(`tab-btn-${tab}`).addEventListener("keydown", onTabKey);
+}
+$("settings-save").addEventListener("click", saveSettings);
+$("settings-discard").addEventListener("click", onDiscardSettings);
 $("log-limit").addEventListener("change", loadLogs);
 $("log-search").addEventListener("input", renderLogs);
 $("log-session").addEventListener("change", (event) => {
@@ -2279,9 +2505,10 @@ document.addEventListener("keydown", (event) => {
     $("add-menu").open = false;
     $("add-menu").querySelector("summary").focus();
   }
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s" && currentTab === "decision") {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s" && currentTab !== "logs") {
     event.preventDefault();
-    saveDecisionConfig();
+    if (currentTab === "settings") saveSettings();
+    else saveDecisionConfig();
   }
 });
 
@@ -2312,7 +2539,7 @@ for (const type of ["input", "change"]) {
 }
 
 window.addEventListener("beforeunload", (event) => {
-  if (isDirty()) event.preventDefault();
+  if (isDirty() || settingsDirty()) event.preventDefault();
 });
 
 await reload();

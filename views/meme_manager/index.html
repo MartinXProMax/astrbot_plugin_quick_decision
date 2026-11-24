@@ -32,6 +32,7 @@
       <nav class="tabs" role="tablist" aria-label="插件页面分段">
         <button id="tab-btn-decision" type="button" role="tab" class="tab active" data-tab="decision" aria-selected="true" aria-controls="panel-decision">判断配置</button>
         <button id="tab-btn-logs" type="button" role="tab" class="tab" data-tab="logs" aria-selected="false" aria-controls="panel-logs" tabindex="-1">决策日志</button>
+        <button id="tab-btn-settings" type="button" role="tab" class="tab" data-tab="settings" aria-selected="false" aria-controls="panel-settings" tabindex="-1">插件设置</button>
       </nav>
 
       <main>
@@ -196,6 +197,22 @@
             <ol id="logs" class="log-list"></ol>
             <p id="logs-empty" class="empty" hidden>还没有决策记录。机器人收到消息并完成一次判断后，结果会出现在这里。</p>
           </section>
+        </div>
+
+        <div id="panel-settings" role="tabpanel" aria-labelledby="tab-btn-settings" hidden>
+          <p class="hint panel-intro">
+            与 AstrBot 插件配置页中的同名设置相同，保存后立即生效。默认决策模式、判断模型的背景信息和问题在「判断配置」中编辑。
+          </p>
+          <fieldset id="settings-form" class="settings-form" aria-label="插件设置">
+            <div id="settings-sections"><p class="hint">正在读取插件设置…</p></div>
+          </fieldset>
+          <div id="settings-savebar" class="savebar" data-state="clean">
+            <p id="settings-msg" class="savebar-msg" role="status">与插件配置一致</p>
+            <div class="savebar-actions">
+              <button id="settings-discard" type="button" class="btn btn-ghost" hidden>撤销更改</button>
+              <button id="settings-save" type="button" class="btn btn-primary" title="Ctrl + S" disabled>保存设置</button>
+            </div>
+          </div>
         </div>
       </main>
     </div>

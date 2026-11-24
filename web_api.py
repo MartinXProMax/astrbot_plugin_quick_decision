@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
+import math
 import time
 from collections.abc import Mapping
 from dataclasses import fields
+from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.provider import DecisionBooleanAnswer, DecisionBooleanQuestion, DecisionProvider, ProviderType
@@ -27,6 +30,112 @@ from .models import QUESTION_ROLES, BufferedMessage
 from .workflow_actions import ACTIONS, SOURCES, WORKFLOW_EVENTS, migrate_actions
 
 PLUGIN_NAME = "astrbot_plugin_quick_decision"
+SCHEMA_PATH = Path(__file__).with_name("_conf_schema.json")
+
+# 「插件设置」页展示的配置项，分组顺序即页面顺序。标签、说明和取值范围取自 _conf_schema.json。
+# decision_mode、decision_custom_context、decision_questions 在「判断配置」页编辑；vision_provider_id 已停用。
+SETTING_SECTIONS = (
+    ("run", "运行", "", ("enabled", "dry_run")),
+    ("judge", "判断模型", "仅模型判断的问题使用这些设置。", (
+        "decision_provider_id", "choice_threshold", "choice_temperature", "context_message_limit")),
+    ("pace", "节奏", "", ("debounce_seconds", "cooldown_seconds")),
+    ("group", "群聊", None, (
+        "group.enable_interrupt", "group.target_quote_mode", "group.enable_proactive_after_silence",
+        "group.silence_seconds", "group.hourly_proactive_limit")),
+    ("private", "私聊", None, (
+        "private.enable_proactive_after_silence", "private.silence_seconds", "private.hourly_proactive_limit")),
+    ("logs", "决策日志", "", ("decision_log_limit", "decision_log_include_content")),
+)
+# 配置键与 PluginSettings 属性名不同的项；读取时展示插件实际生效的值。
+SETTING_ATTRS = {
+    "group.enable_interrupt": "group_enable_interrupt",
+    "group.target_quote_mode": "target_quote_mode",
+    "group.enable_proactive_after_silence": "group_enable_proactive",
+    "group.silence_seconds": "group_silence_seconds",
+    "group.hourly_proactive_limit": "group_hourly_proactive_limit",
+    "private.enable_proactive_after_silence": "private_enable_proactive",
+    "private.silence_seconds": "private_silence_seconds",
+    "private.hourly_proactive_limit": "private_hourly_proactive_limit",
+}
+SETTING_OPTION_LABELS = {"group.target_quote_mode": {"first": "仅首段引用", "all": "每段都引用", "none": "不引用"}}
+SETTING_UNITS = {
+    "context_message_limit": "条", "debounce_seconds": "秒", "cooldown_seconds": "秒",
+    "group.silence_seconds": "秒", "group.hourly_proactive_limit": "次",
+    "private.silence_seconds": "秒", "private.hourly_proactive_limit": "次", "decision_log_limit": "条",
+}
+SETTING_TEXT_LIMIT = 200
+
+
+@functools.cache
+def _schema() -> dict:
+    return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def _schema_item(key: str) -> dict:
+    node = _schema()
+    *parents, name = key.split(".")
+    for parent in parents:
+        node = node[parent]["items"]
+    return node[name]
+
+
+@functools.cache
+def setting_sections() -> tuple[dict, ...]:
+    sections = []
+    for section_id, title, hint, keys in SETTING_SECTIONS:
+        items = []
+        for key in keys:
+            item = _schema_item(key)
+            field = {"key": key, "type": item["type"], "label": item.get("description", key),
+                     "hint": item.get("hint", ""), "default": item.get("default")}
+            if "options" in item:
+                labels = SETTING_OPTION_LABELS.get(key, {})
+                field["options"] = [{"value": value, "label": labels.get(value, value)} for value in item["options"]]
+            if "slider" in item:
+                field.update({name: item["slider"][name] for name in ("min", "max", "step") if name in item["slider"]})
+            if key in SETTING_UNITS:
+                field["unit"] = SETTING_UNITS[key]
+            if field["type"] == "string" and "options" not in field:
+                field["max_length"] = SETTING_TEXT_LIMIT
+            items.append(field)
+        if hint is None:
+            hint = _schema()[section_id].get("hint", "")
+        sections.append({"id": section_id, "title": title, "hint": hint, "fields": items})
+    return tuple(sections)
+
+
+def setting_fields() -> dict[str, dict]:
+    return {field["key"]: field for section in setting_sections() for field in section["fields"]}
+
+
+def validate_setting(field: dict, value):
+    """校验一项设置，返回 (规范化后的值, 错误信息)。"""
+    label = field["label"]
+    kind = field["type"]
+    if kind == "bool":
+        return (value, None) if type(value) is bool else (None, f"「{label}」需要是开关值")
+    if kind in ("int", "float"):
+        if type(value) is bool or not isinstance(value, (int, float)) or not math.isfinite(value):
+            return None, f"「{label}」需要是数字"
+        if kind == "int":
+            if isinstance(value, float) and not value.is_integer():
+                return None, f"「{label}」需要是整数"
+            value = int(value)
+        else:
+            value = float(value)
+        low, high = field.get("min"), field.get("max")
+        if (low is not None and value < low) or (high is not None and value > high):
+            return None, f"「{label}」需在 {low} 到 {high} 之间"
+        return value, None
+    if not isinstance(value, str):
+        return None, f"「{label}」需要是文本"
+    value = value.strip()
+    options = [option["value"] for option in field.get("options", ())]
+    if options and value not in options:
+        return None, f"「{label}」只能是 {' / '.join(options)}"
+    if len(value) > field.get("max_length", SETTING_TEXT_LIMIT):
+        return None, f"「{label}」不能超过 {field.get('max_length', SETTING_TEXT_LIMIT)} 个字符"
+    return value, None
 
 
 def _needs_candidate_editor(settings):
@@ -49,6 +158,7 @@ class WebApiMixin:
                 ["GET", "POST"],
                 "读取或保存判断配置",
             ),
+            (f"/{PLUGIN_NAME}/settings", self.web_settings, ["GET", "POST"], "读取或保存插件设置"),
         ]
         for route, handler, methods, desc in routes:
             self.context.register_web_api(route, handler, methods, desc)
@@ -316,8 +426,8 @@ class WebApiMixin:
         if error:
             return error_response(error, status_code=400)
 
-        config = getattr(self, "config", None)
-        if config is None or not hasattr(config, "save_config"):
+        config = self._writable_config()
+        if config is None:
             return error_response("当前环境无法写入官方插件配置", status_code=500)
         changes = {
             "decision_mode": mode,
@@ -327,32 +437,100 @@ class WebApiMixin:
                 ensure_ascii=False, indent=2,
             ),
         }
-        if not hasattr(self, "_decision_save_lock"):
-            self._decision_save_lock = asyncio.Lock()
-        async with self._decision_save_lock:
+        async with self._config_lock():
             if version < 8 and _needs_candidate_editor(self.settings):
                 return error_response("当前配置使用候选来源引用，请刷新编辑页后再保存", status_code=409)
             if version < 7 and self.settings.workflow_version == 5:
                 return error_response("当前配置使用选项动作，需要支持版本 7 的编辑器", status_code=409)
-            missing = object()
-            previous = {key: config.get(key, missing) for key in changes}
             try:
-                for key, value in changes.items():
-                    config[key] = value
-                save = getattr(config, "save_config_async", None)
-                if callable(save):
-                    await save()
-                else:
-                    config.save_config()
-            except (Exception, asyncio.CancelledError) as exc:
-                for key, value in previous.items():
-                    if value is missing:
-                        config.pop(key, None)
-                    else:
-                        config[key] = value
-                if isinstance(exc, asyncio.CancelledError):
-                    raise
+                await self._write_config(config, changes)
+            except Exception:
                 logger.exception("判断配置保存失败")
                 return error_response("保存配置失败，请重试", status_code=500)
         logger.info("已更新判断配置")
         return json_response(self._decision_config_payload(warning=None))
+
+    # ---------- 插件设置 ----------
+
+    def _writable_config(self):
+        config = getattr(self, "config", None)
+        return config if config is not None and hasattr(config, "save_config") else None
+
+    def _config_lock(self) -> asyncio.Lock:
+        # 判断配置和插件设置写同一份配置文件，共用一把锁，避免交错保存互相覆盖。
+        if not hasattr(self, "_config_save_lock"):
+            self._config_save_lock = asyncio.Lock()
+        return self._config_save_lock
+
+    async def _write_config(self, config, changes: dict) -> None:
+        """写入顶层配置键并保存；保存失败或被取消时恢复这些键，再把异常抛给调用方。"""
+        missing = object()
+        previous = {key: config.get(key, missing) for key in changes}
+        try:
+            for key, value in changes.items():
+                config[key] = value
+            save = getattr(config, "save_config_async", None)
+            if callable(save):
+                await save()
+            else:
+                config.save_config()
+        except BaseException:
+            for key, value in previous.items():
+                if value is missing:
+                    config.pop(key, None)
+                else:
+                    config[key] = value
+            raise
+
+    def _settings_payload(self) -> dict:
+        settings = self.settings
+        return {
+            "sections": list(setting_sections()),
+            "values": {key: getattr(settings, SETTING_ATTRS.get(key, key)) for key in setting_fields()},
+        }
+
+    async def web_settings(self):
+        if request.method == "GET":
+            return json_response(self._settings_payload())
+
+        payload = await request.json(default={})
+        edited = payload.get("changes") if isinstance(payload, dict) else None
+        if not isinstance(edited, dict):
+            return error_response("请求体需要包含 changes 对象", status_code=400)
+        known = setting_fields()
+        values = {}
+        for key, value in edited.items():
+            field = known.get(key)
+            if field is None:
+                return error_response(f"未知的设置项：{key}", status_code=400)
+            values[key], error = validate_setting(field, value)
+            if error:
+                return error_response(error, status_code=400)
+        if not values:
+            return json_response(self._settings_payload())
+        config = self._writable_config()
+        if config is None:
+            return error_response("当前环境无法写入官方插件配置", status_code=500)
+        async with self._config_lock():
+            changes = {}
+            for key, value in values.items():
+                parent, _, name = key.rpartition(".")
+                if not parent:
+                    changes[key] = value
+                    continue
+                # 嵌套分组整体替换为新字典，保留未改动的子键；回滚时原字典不受影响。
+                if parent not in changes:
+                    current = config.get(parent)
+                    changes[parent] = dict(current) if isinstance(current, Mapping) else {}
+                changes[parent][name] = value
+            try:
+                await self._write_config(config, changes)
+            except Exception:
+                logger.exception("插件设置保存失败")
+                return error_response("保存设置失败，请重试", status_code=500)
+        sessions = getattr(self, "sessions", None)
+        if "decision_log_limit" in values and sessions is not None:
+            # 日志存储在启动时读取保留条数，这里同步，免去重载插件。
+            sessions.log_limit = values["decision_log_limit"]
+        logger.info("已更新插件设置：%s", "、".join(values))
+        return json_response(self._settings_payload())

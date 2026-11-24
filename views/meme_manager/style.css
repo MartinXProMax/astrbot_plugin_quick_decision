@@ -3204,3 +3204,170 @@ textarea.is-invalid {
 .act-head b {
   white-space: nowrap;
 }
+
+/* ---------- 插件设置 ---------- */
+
+.panel-intro {
+  margin: 0 0 16px;
+}
+
+.settings-form {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.set-list {
+  display: grid;
+}
+
+.set-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 320px);
+  align-items: center;
+  gap: 8px 28px;
+  padding: 14px 0;
+  border-top: 1px solid var(--line);
+}
+
+.set-row:first-child {
+  border-top: 0;
+  padding-top: 6px;
+}
+
+.set-row:last-child {
+  padding-bottom: 0;
+}
+
+/* 改过的项在左侧留一道麦黄色竖线，与问题卡片的改动标记一致。 */
+.set-row.is-changed::before {
+  content: "";
+  position: absolute;
+  left: -12px;
+  top: 16px;
+  bottom: 16px;
+  width: 3px;
+  border-radius: 3px;
+  background: var(--chat);
+}
+
+.set-row:first-child.is-changed::before {
+  top: 8px;
+}
+
+.set-row:last-child.is-changed::before {
+  bottom: 2px;
+}
+
+.set-text {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.set-label {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  width: fit-content;
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.set-change {
+  display: none;
+}
+
+.set-row.is-changed .set-change {
+  display: inline-flex;
+}
+
+.set-hint {
+  color: var(--muted);
+  font-size: 12.5px;
+  max-width: 62ch;
+}
+
+.set-error {
+  color: var(--danger);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.set-control {
+  display: flex;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.set-control > input[type="text"] {
+  width: 100%;
+}
+
+.set-number {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px 12px;
+  width: 100%;
+}
+
+.set-number input[type="range"] {
+  width: 100%;
+  margin: 0;
+  accent-color: var(--ink);
+  cursor: pointer;
+}
+
+.set-number-box {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  grid-column: 2;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.set-number-box input[type="number"] {
+  width: 92px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.set-unit {
+  min-width: 1em;
+}
+
+.set-duration {
+  grid-column: 1 / -1;
+  justify-self: end;
+  color: var(--faint);
+  font-size: 12px;
+}
+
+.set-row.has-error input[type="number"],
+.set-row.has-error input[type="text"] {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.settings-form:disabled .set-row {
+  opacity: 0.7;
+}
+
+@media (max-width: 640px) {
+  .set-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .set-control {
+    justify-content: flex-start;
+  }
+
+  .set-row.is-changed::before {
+    left: -10px;
+  }
+}
