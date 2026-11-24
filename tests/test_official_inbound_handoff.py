@@ -509,6 +509,39 @@ class DirectSendGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.conversation_manager.updated[0]["history"],
                          [{"role": "assistant", "content": "周末过得怎么样？"}])
 
+    async def test_proactive_generation_drops_tool_rounds_but_keeps_them_in_history(self) -> None:
+        import json
+
+        from astrbot_plugin_quick_decision.reply_generator import generate_text
+
+        call = lambda cid: {"id": cid, "type": "function",  # noqa: E731
+                            "function": {"name": "web_search", "arguments": "{}"}}
+        history = [
+            {"role": "user", "content": "查下天气"},
+            {"role": "assistant", "content": None, "tool_calls": [call("c1")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "晴"},
+            {"role": "assistant", "content": "我再确认一下", "tool_calls": [call("c2")]},
+            {"role": "tool", "tool_call_id": "c2", "content": "晴，25 度"},
+            {"role": "assistant", "content": "今天晴，25 度"},
+        ]
+        context = SimpleNamespace(
+            conversation_manager=FakeConvMgr(FakeConversation(history=json.dumps(history))),
+            persona_manager=SimpleNamespace(get_persona=AsyncMock(return_value=None)),
+            get_current_chat_provider_id=AsyncMock(return_value="chat"),
+            llm_generate=AsyncMock(return_value=SimpleNamespace(completion_text="出门记得防晒")),
+        )
+        decision = DecisionResult(action="proactive", scene="group_proactive")
+        await generate_text(context, umo="room", decision=decision, user_prompt="")
+        # 请求里不能出现没有 tool 结果的 tool_calls，否则 Anthropic 等接口返回 400。
+        self.assertEqual(context.llm_generate.await_args.kwargs["contexts"], [
+            {"role": "user", "content": "查下天气"},
+            {"role": "assistant", "content": "我再确认一下"},
+            {"role": "assistant", "content": "今天晴，25 度"},
+        ])
+        # 写回官方历史时原样保留工具调用轮次，只追加本轮发言。
+        self.assertEqual(context.conversation_manager.updated[0]["history"],
+                         [*history, {"role": "assistant", "content": "出门记得防晒"}])
+
     async def test_send_guard_strips_reply_inserted_after_decorate_hook(self) -> None:
         event = FakeEvent(is_private=False)
         chain = [SimpleNamespace(text="你好")]

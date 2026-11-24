@@ -325,7 +325,8 @@ async def send_followup_tools(context, umo, resolver, decision, platform_name, *
         return await run_tools(context, umo=umo, resolver=resolver, decision=decision)
 
 
-def _history_as_contexts(history_raw: str | list | None) -> list[dict]:
+def _history_records(history_raw: str | list | None) -> list:
+    """官方会话历史原样解析成列表；写回时以它为底，不能丢掉其中的工具调用轮次。"""
     if not history_raw:
         return []
     if isinstance(history_raw, str):
@@ -335,13 +336,31 @@ def _history_as_contexts(history_raw: str | list | None) -> list[dict]:
             return []
     else:
         records = history_raw
+    return list(records) if isinstance(records, list) else []
+
+
+_TOOL_CALL_KEYS = frozenset({"tool_calls", "function_call"})
+
+
+def _history_as_contexts(history_raw: str | list | None) -> list[dict]:
+    """把官方历史转成自生成请求的 contexts。
+
+    自生成请求不带工具定义，所以工具调用轮次要整体去掉：丢弃 tool 消息的同时，也要去掉
+    assistant 消息上的 tool_calls。只丢 tool 消息会留下没有结果的工具调用，Anthropic 等接口
+    会直接返回 400（missing tool_result for preceding tool_use）。
+    """
     contexts: list[dict] = []
-    for item in records:
+    for item in _history_records(history_raw):
         if not isinstance(item, dict):
             continue
         role = item.get("role")
         if role not in {"system", "user", "assistant"}:
             continue
+        if role == "assistant" and _TOOL_CALL_KEYS & item.keys():
+            item = {k: v for k, v in item.items() if k not in _TOOL_CALL_KEYS}
+            content = item.get("content")
+            if not (content.strip() if isinstance(content, str) else content):
+                continue
         contexts.append(item)
     return contexts
 
@@ -389,9 +408,8 @@ async def generate_text(
         except Exception:  # noqa: BLE001
             conversation = None
     system_prompt = await resolve_persona_prompt(context, umo, conversation)
-    contexts = _history_as_contexts(
-        getattr(conversation, "history", None) if conversation else None
-    )
+    history_raw = getattr(conversation, "history", None) if conversation else None
+    contexts = _history_as_contexts(history_raw)
     prompt = user_prompt.strip() or "请根据当前对话自然地回复。"
     if decision.scene in {"group_proactive", "private_proactive"}:
         prompt = ("本轮由定时任务触发，请结合当前时间、会话上下文和判断提示自然地发言。"
@@ -407,7 +425,9 @@ async def generate_text(
     text = (getattr(response, "completion_text", None) or "").strip()
     if text and curr_cid:
         try:
-            history = list(contexts)
+            # 以原始历史为底追加，保留官方的工具调用轮次；用过滤后的 contexts 写回会把
+            # tool 消息永久删掉，之后官方流水线也会因 tool_calls 缺少结果而报 400。
+            history = _history_records(history_raw)
             if decision.scene in {"group_proactive", "private_proactive"}:
                 history.append({"role": "assistant", "content": text})
             else:
