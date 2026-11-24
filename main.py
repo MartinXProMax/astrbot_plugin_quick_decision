@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import asdict
 from datetime import datetime, timedelta
@@ -106,7 +107,19 @@ class QuickDecisionPlugin(Star, WebApiMixin):
 
     @property
     def settings(self) -> PluginSettings:
-        return PluginSettings(self.config)
+        """当前配置对应的设置。
+
+        配置内容不变时复用同一对象，免去每次读取都重新解析判断图；调用方只读，
+        需要改动时请自行构造 PluginSettings。配置的任何改动（含原地修改嵌套项）都会重新解析。
+        """
+        try:
+            key = json.dumps(self.config, sort_keys=True, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return PluginSettings(self.config)
+        cached = getattr(self, "_settings_cache", None)
+        if cached is None or cached[0] != key:
+            cached = self._settings_cache = (key, PluginSettings(self.config))
+        return cached[1]
 
     async def initialize(self) -> None:
         try:
