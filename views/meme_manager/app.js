@@ -45,6 +45,7 @@ const ACTION_UI = {
   add_context: { icon: "context", group: "chat" },
   quote_message: { icon: "quote", group: "send" },
   send_meme: { icon: "image", group: "send" },
+  voice_tone: { icon: "voice", group: "send", text: "语气", placeholder: "如 开心、温柔；Azure 引擎填 cheerful 等风格名" },
 };
 const WHEN_LABELS = { on_match: "判断后立即发送", after_send: "正文发送后配图" };
 const TOOL_STATUS = {
@@ -67,6 +68,7 @@ const ICONS = {
   context: '<path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><path d="M8 13h8M8 17h5"/>',
   quote: '<path d="M6 7h5v5c0 3-2 5-5 6"/><path d="M14 7h5v5c0 3-2 5-5 6"/>',
   zap: '<path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/>',
+  voice: '<path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/>',
   close: '<path d="M6 6l12 12M18 6 6 18"/>',
 };
 
@@ -1361,6 +1363,13 @@ function actionParams(q, ref, action) {
       choices.push([fromValue, action.from ? `「${qName(action.from)}」（已失效）` : `本题（已失效）`]);
     }
     fields.push(sourceSelect(noun, choices, fromValue, (value) => { action.from = pick(value); refreshEditor(); }));
+  } else if (params.includes("text")) {
+    const ui = ACTION_UI[action.tool] || {};
+    fields.push(h("label", { class: "act-field is-label" }, h("span", null, ui.text || "文本"),
+      h("input", {
+        type: "text", value: action.text ?? "", placeholder: ui.placeholder || "", "aria-label": ui.text || "文本",
+        oninput: (event) => { action.text = event.target.value; recheckAction(event.target, q, ref, action); },
+      })));
   }
   if (params.includes("when") && tool.when?.length) {
     fields.push(segmented("时机", tool.when.map((w) => [w, WHEN_LABELS[w] || w]), action.when,
@@ -1393,6 +1402,8 @@ function actionNotes(q, ref, action) {
     if (all.length > 1) notes.push(`多个引用同时命中时，采用排在最后的「${qName(all[all.length - 1].q)}」`);
   } else if (action.tool === "send_meme") {
     notes.push(action.when === "after_send" ? "正文确认发送后再发，本轮不发言就跳过" : "不等正文，本轮不发言也会发送");
+  } else if (action.tool === "voice_tone") {
+    notes.push("通用 TTS 合成本轮语音时叠加这个语气：MiMo 引擎追加在原有风格后，Azure 引擎替换原有风格，其他引擎忽略");
   }
   if (action.from && !isAncestor(action.from, q)) notes.push(`「${qName(action.from)}」未提问或未命中时跳过这个动作`);
   return notes;
@@ -1950,7 +1961,7 @@ function renderLog(item) {
       main,
       sub,
       item.trigger_text ? h("p", { class: "log-message" }, h("b", null, "触发"), item.trigger_text) : null,
-      item.reply_text ? h("p", { class: "log-message is-reply" }, h("b", null, item.reply_complete === false ? "部分回复" : "回复"), item.reply_text) : null,
+      item.reply_text ? h("p", { class: "log-message is-reply" }, h("b", null, (item.reply_complete === false ? "部分回复" : "回复") + (item.reply_voice ? "（语音）" : "")), item.reply_text) : null,
       item.raw?.skip_reason ? h("p", { class: "log-meta" }, item.raw.skip_reason) : null,
       item.error ? h("p", { class: "log-error" }, item.error) : null,
       item.umo ? h("p", { class: "log-umo", title: item.umo }, sessionLabel(item.umo, item.session_name)) : null,
@@ -2426,7 +2437,7 @@ function renderPluginDefaults(plugin) {
       icon("plus"), missing.length === rows.length ? "加入判断配置" : `加入缺少的 ${missing.length} 道题`);
   }
   return pluginPart("自带默认问题",
-    "与「恢复默认问题」里的同名题相同。加入后到「判断配置」检查并保存；判断配置中已有同 ID 的题不会被覆盖。",
+    "加入后到「判断配置」检查并保存；判断配置中已有同 ID 的题不会被覆盖。",
     h("ol", { class: "plugin-questions" }, rows),
     h("div", { class: "plugin-foot" }, action));
 }
@@ -2452,7 +2463,7 @@ function renderPlugin(plugin) {
     renderPluginDefaults(plugin),
     plugin.tips?.length > 0 && h("details", { class: "tips" },
       h("summary", null, "避免两个插件重复执行"),
-      h("p", { class: "hint" }, `请在${plugin.name}的设置里改：`),
+      h("p", { class: "hint" }, `请按下面调整${plugin.name}或 AstrBot 的设置：`),
       h("ul", { class: "checklist" }, plugin.tips.map((tip) => h("li", null, tip)))));
 }
 

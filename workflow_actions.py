@@ -18,6 +18,7 @@ ACTIONS = {
                       "source": "recent_messages"},
     "send_meme": {"label": "发送表情包", "stages": ["pre_reply", "post_reply"], "parameters": ["from", "when"],
                   "source": "memes", "when": ["on_match", "after_send"]},
+    "voice_tone": {"label": "设定语音语气", "stages": ["pre_reply"], "parameters": ["text"], "required": ["text"]},
 }
 
 
@@ -145,6 +146,8 @@ def validate_actions(q, by_id):
             tool = ACTIONS.get(action["tool"])
             if not tool or q.stage not in tool["stages"] or action.keys() - {"tool", *tool["parameters"]}:
                 return "工具名称、参数或执行阶段无效"
+            if any(name not in action for name in tool.get("required", ())):
+                return f"「{tool['label']}」还没有填写"
             if any(not isinstance(v, str) or not v.strip() for v in action.values()):
                 return "动作参数需要非空文本"
             if "text" in action and "from" in action:

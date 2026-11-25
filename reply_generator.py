@@ -15,6 +15,7 @@ from astrbot.core.agent.message import TextPart
 
 from .decision_tools import meme_chain, run_tools, send_chain, skip_tools
 from .models import DecisionResult
+from .tts_adapter import has_record
 
 try:
     from astrbot.core.platform.astr_message_event import streaming_response_event
@@ -195,15 +196,22 @@ def install_group_quote_guard(event, decision: DecisionResult, *, on_stream_end=
     stream_text = []
 
     async def deliver(payload, streaming, args, kwargs):
+        voice = has_record(payload.chain)
         try:
             receipt = await original(payload, *args, **kwargs)
         except Exception:
-            decision.text_sent = False
+            # 语音发送抛错时通用 TTS 会改发原文，是否送达以之后的回执为准。
+            if not voice:
+                decision.text_sent = False
             raise
         if receipt is False:
             decision.text_sent = False
         else:
             delivered = "".join(c.text for c in payload.chain if isinstance(c, Plain) and c.text)
+            if voice and not delivered.strip():
+                # 通用 TTS 把整段文字换成了一条语音，记录时仍用原文。
+                delivered = event.get_extra("_qd_undecorated_text") or ""
+                decision.voice_sent = True
             if streaming:
                 stream_text.append(delivered)
             elif delivered.strip():
@@ -222,10 +230,14 @@ def install_group_quote_guard(event, decision: DecisionResult, *, on_stream_end=
             if official_generation_failed(event):
                 return await original(message, *args, **kwargs)
         else:
-            if not getattr(result, "is_llm_result", lambda: False)():
+            # 通用 TTS 跳过一条回复时会把它标成普通结果，装饰钩子记下的仍是本轮模型结果。
+            own_result = result is not None and result is event.get_extra("_qd_llm_result")
+            if not own_result and not getattr(result, "is_llm_result", lambda: False)():
                 return await original(message, *args, **kwargs)
             # 官方 derive 复用装饰后的组件。其他插件新建的消息即使同文也独立发送。
-            if not any(c is own for c in chain if not _is_reply_component(c) for own in result.chain):
+            # 语音发送失败时，通用 TTS 改发的是装饰钩子当时的原始组件。
+            own = [*result.chain, *(event.get_extra("_qd_llm_components") or ())]
+            if not any(c is item for c in chain if not _is_reply_component(c) for item in own):
                 return await original(message, *args, **kwargs)
             if result is not last_result:
                 last_result, quoted = result, False
@@ -452,11 +464,16 @@ async def send_decision_message(
     segmenter=None,
     sleeper=None,
     sent_texts: list[str] | None = None,
+    voice=None,
+    voice_fallback: bool = True,
 ) -> bool:
     """按官方分段配置发送文字段，全部成功后再发独立表情。
 
     某一段失败时不重发已成功段，也不把整段原文再发一遍；未成功的剩余文字仍尝试发出
     （与官方 RespondStage 遇错继续后续段一致），但只有全部文字段成功才发表情。
+
+    给了 voice（正文 -> 语音组件或 None）时先尝试把整段正文作为一条语音发出，不分段、不引用；
+    语音送达就不再发文字。语音发送失败时按 voice_fallback 决定是否改发文字。
     """
     if dry_run:
         logger.info("试运行模式：已跳过向会话 %s 发送消息", umo)
@@ -469,6 +486,21 @@ async def send_decision_message(
         segmenter = await OfficialSegmenter.from_context(
             context, umo=umo, sleeper=sleeper
         )
+    record = await voice(text) if voice is not None else None
+    if record is not None:
+        chain = MessageChain()
+        chain.chain.append(record)
+        if await send_chain(context, umo, chain):
+            decision.text_sent = decision.voice_sent = True
+            if sent_texts is not None:
+                sent_texts.append(text)
+            await send_followup_tools(context, umo, resolver, decision, platform_name, segmenter=segmenter)
+            return True
+        if not voice_fallback:
+            decision.text_sent = False
+            skip_tools(decision, "语音未发送", when="after_send")
+            return False
+        logger.warning("语音发送失败，改发文字：%s", umo)
     segments = segmenter.split_text(
         text, is_llm_result=True, platform_name=platform_name
     )

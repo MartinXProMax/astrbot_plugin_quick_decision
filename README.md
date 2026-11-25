@@ -33,6 +33,9 @@
 - **表情包管理器无缝兼容**
   - 对接插件市场中的「表情包管理器」（`anka-afk/astrbot_plugin_meme_manager`），读取其 `semantic_metadata.json` 中的分类和逐图语义描述：默认先选图库分类，再从该分类选择图片。
   - 未安装或缺失依赖时自动降级为纯文字回复并给出提示，不回退旧版自制图库。
+- **通用 TTS 语音回复**
+  - 对接「通用 TTS」（`CyrilPeng/astrbot_plugin_universal_tts`）：回复是否转语音仍由它决定，语音替换文字发出，不会语音、文字各发一遍。
+  - 冷场和定时发言也能转成语音；可选的 `voice_tone` 判断题按语境切换朗读语气（MiMo / Azure 引擎）；语音送达后照常记录回复、补发表情。详见 [`docs/universal-tts.md`](docs/universal-tts.md)。
 - **试运行模式与异常降级保护**
   - **试运行（`dry_run`）**：仅执行决策并写入日志，不向 QQ 实际发送消息，也不放行官方默认回复，适合上线前安全调参。
   - **失败降级（`DecisionError`）**：判断提供商未配置、超时、HTTP 错误或返回异常时，群聊被动/插话及所有主动发言均保持沉默；私聊收到消息时，仅在发言题已经放行、后续判断失败时回退到官方纯文字回复。
@@ -46,14 +49,15 @@
 | **AstrBot 版本** | `>= 4.29.4, < 5` |
 | **支持平台** | `aiocqhttp`（QQ 群聊 / 私聊） |
 | **Python 第三方依赖** | 无（无需安装 `requirements.txt`） |
-| **可选配套插件** | `anka-afk/astrbot_plugin_meme_manager`（表情包管理器，仅需配图时安装） |
+| **可选配套插件** | `anka-afk/astrbot_plugin_meme_manager`（表情包管理器，仅需配图时安装）；`CyrilPeng/astrbot_plugin_universal_tts`（通用 TTS，仅需语音回复时安装） |
 
 > [!WARNING]
 > **兼容性与冲突注意事项**
 >
 > 1. **请勿同时开启 AstrBot 官方「概率主动回复」**，以免与本插件的插话及冷场主动发言策略产生冲突。
 > 2. **搭配「表情包管理器」使用时**：请进入 `anka-afk/astrbot_plugin_meme_manager` 配置，关闭「**启用主动发送表情工具**」，并将「**表情发送概率**」设为 `0`，避免同一轮回复重复发送表情包。
-> 3. 本插件不依赖其他读空气插件；自 `1.2.0` 起已停用旧版自制图库及相关 `/meme` 指令与 `vision_provider_id` 配置。
+> 3. **搭配「通用 TTS」使用时**：在 AstrBot 配置里打开「**启用 TTS**」，但「**TTS 提供商**」留空，并关闭流式输出；否则通用 TTS 合成失败的回复会由内置 TTS 再转一次（开着「同时输出语音和文字」时还会语音、文字各发一遍），流式回复也不会转语音。
+> 4. 本插件不依赖其他读空气插件；自 `1.2.0` 起已停用旧版自制图库及相关 `/meme` 指令与 `vision_provider_id` 配置。
 
 ## 📦 安装与快速上手
 
@@ -119,6 +123,8 @@ cp -a astrbot_plugin_quick_decision /AstrBot/data/plugins/
 | `cooldown_seconds` | `int` | `300` | `0` ~ `3600`（步长 `10`） | 同一会话的决策冷却时间（秒） |
 | `decision_log_include_content` | `bool` | `true` | `true` / `false` | 是否在决策日志中记录触发消息摘要和实际回复前缀 |
 | `external_plugins.meme_manager.enabled` | `bool` | `true` | `true` / `false` | 启用表情包管理器适配；关闭后视同未安装，选表情的问题因没有候选而跳过 |
+| `external_plugins.universal_tts.enabled` | `bool` | `true` | `true` / `false` | 启用通用 TTS 适配；关闭后主动发言只发文字、语音语气不生效，被动回复是否转语音仍由通用 TTS 决定 |
+| `external_plugins.universal_tts.proactive_voice` | `bool` | `true` | `true` / `false` | 冷场和定时发言也按通用 TTS 的规则转成语音 |
 
 决策日志显示触发消息前 120 字、确认送达的正文前 80 字，并保存本轮近期消息快照（每条最多 500 字）。关闭 `decision_log_include_content` 后新日志不再保存这些内容，已有日志按原保留条数淘汰。日志可按会话筛选，优先显示群名或私聊对象名称；没有名称时显示会话编号。停留在日志页时默认每 10 秒刷新，可取消勾选。
 
@@ -225,6 +231,7 @@ astrbot_plugin_quick_decision/
 ├── reply_generator.py       # 主动回复生成器
 ├── external_plugins.py      # 外部插件适配器目录（提供的动作、候选来源与自带默认问题）
 ├── meme_adapter.py          # 表情包管理器（semantic_metadata.json）适配器
+├── tts_adapter.py           # 通用 TTS 适配器（主动发言转语音、朗读语气）
 ├── config_util.py           # 配置解析与默认判断问题定义
 ├── session_store.py         # 会话状态、冷却计数与决策日志存储
 ├── web_api.py               # WebUI 管理后端接口
@@ -236,7 +243,7 @@ astrbot_plugin_quick_decision/
 └── LICENSE                  # MIT 开源协议
 ```
 
-如需深入了解内部架构与扩展机制，可查阅仓库 `docs/` 目录下的技术文档（如 `docs/decision-engine.md`、`docs/decision-extension-design.md`、`docs/decision-tool-execution.md` 等）。
+如需深入了解内部架构与扩展机制，可查阅仓库 `docs/` 目录下的技术文档（如 `docs/decision-engine.md`、`docs/decision-extension-design.md`、`docs/decision-tool-execution.md`、`docs/universal-tts.md` 等）。
 
 ## 📄 开源协议
 

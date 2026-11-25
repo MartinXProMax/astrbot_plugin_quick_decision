@@ -53,6 +53,23 @@ def _meme_details(status: dict[str, Any]) -> list[dict[str, str]]:
     ]
 
 
+def _tts_details(status: dict[str, Any]) -> list[dict[str, str]]:
+    if not status.get("plugin_loaded"):
+        return []
+    core = status.get("core_provider") or ""
+    rows = [
+        {"label": "当前引擎", "value": status.get("engine") or "未配置"},
+        {"label": "合成", "value": "已用 /tts_off 暂停" if status.get("runtime_enabled") is False
+         else f"触发概率 {status.get('probability', 100)}%"},
+        {"label": "AstrBot「启用 TTS」", "value": "已打开" if status.get("astrbot_tts_enabled") else "未打开（通用 TTS 不会合成）"},
+        {"label": "AstrBot 内置 TTS 提供商",
+         "value": f"{core}（通用 TTS 合成失败时会接手）" if core else "未选择"},
+    ]
+    if core and status.get("dual_output"):
+        rows.append({"label": "注意", "value": "内置 TTS 开着「同时输出语音和文字」，由它接手的回复会语音、文字各发一遍"})
+    return rows
+
+
 EXTERNAL_PLUGINS: dict[str, ExternalPlugin] = {
     plugin.id: plugin
     for plugin in (
@@ -67,6 +84,21 @@ EXTERNAL_PLUGINS: dict[str, ExternalPlugin] = {
             default_questions=("use_meme", "meme_category", "meme_id"),
             tips=("关闭「启用主动发送表情工具」", "把「表情发送概率」设为 0"),
             details=_meme_details,
+        ),
+        ExternalPlugin(
+            id="universal_tts",
+            name="通用 TTS",
+            repo="CyrilPeng/astrbot_plugin_universal_tts",
+            summary="回复是否转成语音、用哪个引擎仍由通用 TTS 决定，语音会替换文字发出，不会再发一遍原文。"
+                    "快速决策让冷场和定时发言也走语音，可按判断结果切换朗读语气，并在语音送达后照常记录回复、补发表情。",
+            adapter_attr="tts_adapter",
+            actions=("voice_tone",),
+            default_questions=("voice_tone",),
+            tips=("在 AstrBot 配置里打开「启用 TTS」，但不要选择 TTS 提供商：通用 TTS 以这个开关为准，"
+                  "选了提供商时，它合成失败的回复会由内置 TTS 再转一次",
+                  "保持「发送失败时回退为文字」开启，语音发不出去时改发原文",
+                  "关闭流式输出，流式回复不会转成语音"),
+            details=_tts_details,
         ),
     )
 }

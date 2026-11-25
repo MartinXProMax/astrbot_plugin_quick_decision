@@ -216,6 +216,24 @@
             "default": true
           }
         }
+      },
+      "universal_tts": {
+        "description": "通用 TTS",
+        "type": "object",
+        "items": {
+          "enabled": {
+            "description": "启用通用 TTS 适配",
+            "type": "bool",
+            "hint": "关闭后快速决策不再调用通用 TTS：冷场和定时发言只发文字，语音语气不生效。回复是否转语音仍由通用 TTS 自己决定。",
+            "default": true
+          },
+          "proactive_voice": {
+            "description": "冷场和定时发言也转语音",
+            "type": "bool",
+            "hint": "主动发言不经过 AstrBot 的发送前处理，通用 TTS 碰不到；开启后由快速决策按通用 TTS 的规则转成语音再发。",
+            "default": true
+          }
+        }
       }
     }
   }

@@ -271,6 +271,9 @@ class DecisionResult:
     followup_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
     reply_sources: list[str] = field(default_factory=list)
     context_fields: dict[str, Any] = field(default_factory=dict)
+    # 通用 TTS 合成时叠加的语气；空表示沿用引擎设置。
+    voice_tone: str = ""
+    voice_sent: bool = False
     log_context: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
