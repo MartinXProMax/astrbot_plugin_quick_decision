@@ -275,6 +275,8 @@ class DecisionResult:
     voice_mode: str = ""
     # 通用 TTS 合成时叠加的语气；空表示沿用引擎设置。
     voice_tone: str = ""
+    # 语气由正文生成后的判断给出时，判断结束（无论成败）后置位；合成语音前等它。
+    tone_judged: asyncio.Event | None = field(default=None, repr=False, compare=False)
     voice_sent: bool = False
     log_context: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 

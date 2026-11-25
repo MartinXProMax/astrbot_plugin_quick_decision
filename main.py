@@ -73,6 +73,8 @@ PLUGIN_NAME = "astrbot_plugin_quick_decision"
 LOG_TEXT_LIMIT = 120
 # 同时进行的定时与冷场回合上限；超出的会话保持到期，留到下次检查。
 PROACTIVE_CONCURRENCY = 4
+# 合成语音前最多等多久正文生成后的语气判断；超时就用引擎默认语气。
+VOICE_TONE_WAIT_SECONDS = 15
 
 
 def _log_text(value: str, limit: int = LOG_TEXT_LIMIT) -> str:
@@ -160,6 +162,16 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if adapter is None or not self.settings.plugin_enabled("universal_tts"):
             return None
         return adapter
+
+    async def _await_voice_tone(self, decision: DecisionResult) -> None:
+        """语气在正文生成后判断时，等判断结束再合成；超时用引擎默认语气。"""
+        judged = decision.tone_judged
+        if judged is None or judged.is_set():
+            return
+        try:
+            await asyncio.wait_for(judged.wait(), VOICE_TONE_WAIT_SECONDS)
+        except TimeoutError:
+            logger.warning("等待语气判断超过 %s 秒，本轮按引擎默认语气合成：%s", VOICE_TONE_WAIT_SECONDS, decision.round_id)
 
     def _voice_available(self, scene: str) -> bool:
         """本轮能否转语音；不能时跳过「是否用语音」等用到语音动作的题。"""
@@ -503,6 +515,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         voice = None
         if tts is not None:
             async def voice(body):
+                await self._await_voice_tone(result)
                 return await tts.voice_record(profile.umo, body, tone=result.voice_tone, force=mode == "voice")
 
         sent_texts: list[str] = []
@@ -811,11 +824,22 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         settings = self.settings
         if not settings.enabled or settings.dry_run:
             return
+        if any(action.get("tool") == "voice_tone" for spec in getattr(plan, "specs", ())
+               for actions in (getattr(spec, "actions", None) or {}).values() for action in actions):
+            # 语气要按实际正文判断，合成语音的一方会等这个信号。
+            decision.tone_judged = asyncio.Event()
 
         async def judge_and_log():
             try:
-                report = await evaluate_post_reply(self.context, plan, text, decision.answers, decision=decision)
-                await self.sessions.update_round_log(decision.round_id, post_decision=report)
+                try:
+                    report = await evaluate_post_reply(self.context, plan, text, decision.answers, decision=decision)
+                finally:
+                    if decision.tone_judged is not None:
+                        decision.tone_judged.set()
+                fields = {"post_decision": report}
+                if decision.voice_tone:
+                    fields["voice_tone"] = decision.voice_tone
+                await self.sessions.update_round_log(decision.round_id, **fields)
                 if decision.tool_calls:
                     if self.settings.dry_run or not self.settings.enabled:
                         skip_tools(decision, "试运行或插件停用")
@@ -887,9 +911,13 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             event.set_extra("_qd_llm_result", result)
             event.set_extra("_qd_llm_components", list(result.chain))
             mode = decision.voice_mode
-            # 判断要发语音时不看通用 TTS 的触发概率；只给了语气时仍由它按概率决定。
-            if (mode == "voice" or (not mode and decision.voice_tone)) and (tts := self._tts()) is not None:
-                await tts.voice_event(event, decision.voice_tone, force=mode == "voice")
+            tts = self._tts()
+            if tts is not None and mode != "text":
+                # 语气在正文生成后判断，先等它；只发文字时不用等。
+                await self._await_voice_tone(decision)
+                # 判断要发语音时不看通用 TTS 的触发概率；只给了语气时仍由它按概率决定。
+                if mode == "voice" or decision.voice_tone:
+                    await tts.voice_event(event, decision.voice_tone, force=mode == "voice")
 
     # 晚于通用 TTS（priority=0）执行：它按自己的概率转出的语音或改标的结果类型，按本轮判断改回来。
     @filter.on_decorating_result(priority=-10)

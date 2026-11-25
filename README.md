@@ -34,7 +34,7 @@
   - 对接插件市场中的「表情包管理器」（`anka-afk/astrbot_plugin_meme_manager`），读取其 `semantic_metadata.json` 中的分类和逐图语义描述：默认先选图库分类，再从该分类选择图片。
   - 未安装或缺失依赖时自动降级为纯文字回复并给出提示，不回退旧版自制图库。
 - **通用 TTS 语音回复**
-  - 对接「通用 TTS」（`CyrilPeng/astrbot_plugin_universal_tts`）：默认问题 `use_voice` 每轮判断正文发语音还是文字，不再按它的触发概率；`voice_tone` 按语境切换朗读语气（MiMo / Azure 引擎）。语音替换文字发出，不会语音、文字各发一遍。
+  - 对接「通用 TTS」（`CyrilPeng/astrbot_plugin_universal_tts`）：默认问题 `use_voice` 每轮判断正文发语音还是文字，不再按它的触发概率；`voice_tone` 在正文生成后按实际回复判断朗读语气（MiMo / Azure 引擎）。语音替换文字发出，不会语音、文字各发一遍。
   - 冷场和定时发言也能转成语音；语音送达后照常记录回复、补发表情；没装或停用通用 TTS 时自动跳过语音题。详见 [`docs/universal-tts.md`](docs/universal-tts.md)。
 - **试运行模式与异常降级保护**
   - **试运行（`dry_run`）**：仅执行决策并写入日志，不向 QQ 实际发送消息，也不放行官方默认回复，适合上线前安全调参。

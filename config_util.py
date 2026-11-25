@@ -267,7 +267,7 @@ USE_VOICE_PROMPT = (
     "需要代码、链接、列表、数字细节或较长说明时选否。"
 )
 VOICE_STYLE_HINT = "本轮正文会转成语音发送：请写口语化、适合朗读的句子，不要使用列表、表格、代码、链接或颜文字。"
-VOICE_TONE_PROMPT = "这轮回复转成语音时，用什么语气朗读最贴合回复内容和当前气氛？拿不准时选 plain。"
+VOICE_TONE_PROMPT = "这条回复转成语音时，结合回复内容和当前气氛，用什么语气朗读最贴合？拿不准时选 plain。"
 # (选项, 判断标准, 交给通用 TTS 的语气词)；plain 沿用语音引擎自带的语气。
 VOICE_TONES = (
     ("plain", "平静自然，沿用语音引擎默认的语气", ""),
@@ -282,13 +282,10 @@ VOICE_TONES = (
 def voice_questions() -> list[DecisionQuestion]:
     """是否用语音及朗读语气。由判断决定是否转语音，不看通用 TTS 的触发概率。
 
-    语音不可用（未装通用 TTS、适配停用或暂停）时，用到语音动作的题在运行时跳过，不多问一次。
+    是否用语音在正文生成前判断，以便提示会话模型写适合朗读的句子；语气在正文生成后按实际回复判断，
+    合成语音前会等它出结果。语音不可用（未装通用 TTS、适配停用或暂停）时，用到语音动作的题跳过。
     """
-    tones = {
-        key: [{"tool": "voice_tone", "text": tone}, {"tool": "add_context", "label": "语气", "text": tone}]
-        for key, _, tone in VOICE_TONES
-        if tone
-    }
+    tones = {key: [{"tool": "voice_tone", "text": tone}] for key, _, tone in VOICE_TONES if tone}
     return [
         DecisionQuestion(
             "use_voice",
@@ -309,7 +306,8 @@ def voice_questions() -> list[DecisionQuestion]:
             "choice",
             VOICE_TONE_PROMPT,
             options=[DecisionQuestionOption(key, criteria) for key, criteria, _ in VOICE_TONES],
-            triggers=[{"question": "use_voice", "option": "true", "ask_with_parent": True}],
+            triggers=[{"question": "use_voice", "option": "true"}],
+            stage="post_reply",
             actions=tones,
             default_option="plain",
         ),

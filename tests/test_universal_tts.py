@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import tempfile
 import unittest
@@ -23,7 +24,7 @@ from test_decision_engine import DecisionBooleanAnswer, choice, message
 from astrbot.api.message_components import Plain
 from astrbot_plugin_quick_decision import reply_generator, web_api
 from astrbot_plugin_quick_decision.config_util import PluginSettings, default_graph, load_questions
-from astrbot_plugin_quick_decision.decision_engine import ask_decision, preview_workflow
+from astrbot_plugin_quick_decision.decision_engine import ask_decision, evaluate_post_reply, preview_workflow
 from astrbot_plugin_quick_decision.models import DecisionResult
 from astrbot_plugin_quick_decision.reply_generator import send_decision_message, session_hint_text
 from astrbot_plugin_quick_decision.tts_adapter import (
@@ -385,6 +386,18 @@ class ProactiveVoiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await run(voice_mode="text")).text, "有人在吗")
                 self.assertEqual(self.universal.hook_calls, calls, "只发文字时不调用通用 TTS")
 
+                async def judge_tone(context, plan, text, answers, *, decision):
+                    await asyncio.sleep(0.01)
+                    decision.voice_tone = "温柔"
+                    return {"answers": {"voice_tone": "gentle"}}
+
+                plan = SimpleNamespace(specs=[SimpleNamespace(actions={"gentle": [{"tool": "voice_tone", "text": "温柔"}]})])
+                with patch.object(main, "evaluate_post_reply", side_effect=judge_tone):
+                    record = await run(voice_mode="voice", post_plan=plan)
+                    await asyncio.gather(*plugin._post_tasks)
+                self.assertTrue(is_record(record))
+                self.assertEqual(self.engine.spoken[-1][:2], ("温柔 温柔", "有人在吗"), "等正文生成后的语气判断")
+
                 plugin.config["external_plugins"] = {"universal_tts": {"proactive_voice": False}}
                 self.assertEqual((await run(voice_mode="voice")).text, "有人在吗")
                 plugin.config["external_plugins"] = {"universal_tts": {"enabled": False}}
@@ -490,6 +503,36 @@ class PassiveVoiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("reply_voice", row)
         self.assertEqual(self.engine.spoken, [])
 
+    async def test_voice_waits_for_the_tone_judged_after_the_reply(self):
+        decision = DecisionResult(action="reply", voice_mode="voice")
+        decision.tone_judged = asyncio.Event()
+
+        async def judge_later():
+            await asyncio.sleep(0.01)
+            decision.voice_tone = "开心"
+            decision.tone_judged.set()
+
+        task = asyncio.create_task(judge_later())
+        event, row = await self.round(decision)
+        await task
+        self.assertEqual([style for style, _, _ in self.engine.spoken], ["温柔 开心"])
+        self.assertTrue(is_record(event._sends[0].chain[0]))
+
+    async def test_slow_tone_judgment_falls_back_to_the_engine_tone(self):
+        decision = DecisionResult(action="reply", voice_mode="voice")
+        decision.tone_judged = asyncio.Event()
+        with patch.object(self.main, "VOICE_TONE_WAIT_SECONDS", 0.01):
+            event, _ = await self.round(decision)
+        self.assertEqual([style for style, _, _ in self.engine.spoken], ["温柔"])
+        self.assertTrue(is_record(event._sends[0].chain[0]))
+
+    async def test_text_rounds_do_not_wait_for_the_tone(self):
+        self.universal.config["tts_probability"] = 0
+        decision = DecisionResult(action="reply", voice_mode="text")
+        decision.tone_judged = asyncio.Event()
+        event, _ = await asyncio.wait_for(self.round(decision), 2)
+        self.assertEqual([type(c).__name__ for c in event._sends[0].chain], ["Plain"])
+
     async def test_tone_without_voice_decision_is_used_once(self):
         _, row = await self.round(DecisionResult(action="reply", voice_tone="开心"))
         self.assertEqual([style for style, _, _ in self.engine.spoken], ["温柔 开心"])
@@ -537,17 +580,23 @@ class VoiceQuestionTests(unittest.IsolatedAsyncioTestCase):
         settings = self.settings()
         base = {"action": choice("reply", reply=1), "address_message": DecisionBooleanAnswer(probability=0),
                 "length": choice("short", short=1), "use_meme": DecisionBooleanAnswer(probability=0)}
-        voiced, asked = await self.ask(settings, {**base, "use_voice": DecisionBooleanAnswer(probability=0.9),
-                                                  "voice_tone": choice("happy", happy=0.9)})
+        voiced, asked = await self.ask(settings, {**base, "use_voice": DecisionBooleanAnswer(probability=0.9)})
         self.assertIn("use_voice", asked)
-        self.assertEqual((voiced.voice_mode, voiced.voice_tone), ("voice", "开心"))
-        hints = session_hint_text(voiced)
-        self.assertIn("适合朗读", hints)
-        self.assertIn("开心", hints)
+        self.assertNotIn("voice_tone", asked, "语气在正文生成后才判断")
+        self.assertEqual((voiced.voice_mode, voiced.voice_tone), ("voice", ""))
+        self.assertIn("适合朗读", session_hint_text(voiced))
 
-        texted, _ = await self.ask(settings, {**base, "use_voice": DecisionBooleanAnswer(probability=0.1),
-                                              "voice_tone": choice("happy", happy=0.9)})
+        judge = AsyncMock(return_value={"voice_tone": choice("happy", happy=0.9)})
+        report = await evaluate_post_reply(SimpleNamespace(decision=SimpleNamespace(ask=judge)), voiced.post_plan,
+                                           "今天抽到大奖啦！", voiced.answers, decision=voiced)
+        self.assertNotIn("error", report)
+        self.assertEqual(list(judge.await_args.args[0]), ["voice_tone"])
+        self.assertIn("今天抽到大奖啦！", repr(judge.await_args))
+        self.assertEqual(voiced.voice_tone, "开心")
+
+        texted, _ = await self.ask(settings, {**base, "use_voice": DecisionBooleanAnswer(probability=0.1)})
         self.assertEqual((texted.voice_mode, texted.voice_tone), ("text", ""))
+        self.assertIsNone(texted.post_plan, "只发文字时不问语气")
         self.assertNotIn("适合朗读", session_hint_text(texted) or "")
 
     async def test_voice_questions_are_skipped_without_tts(self):
