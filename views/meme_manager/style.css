@@ -387,8 +387,21 @@ h1 {
   font: inherit;
   font-size: 15px;
   font-weight: 600;
+  white-space: nowrap;
   cursor: pointer;
   border-radius: var(--r-sm) var(--r-sm) 0 0;
+}
+
+/* 四个标签在手机宽度下也排成一行。 */
+@media (max-width: 480px) {
+  .tabs {
+    gap: 0;
+  }
+
+  .tab {
+    padding-inline: 9px;
+    font-size: 14px;
+  }
 }
 
 .tab:hover {
@@ -614,22 +627,7 @@ textarea.is-invalid {
   font-size: 13px;
 }
 
-/* ---------- 表情包管理器状态 ---------- */
-
-.adapter {
-  padding-block: 16px;
-}
-
-.adapter-head {
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
-}
-
-.adapter-text h2 {
-  font-size: 15px;
-  margin-bottom: 2px;
-}
+/* ---------- 外部插件状态 ---------- */
 
 .state-dot {
   flex: none;
@@ -641,16 +639,16 @@ textarea.is-invalid {
   box-shadow: 0 0 0 4px color-mix(in srgb, var(--faint) 18%, transparent);
 }
 
-.adapter[data-state="ok"] .state-dot {
+.plugin[data-state="ok"] .state-dot {
   background: var(--ok);
   box-shadow: 0 0 0 4px var(--ok-soft);
 }
 
-.adapter[data-state="error"] {
+.plugin[data-state="error"] {
   border-color: color-mix(in srgb, var(--danger) 35%, var(--line));
 }
 
-.adapter[data-state="error"] .state-dot {
+.plugin[data-state="error"] .state-dot {
   background: var(--danger);
   box-shadow: 0 0 0 4px var(--danger-soft);
 }
@@ -3369,5 +3367,272 @@ textarea.is-invalid {
 
   .set-row.is-changed::before {
     left: -10px;
+  }
+}
+
+/* ---------- 外部插件 ---------- */
+
+.banner-warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+  border: 1px solid var(--warn-line);
+}
+
+.plugin-notice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+  margin-bottom: 16px;
+}
+
+.plugin-notice span {
+  flex: 1 1 32ch;
+}
+
+.plugin-notice .btn {
+  min-height: 28px;
+  color: inherit;
+}
+
+.plugin {
+  display: grid;
+  gap: 14px;
+}
+
+.plugin-head {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.plugin-title {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.plugin-title h2 {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+
+.plugin[data-state="ok"] .plugin-badge {
+  border-color: color-mix(in srgb, var(--ok) 35%, transparent);
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.plugin[data-state="error"] .plugin-badge {
+  border-color: color-mix(in srgb, var(--danger) 35%, transparent);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.plugin[data-state="off"] .plugin-badge {
+  border-style: dashed;
+}
+
+.plugin-repo {
+  flex: none;
+  max-width: 45%;
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.plugin-summary {
+  max-width: 68ch;
+}
+
+.plugin-details {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 24px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.plugin-details div {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.plugin-details dt {
+  flex: none;
+  color: var(--muted);
+}
+
+.plugin-details dd {
+  margin: 0;
+  min-width: 0;
+}
+
+.plugin-settings {
+  padding: 2px 0;
+  border-block: 1px solid var(--line);
+}
+
+.plugin-settings .set-row:first-child {
+  padding-top: 14px;
+}
+
+.plugin-settings .set-row:last-child {
+  padding-bottom: 14px;
+}
+
+.plugin-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.plugin-part {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--sunken);
+}
+
+.plugin-part h3 {
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.plugin-items,
+.plugin-questions {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.plugin-item {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.plugin-item-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+
+.plugin-item-head .icon {
+  width: 16px;
+  height: 16px;
+  color: var(--send);
+}
+
+.plugin-item-meta,
+.plugin-use {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.plugin-use.is-empty {
+  color: var(--faint);
+}
+
+.plugin-ref {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font: inherit;
+  font-family: var(--font-mono);
+  text-decoration: underline;
+  text-decoration-color: var(--line-strong);
+  text-underline-offset: 3px;
+  cursor: pointer;
+}
+
+.plugin-ref:hover {
+  text-decoration-color: currentColor;
+}
+
+.plugin-ref:focus-visible {
+  outline: none;
+  border-radius: 3px;
+  box-shadow: var(--focus);
+}
+
+.plugin-questions {
+  gap: 6px;
+}
+
+.plugin-q {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}
+
+.plugin-q > .q-tag {
+  justify-self: start;
+}
+
+.plugin-q-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.q-tag.is-ok {
+  border-color: color-mix(in srgb, var(--ok) 35%, transparent);
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.plugin-foot {
+  display: flex;
+  align-items: center;
+  margin-top: 4px;
+}
+
+.plugin .tips {
+  margin: 0;
+}
+
+@media (max-width: 640px) {
+  .plugin-head {
+    flex-wrap: wrap;
+  }
+
+  .plugin-repo {
+    max-width: 100%;
+    margin: 0 0 0 22px;
+  }
+
+  .plugin-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .plugin-q {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .plugin-q-text {
+    order: 1;
+    grid-column: 1 / -1;
+    white-space: normal;
   }
 }

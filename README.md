@@ -37,7 +37,7 @@
   - **试运行（`dry_run`）**：仅执行决策并写入日志，不向 QQ 实际发送消息，也不放行官方默认回复，适合上线前安全调参。
   - **失败降级（`DecisionError`）**：判断提供商未配置、超时、HTTP 错误或返回异常时，群聊被动/插话及所有主动发言均保持沉默；私聊收到消息时，仅在发言题已经放行、后续判断失败时回退到官方纯文字回复。
 - **内置 WebUI 管理与决策日志**
-  - 在插件详情页提供「**判断配置**」（可视化编辑全部问题、用途、单题随机开关、权重、当轮提示与工具绑定，支持 `Ctrl+S` 保存即时生效）、「**决策日志**」（按日期分组，支持按发言 / 沉默 / 失败或降级状态筛选及关键词搜索）与「**插件设置**」（启用、试运行、判断提供商、阈值与温度、节奏、群聊 / 私聊策略和日志保留等其余配置项，校验取值范围，只保存改动的项并立即生效）。
+  - 在插件详情页提供「**判断配置**」（可视化编辑全部问题、用途、单题随机开关、权重、当轮提示与工具绑定，支持 `Ctrl+S` 保存即时生效）、「**决策日志**」（按日期分组，支持按发言 / 沉默 / 失败或降级状态筛选及关键词搜索）、「**外部插件**」（各适配器的对接状态与启用开关、提供的选项动作和候选来源、自带的默认问题，可一键加入判断配置）与「**插件设置**」（启用、试运行、判断提供商、阈值与温度、节奏、群聊 / 私聊策略和日志保留等其余配置项，校验取值范围，只保存改动的项并立即生效）。
 
 ## 📋 环境与依赖要求
 
@@ -101,7 +101,7 @@ cp -a astrbot_plugin_quick_decision /AstrBot/data/plugins/
 
 ## ⚙️ 配置项说明
 
-以下配置项对应 `_conf_schema.json`，均可在 AstrBot WebUI 插件配置页中调整；除已停用的 `vision_provider_id` 外，也可在插件详情页的「判断配置」（`decision_mode`、`decision_custom_context`、`decision_questions`）和「插件设置」（其余各项）中修改：
+以下配置项对应 `_conf_schema.json`，均可在 AstrBot WebUI 插件配置页中调整；除已停用的 `vision_provider_id` 外，也可在插件详情页的「判断配置」（`decision_mode`、`decision_custom_context`、`decision_questions`）、「外部插件」（`external_plugins`）和「插件设置」（其余各项）中修改：
 
 ### 基础与决策控制
 
@@ -118,6 +118,7 @@ cp -a astrbot_plugin_quick_decision /AstrBot/data/plugins/
 | `debounce_seconds` | `float` | `1.5` | `0` ~ `8`（步长 `0.1`） | 决策前合并连续消息的防抖等待秒数 |
 | `cooldown_seconds` | `int` | `300` | `0` ~ `3600`（步长 `10`） | 同一会话的决策冷却时间（秒） |
 | `decision_log_include_content` | `bool` | `true` | `true` / `false` | 是否在决策日志中记录触发消息摘要和实际回复前缀 |
+| `external_plugins.meme_manager.enabled` | `bool` | `true` | `true` / `false` | 启用表情包管理器适配；关闭后视同未安装，选表情的问题因没有候选而跳过 |
 
 决策日志显示触发消息前 120 字、确认送达的正文前 80 字，并保存本轮近期消息快照（每条最多 500 字）。关闭 `decision_log_include_content` 后新日志不再保存这些内容，已有日志按原保留条数淘汰。日志可按会话筛选，优先显示群名或私聊对象名称；没有名称时显示会话编号。停留在日志页时默认每 10 秒刷新，可取消勾选。
 
@@ -222,11 +223,12 @@ astrbot_plugin_quick_decision/
 ├── official_handoff.py      # 官方主 Agent 入站流程接管逻辑
 ├── official_segment.py      # 官方分段回复（segmented_reply）兼容处理
 ├── reply_generator.py       # 主动回复生成器
+├── external_plugins.py      # 外部插件适配器目录（提供的动作、候选来源与自带默认问题）
 ├── meme_adapter.py          # 表情包管理器（semantic_metadata.json）适配器
 ├── config_util.py           # 配置解析与默认判断问题定义
 ├── session_store.py         # 会话状态、冷却计数与决策日志存储
 ├── web_api.py               # WebUI 管理后端接口
-├── views/meme_manager/      # WebUI 前端界面（判断配置与决策日志）
+├── views/meme_manager/      # WebUI 前端界面（判断配置、决策日志、外部插件与插件设置）
 ├── docs/                    # 设计与架构文档（决策引擎、扩展设计、工具执行等）
 ├── tests/                   # 单元测试与官方管线验证脚本
 ├── _conf_schema.json        # AstrBot WebUI 配置 Schema

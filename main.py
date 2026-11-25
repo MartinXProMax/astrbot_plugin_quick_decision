@@ -486,6 +486,9 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                     self.sessions.mark_proactive(profile.umo)
 
     def _meme_candidates(self, settings):
+        # 在「外部插件」中停用后视同表情包管理器不可用，选表情的问题因没有候选而跳过。
+        if not settings.plugin_enabled("meme_manager"):
+            return []
         by_id = {q.id: q for q in settings.decision_questions}
         if any(q.enabled and (candidate_type(q, by_id) in ("memes", "meme_categories")
                               or q.requires_candidates in ("memes", "meme_categories") or q.role == "meme")
@@ -940,7 +943,9 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             "决策模式：" + ("纯随机" if settings.decision_mode == "random" else "模型判断"),
             "表情包来源："
             + (
-                f"meme_manager {status.plugin_version or ''}，{status.candidate_count} 张可用"
+                "已在快速决策中停用，仅发文字"
+                if not settings.plugin_enabled("meme_manager")
+                else f"meme_manager {status.plugin_version or ''}，{status.candidate_count} 张可用"
                 if (status := self.meme_adapter.status()).available
                 else (status.message or "不可用，仅发文字")
             ),

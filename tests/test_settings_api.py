@@ -57,7 +57,10 @@ class SettingsApiTests(unittest.IsolatedAsyncioTestCase):
 
     def test_every_schema_option_is_on_the_settings_page_or_edited_elsewhere(self):
         shown = set(web_api.setting_fields())
-        self.assertEqual(shown, set(schema_keys()) - ELSEWHERE)
+        # 外部插件适配的开关在「外部插件」页编辑，见 test_external_plugins。
+        plugin_keys = {key for key in schema_keys() if key.startswith("external_plugins.")}
+        self.assertTrue(plugin_keys)
+        self.assertEqual(shown, set(schema_keys()) - ELSEWHERE - plugin_keys)
         self.assertFalse(shown & ELSEWHERE)
 
     async def test_get_returns_schema_fields_and_effective_values(self):

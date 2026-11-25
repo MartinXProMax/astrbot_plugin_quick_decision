@@ -5,12 +5,14 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Mapping
 from copy import deepcopy
 from graphlib import CycleError, TopologicalSorter
 from typing import Any
 
 from .candidate_sources import migrate_candidate_sources, source_question
 from .decision_tools import TOOLS
+from .external_plugins import EXTERNAL_PLUGINS
 from .models import (
     QUESTION_ROLES,
     DecisionQuestion,
@@ -801,6 +803,18 @@ class PluginSettings:
                 pass
         self.workflow_version = graph.get("version") if isinstance(graph, dict) else None
         self.decision_questions, self.decision_questions_warning = load_questions(graph)
+        plugins = data.get("external_plugins")
+        plugins = plugins if isinstance(plugins, Mapping) else {}
+        self.disabled_plugins = frozenset(
+            plugin_id
+            for plugin_id in EXTERNAL_PLUGINS
+            if isinstance(plugins.get(plugin_id), Mapping)
+            and not _as_bool(plugins[plugin_id].get("enabled"), True)
+        )
+
+    def plugin_enabled(self, plugin_id: str) -> bool:
+        """外部插件适配器是否在快速决策中启用；未写配置时默认启用。"""
+        return plugin_id not in self.disabled_plugins
 
     def silence_seconds(self, is_private: bool) -> int:
         return (

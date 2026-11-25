@@ -32,28 +32,13 @@
       <nav class="tabs" role="tablist" aria-label="插件页面分段">
         <button id="tab-btn-decision" type="button" role="tab" class="tab active" data-tab="decision" aria-selected="true" aria-controls="panel-decision">判断配置</button>
         <button id="tab-btn-logs" type="button" role="tab" class="tab" data-tab="logs" aria-selected="false" aria-controls="panel-logs" tabindex="-1">决策日志</button>
+        <button id="tab-btn-plugins" type="button" role="tab" class="tab" data-tab="plugins" aria-selected="false" aria-controls="panel-plugins" tabindex="-1">外部插件</button>
         <button id="tab-btn-settings" type="button" role="tab" class="tab" data-tab="settings" aria-selected="false" aria-controls="panel-settings" tabindex="-1">插件设置</button>
       </nav>
 
       <main>
         <div id="panel-decision" role="tabpanel" aria-labelledby="tab-btn-decision">
-          <section id="adapter" class="block adapter" data-state="loading" aria-live="polite">
-            <div class="adapter-head">
-              <span class="state-dot" aria-hidden="true"></span>
-              <div class="adapter-text">
-                <h2 id="adapter-title">正在检查表情包管理器…</h2>
-                <p id="adapter-msg" class="hint"></p>
-              </div>
-            </div>
-            <details id="adapter-tips" class="tips" hidden>
-              <summary>避免两个插件各发一张图</summary>
-              <p class="hint">图库和逐图描述在「表情包管理器」页面里管理，这里只按描述选图。请在表情包管理器的设置里改两处：</p>
-              <ul class="checklist">
-                <li>关闭「启用主动发送表情工具」</li>
-                <li>把「表情发送概率」设为 0</li>
-              </ul>
-            </details>
-          </section>
+          <div id="plugin-notice" class="banner banner-warn plugin-notice" role="status" hidden></div>
 
           <section class="block">
             <div class="block-head">
@@ -199,9 +184,25 @@
           </section>
         </div>
 
+        <div id="panel-plugins" role="tabpanel" aria-labelledby="tab-btn-plugins" hidden>
+          <p class="hint panel-intro">
+            快速决策通过适配器读取其他插件的数据、调用它们的功能。每个适配器向判断配置提供候选来源和选项动作，并自带一组默认问题。开关与 AstrBot 插件配置页中的同名设置相同，保存后立即生效。
+          </p>
+          <fieldset id="plugins-form" class="settings-form" aria-label="外部插件">
+            <div id="plugins-list"><p class="hint">正在读取外部插件…</p></div>
+          </fieldset>
+          <div id="plugins-savebar" class="savebar" data-state="clean">
+            <p id="plugins-msg" class="savebar-msg" role="status">与插件配置一致</p>
+            <div class="savebar-actions">
+              <button id="plugins-discard" type="button" class="btn btn-ghost" hidden>撤销更改</button>
+              <button id="plugins-save" type="button" class="btn btn-primary" title="Ctrl + S" disabled>保存外部插件设置</button>
+            </div>
+          </div>
+        </div>
+
         <div id="panel-settings" role="tabpanel" aria-labelledby="tab-btn-settings" hidden>
           <p class="hint panel-intro">
-            与 AstrBot 插件配置页中的同名设置相同，保存后立即生效。默认决策模式、判断模型的背景信息和问题在「判断配置」中编辑。
+            与 AstrBot 插件配置页中的同名设置相同，保存后立即生效。默认决策模式、判断模型的背景信息和问题在「判断配置」中编辑，外部插件的开关在「外部插件」中修改。
           </p>
           <fieldset id="settings-form" class="settings-form" aria-label="插件设置">
             <div id="settings-sections"><p class="hint">正在读取插件设置…</p></div>

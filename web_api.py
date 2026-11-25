@@ -8,6 +8,7 @@ import json
 import math
 import time
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import fields
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from .config_util import (
 )
 from .decision_engine import ask_decision, evaluate_post_reply, preview_workflow
 from .decision_tools import TOOLS
+from .external_plugins import EXTERNAL_PLUGINS
 from .models import QUESTION_ROLES, BufferedMessage
 from .workflow_actions import ACTIONS, SOURCES, WORKFLOW_EVENTS, migrate_actions
 
@@ -79,25 +81,28 @@ def _schema_item(key: str) -> dict:
     return node[name]
 
 
+def _setting_field(key: str, item: dict, *, path: str | None = None) -> dict:
+    """把 schema 中的一项整理成页面表单字段；path 是配置中的完整键，用来查单位和选项文案。"""
+    path = path or key
+    field = {"key": key, "type": item["type"], "label": item.get("description", key),
+             "hint": item.get("hint", ""), "default": item.get("default")}
+    if "options" in item:
+        labels = SETTING_OPTION_LABELS.get(path, {})
+        field["options"] = [{"value": value, "label": labels.get(value, value)} for value in item["options"]]
+    if "slider" in item:
+        field.update({name: item["slider"][name] for name in ("min", "max", "step") if name in item["slider"]})
+    if path in SETTING_UNITS:
+        field["unit"] = SETTING_UNITS[path]
+    if field["type"] == "string" and "options" not in field:
+        field["max_length"] = SETTING_TEXT_LIMIT
+    return field
+
+
 @functools.cache
 def setting_sections() -> tuple[dict, ...]:
     sections = []
     for section_id, title, hint, keys in SETTING_SECTIONS:
-        items = []
-        for key in keys:
-            item = _schema_item(key)
-            field = {"key": key, "type": item["type"], "label": item.get("description", key),
-                     "hint": item.get("hint", ""), "default": item.get("default")}
-            if "options" in item:
-                labels = SETTING_OPTION_LABELS.get(key, {})
-                field["options"] = [{"value": value, "label": labels.get(value, value)} for value in item["options"]]
-            if "slider" in item:
-                field.update({name: item["slider"][name] for name in ("min", "max", "step") if name in item["slider"]})
-            if key in SETTING_UNITS:
-                field["unit"] = SETTING_UNITS[key]
-            if field["type"] == "string" and "options" not in field:
-                field["max_length"] = SETTING_TEXT_LIMIT
-            items.append(field)
+        items = [_setting_field(key, _schema_item(key)) for key in keys]
         if hint is None:
             hint = _schema()[section_id].get("hint", "")
         sections.append({"id": section_id, "title": title, "hint": hint, "fields": items})
@@ -106,6 +111,21 @@ def setting_sections() -> tuple[dict, ...]:
 
 def setting_fields() -> dict[str, dict]:
     return {field["key"]: field for section in setting_sections() for field in section["fields"]}
+
+
+@functools.cache
+def plugin_fields(plugin_id: str) -> tuple[dict, ...]:
+    """外部插件适配器的设置项，来自 _conf_schema.json 的 external_plugins.<id>。"""
+    items = _schema()["external_plugins"]["items"].get(plugin_id, {}).get("items", {})
+    return tuple(
+        _setting_field(key, item, path=f"external_plugins.{plugin_id}.{key}") for key, item in items.items()
+    )
+
+
+def v8_default_questions() -> list[dict]:
+    """判断配置页「恢复默认问题」使用的完整默认问题，已转换为选项动作格式。"""
+    questions, _ = migrate_actions(default_questions())
+    return [q.to_dict() for q in questions]
 
 
 def validate_setting(field: dict, value):
@@ -159,6 +179,8 @@ class WebApiMixin:
                 "读取或保存判断配置",
             ),
             (f"/{PLUGIN_NAME}/settings", self.web_settings, ["GET", "POST"], "读取或保存插件设置"),
+            (f"/{PLUGIN_NAME}/external-plugins", self.web_external_plugins, ["GET", "POST"],
+             "读取外部插件适配状态或保存适配设置"),
         ]
         for route, handler, methods, desc in routes:
             self.context.register_web_api(route, handler, methods, desc)
@@ -198,7 +220,8 @@ class WebApiMixin:
     async def web_status(self):
         settings = self.settings
         adapter_status = self.meme_adapter.status().to_dict()
-        recent = [item for item in self.sessions.recent_logs(limit=settings.decision_log_limit)
+        adapter_status["enabled"] = settings.plugin_enabled("meme_manager")
+        recent =[item for item in self.sessions.recent_logs(limit=settings.decision_log_limit)
                   if item.get("error") or item.get("batches") or (item.get("post_decision") or {}).get("batches")][:50]
         failures = sum(bool(item.get("error") or item.get("degraded")
                             or (item.get("post_decision") or {}).get("error")) for item in recent)
@@ -534,3 +557,111 @@ class WebApiMixin:
             sessions.log_limit = values["decision_log_limit"]
         logger.info("已更新插件设置：%s", "、".join(values))
         return json_response(self._settings_payload())
+
+    # ---------- 外部插件 ----------
+
+    def _stored_plugin_options(self) -> dict:
+        stored = (getattr(self, "config", None) or {}).get("external_plugins")
+        return stored if isinstance(stored, Mapping) else {}
+
+    def _plugin_values(self, plugin_id: str) -> dict:
+        """各设置项实际生效的值；配置里写坏的项按默认值显示，与 PluginSettings 的读取一致。"""
+        settings = self.settings
+        stored = self._stored_plugin_options().get(plugin_id)
+        stored = stored if isinstance(stored, Mapping) else {}
+        values = {}
+        for field in plugin_fields(plugin_id):
+            if field["key"] == "enabled":
+                values["enabled"] = settings.plugin_enabled(plugin_id)
+                continue
+            value, error = validate_setting(field, stored.get(field["key"], field["default"]))
+            values[field["key"]] = field["default"] if error else value
+        return values
+
+    def _plugin_status(self, plugin) -> dict:
+        adapter = getattr(self, plugin.adapter_attr, None)
+        if adapter is None:
+            return {"available": False, "plugin_loaded": False, "plugin_version": None, "message": "适配器没有加载"}
+        try:
+            status = adapter.status()
+        except Exception:  # noqa: BLE001
+            logger.exception("读取外部插件 %s 的状态失败", plugin.id)
+            return {"available": False, "plugin_loaded": False, "plugin_version": None, "message": "读取状态失败，请稍后刷新"}
+        return status.to_dict() if hasattr(status, "to_dict") else dict(vars(status))
+
+    def _external_plugins_payload(self) -> dict:
+        defaults = {q["id"]: q for q in v8_default_questions()}
+        plugins = []
+        for plugin in EXTERNAL_PLUGINS.values():
+            status = self._plugin_status(plugin)
+            actions = []
+            for name in plugin.actions:
+                action = {"id": name, **deepcopy(ACTIONS[name])}
+                if action.get("source"):
+                    action["source_label"] = CATALOGS.get(action["source"], {}).get("label", action["source"])
+                actions.append(action)
+            catalogs = []
+            for name in plugin.catalogs:
+                catalog = {"id": name, **deepcopy(CATALOGS[name])}
+                if catalog.get("children"):
+                    catalog["children_label"] = CATALOGS.get(catalog["children"], {}).get("label", catalog["children"])
+                catalogs.append(catalog)
+            plugins.append({
+                "id": plugin.id,
+                "name": plugin.name,
+                "repo": plugin.repo,
+                "summary": plugin.summary,
+                "status": {key: status.get(key) for key in ("available", "plugin_loaded", "plugin_version", "message")},
+                "details": plugin.details(status) if plugin.details else [],
+                "fields": list(plugin_fields(plugin.id)),
+                "values": self._plugin_values(plugin.id),
+                "actions": actions,
+                "catalogs": catalogs,
+                "default_questions": [deepcopy(defaults[qid]) for qid in plugin.default_questions if qid in defaults],
+                "tips": list(plugin.tips),
+            })
+        return {"plugins": plugins}
+
+    async def web_external_plugins(self):
+        if request.method == "GET":
+            return json_response(self._external_plugins_payload())
+
+        payload = await request.json(default={})
+        edited = payload.get("changes") if isinstance(payload, dict) else None
+        if not isinstance(edited, dict):
+            return error_response("请求体需要包含 changes 对象", status_code=400)
+        values = {}
+        for plugin_id, options in edited.items():
+            plugin = EXTERNAL_PLUGINS.get(plugin_id)
+            if plugin is None:
+                return error_response(f"未知的外部插件：{plugin_id}", status_code=400)
+            if not isinstance(options, dict):
+                return error_response(f"「{plugin.name}」的设置需要是对象", status_code=400)
+            known = {field["key"]: field for field in plugin_fields(plugin_id)}
+            for key, value in options.items():
+                field = known.get(key)
+                if field is None:
+                    return error_response(f"「{plugin.name}」没有设置项：{key}", status_code=400)
+                normalized, error = validate_setting(field, value)
+                if error:
+                    return error_response(error, status_code=400)
+                values.setdefault(plugin_id, {})[key] = normalized
+        if not values:
+            return json_response(self._external_plugins_payload())
+        config = self._writable_config()
+        if config is None:
+            return error_response("当前环境无法写入官方插件配置", status_code=500)
+        async with self._config_lock():
+            # 整体换成新字典并保留未改动的项；保存失败时 _write_config 恢复原字典。
+            merged = {key: dict(value) if isinstance(value, Mapping) else value
+                      for key, value in self._stored_plugin_options().items()}
+            for plugin_id, options in values.items():
+                current = merged.get(plugin_id)
+                merged[plugin_id] = {**(current if isinstance(current, Mapping) else {}), **options}
+            try:
+                await self._write_config(config, {"external_plugins": merged})
+            except Exception:
+                logger.exception("外部插件设置保存失败")
+                return error_response("保存设置失败，请重试", status_code=500)
+        logger.info("已更新外部插件设置：%s", "、".join(EXTERNAL_PLUGINS[key].name for key in values))
+        return json_response(self._external_plugins_payload())

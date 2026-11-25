@@ -3,7 +3,8 @@ import test from "node:test";
 import {
   candidateSourceChoices, candidateSourceIssue, candidateType, configureCandidateCatalogs, previewCandidateItems,
   actionAvailability, changeSource, changeStage, changeType, deleteOption, deleteQuestion, findSlot,
-  normalizeQuestions, possibleScenes, questionIssues, questionsForScene, replySources, roots, runChange, serializeQuestion,
+  normalizeQuestions, pluginQuestions, possibleScenes, questionIssues, questionsForScene, questionsToAdd, replySources, roots,
+  runChange, serializeQuestion,
   sourceChoices, templateQuestion, validate, wouldCycle,
 } from "../views/meme_manager/workflow-model.mjs";
 
@@ -326,4 +327,55 @@ test("非图库的下级候选复用同一来源、类型与删除规则", () =>
   assert.deepEqual(candidateSourceChoices(questions, questions[1]), [questions[0]]);
   assert.equal(validate(questions, CATALOG), null);
   assert.equal(actionAvailability(questions, CATALOG, questions[1], questions[1].options[1], "send_meme"), "需要一道从图库表情中选择的题");
+});
+
+test("外部插件的默认问题按 ID 接到已有题上，跳过同名题并丢掉找不到的引用", () => {
+  const existing = normalizeQuestions([
+    base("action", { ...options("none", "reply"), triggers: [{ event: "message_received" }] }),
+    base("meme_category", { ...options("none", "*"), candidate_source: "meme_categories" }),
+  ]);
+  const defaults = [
+    base("use_meme", {
+      ...yesNo,
+      triggers: [{ question: "action", option: "reply", ask_with_parent: true }, { question: "idle_action", option: "proactive" }],
+      actions: { true: [{ tool: "send_meme", from: "meme_id", when: "after_send" }] },
+    }),
+    base("meme_category", { ...options("none", "*"), candidate_source: "meme_categories" }),
+    base("meme_id", { ...options("none", "*"), candidate_source: { question: "meme_category" }, triggers: [{ question: "meme_category", option: "*" }] }),
+  ];
+  const added = questionsToAdd(existing, defaults);
+  assert.deepEqual(added.map((q) => q.id), ["use_meme", "meme_id"]);
+  const [useMeme, memeId] = added;
+  // 指向已有题的触发条件和候选来源直接引用已有对象，找不到的 idle_action 被丢掉。
+  assert.equal(useMeme.triggers.length, 1);
+  assert.equal(useMeme.triggers[0].parent, existing[0]);
+  assert.equal(useMeme.triggers[0].option, findSlot(existing[0], "reply"));
+  assert.equal(useMeme.sides.true.actions[0].from, memeId);
+  assert.equal(memeId.candidate_from, existing[1]);
+  assert.equal(memeId.triggers[0].parent, existing[1]);
+  assert.equal(candidateType(memeId), "memes");
+  // 原始默认问题不被改动，同一批默认问题可以重复使用。
+  assert.equal(defaults[0].triggers.length, 2);
+  assert.deepEqual(questionsToAdd([...existing, ...added], defaults), []);
+  const questions = [...existing, ...added];
+  assert.equal(validate(questions, CATALOG), null);
+  assert.deepEqual(serializeQuestion(useMeme).triggers, [{ question: "action", option: "reply", ask_with_parent: true }]);
+});
+
+test("没有触发来源的默认问题进入待连接", () => {
+  const [lonely] = questionsToAdd([], [base("use_meme", { ...yesNo, triggers: [{ question: "action", option: "reply" }] })]);
+  assert.equal(lonely.triggers.length, 0);
+});
+
+test("按动作和候选来源找出用到外部插件的题", () => {
+  const plugin = { actions: [{ id: "send_meme" }], catalogs: [{ id: "meme_categories" }, { id: "memes" }] };
+  const questions = normalizeQuestions([
+    base("action", { ...options("none", "reply"), triggers: [{ event: "message_received" }], actions: { reply: [{ tool: "request_reply" }] } }),
+    base("use_meme", { ...yesNo, actions: { true: [{ tool: "send_meme", from: "meme_id" }] } }),
+    base("meme_category", { ...options("none", "*"), candidate_source: "meme_categories" }),
+    base("meme_id", { ...options("none", "*"), candidate_source: { question: "meme_category" } }),
+    base("pick", { ...options("*", "skip"), candidate_source: "recent_messages", requires_candidates: "recent_messages" }),
+  ]);
+  assert.deepEqual(pluginQuestions(questions, plugin).map((q) => q.id), ["use_meme", "meme_category", "meme_id"]);
+  assert.deepEqual(pluginQuestions(questions, { actions: [], catalogs: [] }), []);
 });

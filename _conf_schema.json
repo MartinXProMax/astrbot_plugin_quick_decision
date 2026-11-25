@@ -199,5 +199,24 @@
     "type": "bool",
     "hint": "开启后记录触发消息前120字、实际回复前80字，并保存本轮近期消息快照（每条最多500字）供日志重放。关闭后新日志不保存这些内容，旧记录仍保留。",
     "default": true
+  },
+  "external_plugins": {
+    "description": "外部插件适配",
+    "type": "object",
+    "hint": "也可以在快速决策页面的「外部插件」中查看对接状态和各适配器提供的动作。",
+    "items": {
+      "meme_manager": {
+        "description": "表情包管理器",
+        "type": "object",
+        "items": {
+          "enabled": {
+            "description": "启用表情包管理器适配",
+            "type": "bool",
+            "hint": "关闭后视同未安装表情包管理器：不再读取图库，选表情的问题因没有候选而跳过，机器人只发文字。",
+            "default": true
+          }
+        }
+      }
+    }
   }
 }

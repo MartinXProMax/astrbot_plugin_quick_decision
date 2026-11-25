@@ -747,6 +747,7 @@ function renderQuestions(focus) {
   state.fresh = null;
   renderFlow();
   renderStats();
+  renderPluginNotice();
   refreshChangeMarks();
   if (NEEDS_AUTOSIZE) root.querySelectorAll("textarea.autosize").forEach(autosize);
   // 重建卡片、恢复文本框高度期间页面可能短暂变矮，浏览器会截短滚动位置。
@@ -1654,12 +1655,13 @@ function renderStatusChips(status) {
       h("span", { class: "chip is-dry", title: "只记录决策，不向 QQ 发送消息" }, "试运行中"),
     );
   }
+  const memeOff = adapter.enabled === false;
   chips.push(
     h(
       "span",
-      { class: "chip is-plain" },
+      { class: "chip is-plain", title: memeOff ? "已在「外部插件」中停用表情包管理器适配" : undefined },
       icon("image"),
-      adapter.available ? `${count} 张表情可用` : "只发文字",
+      memeOff ? "表情适配已停用" : adapter.available ? `${count} 张表情可用` : "只发文字",
     ),
   );
   const provider = status.decision_provider || {};
@@ -1695,60 +1697,14 @@ function renderHealth(status) {
   }
 }
 
-function renderAdapter(adapter) {
-  const section = $("adapter");
-  const count = adapter.candidate_count ?? 0;
-  const packs = Array.isArray(adapter.packs) ? adapter.packs : [];
-  const msg = $("adapter-msg");
-  msg.replaceChildren();
-  if (!adapter.available) {
-    section.dataset.state = "error";
-    $("adapter-title").textContent = "没有对接到表情包管理器，机器人只会发文字";
-    msg.append(
-      adapter.message ? `${adapter.message} ` : "",
-      "在插件市场安装并启用「表情包管理器」（",
-      h("code", null, "anka-afk/astrbot_plugin_meme_manager"),
-      "）后点刷新。",
-    );
-    $("adapter-tips").hidden = true;
-    return;
-  }
-  section.dataset.state = "ok";
-  const version = adapter.plugin_version ? `（${adapter.plugin_version}）` : "";
-  $("adapter-title").textContent = `已对接表情包管理器${version}`;
-  if (count) {
-    msg.append(`${packs.length || adapter.pack_count || 0} 个图包，共 ${count} 张带描述的表情供判断模型挑选。`);
-  } else {
-    msg.append("已对接，但还没有可用的表情。请在表情包管理器中添加图片并填写描述。");
-  }
-  if (packs.length) {
-    msg.append(
-      h("br"),
-      "图包：",
-      ...packs.flatMap((pack, index) => [
-        index ? "、" : "",
-        pack.name || pack.id,
-        pack.enabled === false ? "（已停用）" : "",
-        pack.present === false ? "（文件缺失）" : "",
-      ]),
-    );
-  }
-  $("adapter-tips").hidden = false;
-}
-
 async function loadStatus() {
   try {
     const status = await bridge.apiGet("status");
     renderStatusChips(status);
     renderHealth(status);
-    renderAdapter(status.meme_adapter || {});
   } catch (error) {
-    $("status-chips").replaceChildren(h("span", { class: "chip is-off" }, "状态读取失败"));
+    $("status-chips").replaceChildren(h("span", { class: "chip is-off", title: error.message }, "状态读取失败"));
     $("health-banner").hidden = true;
-    $("adapter").dataset.state = "error";
-    $("adapter-title").textContent = "读取插件状态失败";
-    $("adapter-msg").textContent = `${error.message}。可以稍后点刷新重试。`;
-    $("adapter-tips").hidden = true;
   }
 }
 
@@ -2144,35 +2100,40 @@ function setSettingsSaveState(kind, text) {
   $("settings-save").disabled = kind === "saving" || !settingsState.loaded;
 }
 
+function markSettingRow(row, changed, error) {
+  row.classList.toggle("is-changed", changed);
+  row.classList.toggle("has-error", !!error);
+  const note = row.querySelector(".set-error");
+  note.hidden = !error;
+  note.textContent = error;
+}
+
 // 标出改过和无效的项，并刷新保存栏。只改类名和文字，不重建输入框。
 function updateSettingsDirty() {
   if (settingsState.saving) return;
   const changes = settingChanges();
   for (const field of settingsState.fields) {
     const row = $("settings-sections").querySelector(`.set-row[data-key="${field.key}"]`);
-    if (!row) continue;
-    const error = sm.fieldError(field, settingsState.values[field.key]);
-    row.classList.toggle("is-changed", Object.hasOwn(changes, field.key));
-    row.classList.toggle("has-error", !!error);
-    const note = row.querySelector(".set-error");
-    note.hidden = !error;
-    note.textContent = error;
+    if (row) markSettingRow(row, Object.hasOwn(changes, field.key), sm.fieldError(field, settingsState.values[field.key]));
   }
   if (Object.keys(changes).length) setSettingsSaveState("dirty", sm.describeChanges(settingsState.fields, changes));
   else if (["dirty", "error"].includes($("settings-savebar").dataset.state)) setSettingsSaveState("clean");
 }
 
-function settingId(field) {
-  return `set-${field.key.replace(/\W/g, "-")}`;
+// 一行设置读写哪份状态：「插件设置」页和「外部插件」页各自提供。
+function settingBinding(field) {
+  return {
+    id: `set-${field.key.replace(/\W/g, "-")}`,
+    key: field.key,
+    value: settingsState.values[field.key],
+    set: (next) => {
+      settingsState.values[field.key] = next;
+      updateSettingsDirty();
+    },
+  };
 }
 
-function settingControl(field) {
-  const id = settingId(field);
-  const value = settingsState.values[field.key];
-  const set = (next) => {
-    settingsState.values[field.key] = next;
-    updateSettingsDirty();
-  };
+function settingControl(field, { id, value, set }) {
   if (field.type === "bool") {
     const text = h("span", null, value ? "开启" : "关闭");
     return h("label", { class: "switch" },
@@ -2237,19 +2198,19 @@ function settingControl(field) {
   });
 }
 
-function renderSettingRow(field) {
-  const id = settingId(field);
+function renderSettingRow(field, binding) {
+  const { id } = binding;
   // 分段按钮没有单一的输入框可关联，标题改用 aria-labelledby 指向它。
   const label = field.options
     ? h("span", { class: "set-label", id: `${id}-label` }, field.label)
     : h("label", { class: "set-label", id: `${id}-label`, for: id }, field.label);
   label.append(h("span", { class: "q-change set-change" }, "已修改"));
-  return h("div", { class: "set-row", dataset: { key: field.key, type: field.type } },
+  return h("div", { class: "set-row", dataset: { key: binding.key, type: field.type } },
     h("div", { class: "set-text" },
       label,
       field.hint && h("p", { class: "set-hint" }, field.hint),
       h("p", { class: "set-error", hidden: true })),
-    h("div", { class: "set-control" }, settingControl(field)));
+    h("div", { class: "set-control" }, settingControl(field, binding)));
 }
 
 function renderSettings() {
@@ -2257,7 +2218,7 @@ function renderSettings() {
     h("section", { class: "block", dataset: { section: section.id } },
       h("div", { class: "block-head" }, h("h2", null, section.title)),
       section.hint && h("p", { class: "hint" }, section.hint),
-      h("div", { class: "set-list" }, section.fields.map(renderSettingRow)))));
+      h("div", { class: "set-list" }, section.fields.map((field) => renderSettingRow(field, settingBinding(field)))))));
   updateSettingsDirty();
 }
 
@@ -2325,9 +2286,295 @@ function onDiscardSettings() {
   setSettingsSaveState("clean");
 }
 
+// ---------- 外部插件 ----------
+
+// values 和 saved 按适配器 ID 分组，组内是该适配器的设置项。
+const pluginState = { plugins: [], values: {}, saved: {}, loaded: false, saving: false };
+
+// 各适配器的设置项展开成带前缀的一维列表，沿用插件设置页的改动对比和校验。
+function pluginFields() {
+  return pluginState.plugins.flatMap((plugin) => plugin.fields.map((field) => ({ ...field, key: `${plugin.id}.${field.key}`, plugin, name: field.key })));
+}
+
+function flatPluginValues(groups) {
+  return Object.fromEntries(pluginFields().map((field) => [field.key, groups[field.plugin.id]?.[field.name]]));
+}
+
+function pluginChanges() {
+  return sm.changedValues(pluginFields(), flatPluginValues(pluginState.values), flatPluginValues(pluginState.saved));
+}
+
+function pluginsDirty() {
+  return pluginState.loaded && Object.keys(pluginChanges()).length > 0;
+}
+
+function setPluginsSaveState(kind, text) {
+  $("plugins-savebar").dataset.state = kind;
+  $("plugins-msg").textContent = text || SETTINGS_MESSAGES[kind] || "";
+  $("plugins-discard").hidden = kind === "saving" || !pluginsDirty();
+  $("plugins-save").disabled = kind === "saving" || !pluginState.loaded;
+}
+
+function updatePluginsDirty() {
+  if (pluginState.saving) return;
+  const fields = pluginFields();
+  const values = flatPluginValues(pluginState.values);
+  const changes = pluginChanges();
+  for (const field of fields) {
+    const row = $("plugins-list").querySelector(`.set-row[data-key="${field.key}"]`);
+    if (row) markSettingRow(row, Object.hasOwn(changes, field.key), sm.fieldError(field, values[field.key]));
+  }
+  if (Object.keys(changes).length) setPluginsSaveState("dirty", sm.describeChanges(fields, changes));
+  else if (["dirty", "error"].includes($("plugins-savebar").dataset.state)) setPluginsSaveState("clean");
+}
+
+function pluginBinding(plugin, field) {
+  const key = `${plugin.id}.${field.key}`;
+  return {
+    id: `plugin-${key.replace(/\W/g, "-")}`,
+    key,
+    value: pluginState.values[plugin.id]?.[field.key],
+    set: (next) => {
+      pluginState.values[plugin.id][field.key] = next;
+      updatePluginsDirty();
+    },
+  };
+}
+
+// 按已保存的开关和对方插件的状态给出卡片状态；未保存的开关还没有生效。
+function pluginCondition(plugin) {
+  const status = plugin.status || {};
+  const version = status.plugin_version ? `（${status.plugin_version}）` : "";
+  if (pluginState.saved[plugin.id]?.enabled === false) {
+    return {
+      state: "off", label: "已停用",
+      text: status.available
+        ? `已检测到${plugin.name}${version}，但在快速决策中停用了适配，不读取它的数据。`
+        : `已在快速决策中停用适配。${plugin.name}当前也没有对接。`,
+    };
+  }
+  if (status.available) return { state: "ok", label: "已对接", text: `已对接${plugin.name}${version}。` };
+  return { state: "error", label: "未对接", text: status.message || `没有检测到${plugin.name}，安装并启用后点刷新。` };
+}
+
+function firstLine(text, limit = 60) {
+  const line = String(text || "").split("\n")[0].trim();
+  return line.length > limit ? `${line.slice(0, limit)}…` : line;
+}
+
+// 列出用到某项能力的题，点击跳到判断配置中对应的题。
+function usageLine(questions, emptyText) {
+  if (!state.loaded) return h("p", { class: "plugin-use" }, "判断配置未读取，无法统计用到它的题");
+  if (!questions.length) return h("p", { class: "plugin-use is-empty" }, emptyText);
+  return h("p", { class: "plugin-use" }, "判断配置中：",
+    questions.flatMap((q, index) => [
+      index ? "、" : "",
+      h("button", {
+        type: "button", class: "plugin-ref", title: "在判断配置中查看",
+        onclick: () => {
+          setTab("decision");
+          revealQuestion(q);
+        },
+      }, qName(q)),
+    ]));
+}
+
+function pluginPart(title, hint, ...children) {
+  return h("div", { class: "plugin-part" },
+    h("h3", null, title),
+    hint && h("p", { class: "set-hint" }, hint),
+    ...children);
+}
+
+function renderPluginAction(action) {
+  const users = state.questions.filter((q) => wf.slotsOf(q).some((ref) => ref.actions.some((a) => a.tool === action.id)));
+  const meta = [
+    action.stages?.length && `可用于${action.stages.map((s) => STAGE_LABELS[s] || s).join("、")}的题`,
+    action.when?.length && `时机：${action.when.map((w) => WHEN_LABELS[w] || w).join(" / ")}`,
+    action.source_label && `需要候选：${action.source_label}`,
+  ].filter(Boolean);
+  return h("li", { class: "plugin-item" },
+    h("div", { class: "plugin-item-head" }, icon(ACTION_UI[action.id]?.icon || "zap"), h("b", null, action.label), h("code", null, action.id)),
+    meta.length > 0 && h("p", { class: "plugin-item-meta" }, meta.join(" · ")),
+    usageLine(users, "判断配置中还没有选项使用这个动作"));
+}
+
+function renderPluginCatalog(catalog) {
+  const users = state.questions.filter((q) => wf.candidateType(q) === catalog.id || q.requires_candidates === catalog.id);
+  return h("li", { class: "plugin-item" },
+    h("div", { class: "plugin-item-head" }, h("b", null, catalog.label), h("code", null, catalog.id)),
+    catalog.children_label && h("p", { class: "plugin-item-meta" }, `选中一项后，下级题可以从中再选：${catalog.children_label}`),
+    usageLine(users, "判断配置中还没有题从这里取候选"));
+}
+
+function renderPluginDefaults(plugin) {
+  const present = new Set(state.questions.map((q) => q.id.trim()));
+  const missing = plugin.default_questions.filter((raw) => !present.has(raw.id));
+  const rows = plugin.default_questions.map((raw) => {
+    const has = present.has(raw.id);
+    return h("li", { class: cls("plugin-q", has && "is-present") },
+      h("code", null, raw.id),
+      h("span", { class: "q-tag" }, TYPE_LABELS[raw.type] || raw.type),
+      h("span", { class: "plugin-q-text", title: raw.instructions }, firstLine(raw.instructions)),
+      h("span", { class: cls("q-tag", has ? "is-ok" : "is-off") }, has ? "已在判断配置中" : "未添加"));
+  });
+  let action;
+  if (!state.loaded) action = h("span", { class: "set-hint" }, "判断配置读取成功后才能加入");
+  else if (!missing.length) action = h("span", { class: "set-hint" }, "默认问题都已在判断配置中");
+  else {
+    action = h("button", { type: "button", class: "btn btn-outline", onclick: () => addPluginDefaults(plugin) },
+      icon("plus"), missing.length === rows.length ? "加入判断配置" : `加入缺少的 ${missing.length} 道题`);
+  }
+  return pluginPart("自带默认问题",
+    "与「恢复默认问题」里的同名题相同。加入后到「判断配置」检查并保存；判断配置中已有同 ID 的题不会被覆盖。",
+    h("ol", { class: "plugin-questions" }, rows),
+    h("div", { class: "plugin-foot" }, action));
+}
+
+function renderPlugin(plugin) {
+  const condition = pluginCondition(plugin);
+  const list = (items, render, empty) => items.length ? h("ul", { class: "plugin-items" }, items.map(render)) : h("p", { class: "set-hint" }, empty);
+  return h("section", { class: "block plugin", dataset: { state: condition.state, plugin: plugin.id } },
+    h("div", { class: "plugin-head" },
+      h("span", { class: "state-dot", "aria-hidden": "true" }),
+      h("div", { class: "plugin-title" },
+        h("h2", null, plugin.name, h("span", { class: "q-tag plugin-badge" }, condition.label)),
+        h("p", { class: "hint" }, condition.text)),
+      h("code", { class: "plugin-repo", title: "插件市场中的仓库名" }, plugin.repo)),
+    h("p", { class: "plugin-summary" }, plugin.summary),
+    plugin.details?.length > 0 && h("dl", { class: "plugin-details" },
+      plugin.details.map((item) => h("div", null, h("dt", null, item.label), h("dd", null, item.value)))),
+    plugin.fields.length > 0 && h("div", { class: "set-list plugin-settings" },
+      plugin.fields.map((field) => renderSettingRow(field, pluginBinding(plugin, field)))),
+    h("div", { class: "plugin-grid" },
+      pluginPart("提供的动作", "绑定在问题的选项上，答案命中后执行。", list(plugin.actions, renderPluginAction, "不提供动作")),
+      pluginPart("提供的候选来源", "动态选择题从这里取候选，判断模型只看描述。", list(plugin.catalogs, renderPluginCatalog, "不提供候选来源"))),
+    renderPluginDefaults(plugin),
+    plugin.tips?.length > 0 && h("details", { class: "tips" },
+      h("summary", null, "避免两个插件重复执行"),
+      h("p", { class: "hint" }, `请在${plugin.name}的设置里改：`),
+      h("ul", { class: "checklist" }, plugin.tips.map((tip) => h("li", null, tip)))));
+}
+
+function renderPlugins() {
+  if (!pluginState.loaded) return;
+  const open = new Set([...$("plugins-list").querySelectorAll("details.tips[open]")].map((el) => el.closest("[data-plugin]")?.dataset.plugin));
+  $("plugins-list").replaceChildren(...(pluginState.plugins.length
+    ? pluginState.plugins.map(renderPlugin)
+    : [h("p", { class: "empty" }, "还没有适配任何外部插件。")]));
+  for (const card of $("plugins-list").querySelectorAll("[data-plugin]")) {
+    if (open.has(card.dataset.plugin)) card.querySelector("details.tips")?.setAttribute("open", "");
+  }
+  updatePluginsDirty();
+}
+
+// 判断配置里有启用的题依赖已停用或未对接的插件时，在判断配置页顶部提示。
+function renderPluginNotice() {
+  const box = $("plugin-notice");
+  const lines = [];
+  if (pluginState.loaded && state.loaded) {
+    for (const plugin of pluginState.plugins) {
+      const condition = pluginCondition(plugin);
+      if (condition.state === "ok") continue;
+      const used = wf.pluginQuestions(state.questions.filter((q) => q.enabled), plugin);
+      if (!used.length) continue;
+      const why = condition.state === "off" ? "已在「外部插件」中停用" : "当前没有对接";
+      lines.push(`有 ${used.length} 道题用到「${plugin.name}」，但它${why}：读取它候选的题会被跳过，它的动作不会执行。`);
+    }
+  }
+  box.hidden = !lines.length;
+  box.replaceChildren(...lines.map((line) => h("span", null, line)),
+    lines.length ? h("button", { type: "button", class: "btn btn-text", onclick: () => setTab("plugins", { focus: true }) }, "查看外部插件") : "");
+}
+
+function applyPlugins(data) {
+  pluginState.plugins = Array.isArray(data.plugins) ? data.plugins : [];
+  pluginState.saved = Object.fromEntries(pluginState.plugins.map((plugin) => [plugin.id, { ...plugin.values }]));
+  pluginState.values = Object.fromEntries(pluginState.plugins.map((plugin) => [plugin.id, { ...plugin.values }]));
+  pluginState.loaded = true;
+  renderPlugins();
+  renderPluginNotice();
+}
+
+async function loadPlugins() {
+  try {
+    applyPlugins(await bridge.apiGet("external-plugins"));
+    setPluginsSaveState("clean");
+  } catch (error) {
+    if (!pluginState.loaded) {
+      $("plugins-list").replaceChildren(h("p", { class: "log-error" }, `读取外部插件失败：${error.message}。可以稍后点刷新重试。`));
+    }
+    setPluginsSaveState("error", `读取外部插件失败：${error.message}`);
+  }
+}
+
+async function savePlugins() {
+  if (pluginState.saving || !pluginState.loaded) return;
+  const changes = pluginChanges();
+  if (!Object.keys(changes).length) {
+    setPluginsSaveState("clean");
+    return;
+  }
+  const fields = pluginFields();
+  const invalid = fields.find((field) => Object.hasOwn(changes, field.key) && sm.fieldError(field, changes[field.key]));
+  if (invalid) {
+    setPluginsSaveState("error", `「${invalid.label}」${sm.fieldError(invalid, changes[invalid.key])}`);
+    return;
+  }
+  const grouped = {};
+  for (const field of fields) {
+    if (Object.hasOwn(changes, field.key)) (grouped[field.plugin.id] ??= {})[field.name] = changes[field.key];
+  }
+  pluginState.saving = true;
+  setPluginsSaveState("saving");
+  $("plugins-form").disabled = true;
+  try {
+    const data = await bridge.apiPost("external-plugins", { changes: grouped });
+    pluginState.saving = false;
+    applyPlugins(data);
+    setPluginsSaveState("saved");
+    await loadStatus();
+  } catch (error) {
+    setPluginsSaveState("error", `保存失败：${error.message}`);
+  } finally {
+    pluginState.saving = false;
+    $("plugins-form").disabled = false;
+  }
+}
+
+function onDiscardPlugins() {
+  pluginState.values = Object.fromEntries(Object.entries(pluginState.saved).map(([id, values]) => [id, { ...values }]));
+  renderPlugins();
+  setPluginsSaveState("clean");
+}
+
+async function reloadPlugins() {
+  if (pluginsDirty()) {
+    setPluginsSaveState("dirty", "有未保存的更改，刷新时保留了你的编辑");
+    renderPlugins();
+    return;
+  }
+  await loadPlugins();
+}
+
+function addPluginDefaults(plugin) {
+  if (!state.loaded) return;
+  const added = wf.questionsToAdd(state.questions, plugin.default_questions);
+  if (!added.length) return;
+  const start = state.questions.length;
+  state.questions.push(...added);
+  state.open.add(added[0]);
+  setTab("decision");
+  refreshEditor();
+  const pending = added.filter(wf.isPending).length;
+  const note = pending ? `，其中 ${pending} 道找不到原来的触发题，已放进待连接` : "";
+  setSaveState("dirty", `已加入「${plugin.name}」的 ${added.length} 道默认问题${note}。检查后保存生效`);
+  $("questions").querySelector(`[data-q="${start}"]`)?.scrollIntoView({ block: "start", behavior: "smooth" });
+}
+
 // ---------- 页面 ----------
 
-const TABS = ["decision", "logs", "settings"];
+const TABS = ["decision", "logs", "plugins", "settings"];
 let currentTab = "decision";
 let logRefreshTimer = 0;
 
@@ -2343,6 +2590,8 @@ function setTab(name, { focus = false } = {}) {
     if (active && focus) button.focus();
   }
   window.clearInterval(logRefreshTimer);
+  // 判断配置里的题可能刚改过，切过来时重算「用到它的题」和默认问题是否已加入。
+  if (name === "plugins") renderPlugins();
   if (name === "logs") {
     loadLogs();
     logRefreshTimer = window.setInterval(() => {
@@ -2378,7 +2627,9 @@ async function reload() {
   try {
     await loadStatus();
     if (currentTab === "logs") await loadLogs();
-    await Promise.all([reloadDecisionConfig(), reloadSettings()]);
+    await Promise.all([reloadDecisionConfig(), reloadSettings(), reloadPlugins()]);
+    renderPlugins();
+    renderPluginNotice();
   } finally {
     button.disabled = false;
   }
@@ -2389,6 +2640,7 @@ function renderContext(context) {
   document.title = bridge.t("views.meme_manager.title", "快速决策");
   $("tab-btn-decision").textContent = bridge.t("views.meme_manager.tab_decision", "判断配置");
   $("tab-btn-logs").textContent = bridge.t("views.meme_manager.tab_logs", "决策日志");
+  $("tab-btn-plugins").textContent = bridge.t("views.meme_manager.tab_plugins", "外部插件");
   $("tab-btn-settings").textContent = bridge.t("views.meme_manager.tab_settings", "插件设置");
   $("refresh-label").textContent = bridge.t("views.meme_manager.refresh", "刷新");
   document.documentElement.dataset.theme = context?.isDark ? "dark" : "light";
@@ -2453,6 +2705,8 @@ for (const tab of TABS) {
 }
 $("settings-save").addEventListener("click", saveSettings);
 $("settings-discard").addEventListener("click", onDiscardSettings);
+$("plugins-save").addEventListener("click", savePlugins);
+$("plugins-discard").addEventListener("click", onDiscardPlugins);
 $("log-limit").addEventListener("change", loadLogs);
 $("log-search").addEventListener("input", renderLogs);
 $("log-session").addEventListener("change", (event) => {
@@ -2508,6 +2762,7 @@ document.addEventListener("keydown", (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "s" && currentTab !== "logs") {
     event.preventDefault();
     if (currentTab === "settings") saveSettings();
+    else if (currentTab === "plugins") savePlugins();
     else saveDecisionConfig();
   }
 });
@@ -2533,13 +2788,14 @@ for (const type of ["input", "change"]) {
       renderFlow();
       refreshEntries();
       renderStats();
+      renderPluginNotice();
       refreshChangeMarks();
     }
   });
 }
 
 window.addEventListener("beforeunload", (event) => {
-  if (isDirty() || settingsDirty()) event.preventDefault();
+  if (isDirty() || settingsDirty() || pluginsDirty()) event.preventDefault();
 });
 
 await reload();

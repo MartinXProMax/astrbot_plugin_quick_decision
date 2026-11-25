@@ -104,7 +104,8 @@ export function newOption(id, criteria = "", weight = 1) {
 
 // ---------- 读入与序列化 ----------
 
-export function normalizeQuestions(rawList) {
+// existing 是已经读入的题目：新题的触发条件、候选来源和动作来源可以按 ID 指向它们。
+export function normalizeQuestions(rawList, existing = []) {
   const list = Array.isArray(rawList) ? rawList : [];
   const questions = list.map((raw) => {
     const type = raw?.type === "boolean" ? "boolean" : "choice";
@@ -137,7 +138,7 @@ export function normalizeQuestions(rawList) {
     }
     return q;
   });
-  const byId = new Map(questions.map((q) => [q.id, q]));
+  const byId = new Map([...existing.map((q) => [q.id.trim(), q]), ...questions.map((q) => [q.id, q])]);
   questions.forEach((q, index) => {
     const raw = list[index] || {};
     q.candidate_from = byId.get(q.candidate_from_id) || null;
@@ -177,6 +178,22 @@ function normalizeAction(raw, owner, byId) {
   if (typeof raw.when === "string") action.when = raw.when;
   if (raw.tool === "send_meme" && !action.when) action.when = DEFAULT_WHEN;
   return action;
+}
+
+// 外部插件自带的默认问题：跳过已有同 ID 的题，其余接到已有题目上。
+// 指向不存在的题的触发条件和动作会被丢掉，失去全部触发条件的题进入待连接。
+export function questionsToAdd(questions, rawList) {
+  const used = new Set(questions.map((q) => q.id.trim()));
+  const missing = (Array.isArray(rawList) ? rawList : []).filter((raw) => !used.has(String(raw?.id ?? "").trim()));
+  return normalizeQuestions(JSON.parse(JSON.stringify(missing)), questions);
+}
+
+// 用到某个外部插件的题：任一选项绑定了它的动作，或候选（含上级题传下来的）来自它。
+export function pluginQuestions(questions, plugin) {
+  const actions = new Set((plugin?.actions || []).map((a) => a.id));
+  const catalogs = new Set((plugin?.catalogs || []).map((c) => c.id));
+  return questions.filter((q) => catalogs.has(candidateType(q)) || catalogs.has(q.requires_candidates)
+    || slotsOf(q).some((ref) => ref.actions.some((a) => actions.has(a.tool))));
 }
 
 export function serializeAction(action) {
