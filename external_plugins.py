@@ -19,6 +19,35 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class Tip:
+    """一条建议调整的设置。check 根据适配器状态判断是否已做到；返回 None 表示无法判断，
+    例如对方插件没有加载、读不到它的配置。"""
+
+    text: str
+    check: Callable[[dict[str, Any]], bool | None] | None = None
+
+    def state(self, status: dict[str, Any]) -> bool | None:
+        if self.check is None:
+            return None
+        try:
+            return self.check(status)
+        except Exception:  # noqa: BLE001
+            return None
+
+
+def _equals(key: str, expected: Any, *, needs_plugin: bool = False) -> Callable[[dict[str, Any]], bool | None]:
+    """状态里 key 的值是否为 expected；值缺失（或要求对方插件已加载而未加载）时无法判断。"""
+
+    def check(status: dict[str, Any]) -> bool | None:
+        if needs_plugin and not status.get("plugin_loaded"):
+            return None
+        value = status.get(key)
+        return None if value is None else value == expected
+
+    return check
+
+
+@dataclass(frozen=True)
 class ExternalPlugin:
     id: str
     name: str
@@ -29,8 +58,8 @@ class ExternalPlugin:
     catalogs: tuple[str, ...] = ()
     actions: tuple[str, ...] = ()
     default_questions: tuple[str, ...] = ()
-    # 建议在对方插件里调整的设置，避免两边重复执行同一件事。
-    tips: tuple[str, ...] = ()
+    # 建议在对方插件或 AstrBot 里调整的设置，避免两边重复执行同一件事；页面逐项显示是否已做到。
+    tips: tuple[Tip, ...] = ()
     # 把适配器状态整理成页面上的若干「名称：值」。
     details: Callable[[dict[str, Any]], list[dict[str, str]]] | None = None
 
@@ -67,8 +96,6 @@ def _tts_details(status: dict[str, Any]) -> list[dict[str, str]]:
     ]
     if core and status.get("dual_output"):
         rows.append({"label": "注意", "value": "内置 TTS 开着「同时输出语音和文字」，由它接手的回复会语音、文字各发一遍"})
-    if status.get("probability", 0) > 0:
-        rows.append({"label": "建议", "value": "把通用 TTS 的触发概率设为 0：否则判断为只发文字的回复会先被它合成一次，再改回文字"})
     return rows
 
 
@@ -84,7 +111,8 @@ EXTERNAL_PLUGINS: dict[str, ExternalPlugin] = {
             catalogs=("meme_categories", "memes"),
             actions=("send_meme",),
             default_questions=("use_meme", "meme_category", "meme_id"),
-            tips=("关闭「启用主动发送表情工具」", "把「表情发送概率」设为 0"),
+            tips=(Tip("关闭「启用主动发送表情工具」", _equals("send_tool_enabled", False)),
+                  Tip("把「表情发送概率」设为 0", _equals("send_probability", 0))),
             details=_meme_details,
         ),
         ExternalPlugin(
@@ -97,11 +125,17 @@ EXTERNAL_PLUGINS: dict[str, ExternalPlugin] = {
             adapter_attr="tts_adapter",
             actions=("voice_reply", "text_reply", "voice_tone"),
             default_questions=("use_voice", "voice_tone"),
-            tips=("把通用 TTS 的「触发概率」设为 0，是否转语音交给判断决定",
-                  "在 AstrBot 配置里打开「启用 TTS」，但不要选择 TTS 提供商：通用 TTS 以这个开关为准；"
-                  "选了提供商时，为免内置 TTS 把只发文字的回复转成语音，这些回复按普通消息发送，AstrBot 分段回复不生效",
-                  "保持「发送失败时回退为文字」开启，语音发不出去时改发原文",
-                  "关闭流式输出，流式回复不会转成语音"),
+            tips=(Tip("把通用 TTS 的「触发概率」设为 0，是否转语音交给判断决定",
+                      _equals("probability", 0, needs_plugin=True)),
+                  Tip("在 AstrBot 配置里打开「启用 TTS」，通用 TTS 以这个开关为准",
+                      _equals("astrbot_tts_enabled", True)),
+                  Tip("AstrBot 的「TTS 提供商」留空：选了提供商时，为免内置 TTS 把只发文字的回复转成语音，"
+                      "这些回复按普通消息发送，AstrBot 分段回复不生效",
+                      _equals("core_provider", "")),
+                  Tip("保持通用 TTS 的「发送失败时回退为文字」开启，语音发不出去时改发原文",
+                      _equals("fallback_to_text", True, needs_plugin=True)),
+                  Tip("在 AstrBot 配置里关闭流式输出，流式回复不会转成语音",
+                      _equals("streaming", False))),
             details=_tts_details,
         ),
     )

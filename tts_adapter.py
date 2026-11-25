@@ -175,6 +175,8 @@ class TTSStatus:
     astrbot_tts_enabled: bool = False
     core_provider: str = ""
     dual_output: bool = False
+    # AstrBot 的流式输出；读不到配置时为 None。
+    streaming: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -209,7 +211,7 @@ class UniversalTTSAdapter:
         config = getattr(instance, "config", None) or {}
         return _as_bool(config.get("fallback_to_text_on_send_error", True), True)
 
-    def _astrbot_tts_settings(self) -> dict:
+    def _astrbot_config(self):
         config = getattr(self.context, "astrbot_config", None)
         if config is None:
             getter = getattr(self.context, "get_config", None)
@@ -217,11 +219,21 @@ class UniversalTTSAdapter:
                 config = getter() if callable(getter) else None
             except Exception:  # noqa: BLE001
                 config = None
+        return config
+
+    def _astrbot_section(self, name: str) -> dict | None:
+        """AstrBot 配置中的一节；读不到配置时为 None。"""
+        config = self._astrbot_config()
+        if config is None:
+            return None
         try:
-            settings = (config or {}).get("provider_tts_settings") or {}
+            section = config.get(name) or {}
+            return section if isinstance(section, dict) else dict(section)
         except Exception:  # noqa: BLE001
-            return {}
-        return settings if isinstance(settings, dict) else dict(settings)
+            return None
+
+    def _astrbot_tts_settings(self) -> dict:
+        return self._astrbot_section("provider_tts_settings") or {}
 
     def _core_provider(self, settings: dict) -> str:
         """AstrBot 内置 TTS 当前选中的提供商；没有选时为空。"""
@@ -248,10 +260,12 @@ class UniversalTTSAdapter:
         registered = self._registered()
         version = read_star_version(registered)
         settings = self._astrbot_tts_settings()
+        provider = self._astrbot_section("provider_settings")
         common = dict(
             astrbot_tts_enabled=_as_bool(settings.get("enable"), False),
             core_provider=self._core_provider(settings),
             dual_output=_as_bool(settings.get("dual_output"), False),
+            streaming=None if provider is None else _as_bool(provider.get("streaming_response"), False),
         )
         instance = self.plugin()
         if instance is None:

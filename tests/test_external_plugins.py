@@ -98,7 +98,9 @@ class ExternalPluginsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([q["id"] for q in meme["default_questions"]], ["use_meme", "meme_category", "meme_id"])
         for question in meme["default_questions"]:
             self.assertEqual(question, restore[question["id"]])
-        self.assertTrue(meme["tips"])
+        # 测试替身没有报告表情包管理器的设置，建议都无法检查。
+        self.assertEqual([tip["done"] for tip in meme["tips"]], [None, None])
+        self.assertTrue(all(tip["text"] for tip in meme["tips"]))
 
     async def test_available_adapter_reports_version_and_pack_details(self):
         packs = [{"id": "daily", "name": "日常", "enabled": True, "present": True},
@@ -112,6 +114,27 @@ class ExternalPluginsApiTests(unittest.IsolatedAsyncioTestCase):
             {"label": "图包", "value": "日常、旧图（已停用）（文件缺失）"},
             {"label": "可选表情", "value": "12 张带描述的表情"},
         ])
+
+    async def test_tips_show_which_settings_are_already_done(self):
+        status = {"available": True, "plugin_loaded": True, "plugin_version": "v3.2.1", "message": "",
+                  "candidate_count": 0, "packs": [], "send_tool_enabled": False, "send_probability": 100}
+        self.plugin.meme_adapter = SimpleNamespace(status=lambda: SimpleNamespace(to_dict=lambda: status))
+        meme = (await self.call())["plugins"][0]
+        self.assertEqual([(tip["text"], tip["done"]) for tip in meme["tips"]],
+                         [("关闭「启用主动发送表情工具」", True), ("把「表情发送概率」设为 0", False)])
+
+    def test_meme_manager_settings_follow_its_config_and_defaults(self):
+        from astrbot_plugin_quick_decision.meme_adapter import meme_manager_settings
+
+        def star(config):
+            return SimpleNamespace(star_cls=SimpleNamespace(config=config))
+
+        self.assertEqual(meme_manager_settings(star({"generation": {"emotion": {
+            "send_tool_enabled": False, "probability": 0}}})), {"send_tool_enabled": False, "send_probability": 0})
+        self.assertEqual(meme_manager_settings(star({})), {"send_tool_enabled": True, "send_probability": 100})
+        self.assertEqual(meme_manager_settings(star({"generation": {"emotion": {"probability": "x"}}})),
+                         {"send_tool_enabled": True, "send_probability": None})
+        self.assertEqual(meme_manager_settings(None), {"send_tool_enabled": None, "send_probability": None})
 
     async def test_status_failure_is_reported_instead_of_raising(self):
         def broken():

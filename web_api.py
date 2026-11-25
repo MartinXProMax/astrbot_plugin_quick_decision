@@ -623,7 +623,8 @@ class WebApiMixin:
                 "actions": actions,
                 "catalogs": catalogs,
                 "default_questions": [deepcopy(defaults[qid]) for qid in plugin.default_questions if qid in defaults],
-                "tips": list(plugin.tips),
+                # done：True 已做到，False 未做到，None 无法检查（对方插件没加载或读不到配置）。
+                "tips": [{"text": tip.text, "done": tip.state(status)} for tip in plugin.tips],
             })
         return {"plugins": plugins}
 

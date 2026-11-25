@@ -694,6 +694,34 @@ textarea.is-invalid {
   border-radius: 4px;
 }
 
+/* 外部插件建议：已做到打钩，无法检查用虚线框。 */
+.checklist li.is-done::before {
+  content: "✓";
+  display: grid;
+  place-items: center;
+  border-color: var(--ok);
+  background: var(--ok);
+  color: var(--surface);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.checklist li.is-unknown {
+  color: var(--muted);
+}
+
+.checklist li.is-unknown::before {
+  border-style: dashed;
+  border-color: var(--faint);
+}
+
+.tips summary .q-tag {
+  margin-left: 8px;
+  font-weight: 500;
+  vertical-align: 1px;
+}
+
 /* ---------- 横幅 ---------- */
 
 .banner {

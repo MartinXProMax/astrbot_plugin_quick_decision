@@ -2468,10 +2468,28 @@ function renderPlugin(plugin) {
       pluginPart("提供的动作", "绑定在问题的选项上，答案命中后执行。", list(plugin.actions, renderPluginAction, "不提供动作")),
       pluginPart("提供的候选来源", "动态选择题从这里取候选，判断模型只看描述。", list(plugin.catalogs, renderPluginCatalog, "不提供候选来源"))),
     renderPluginDefaults(plugin),
-    plugin.tips?.length > 0 && h("details", { class: "tips" },
-      h("summary", null, "避免两个插件重复执行"),
-      h("p", { class: "hint" }, `请按下面调整${plugin.name}或 AstrBot 的设置：`),
-      h("ul", { class: "checklist" }, plugin.tips.map((tip) => h("li", null, tip)))));
+    plugin.tips?.length > 0 && renderPluginTips(plugin));
+}
+
+// 每条建议由后端按当前设置检查：done 为 true 已做到，false 未做到，null 无法检查（对方插件没加载）。
+const TIP_STATES = { done: "已做到", todo: "未做到", unknown: "无法检查" };
+
+function renderPluginTips(plugin) {
+  const tips = plugin.tips.map((tip) => (typeof tip === "string" ? { text: tip, done: null } : tip));
+  const stateOf = (tip) => (tip.done === true ? "done" : tip.done === false ? "todo" : "unknown");
+  const done = tips.filter((tip) => stateOf(tip) === "done").length;
+  const unknown = tips.some((tip) => stateOf(tip) === "unknown");
+  const all = done === tips.length;
+  return h("details", { class: "tips" },
+    h("summary", null, "避免两个插件重复执行",
+      h("span", { class: cls("q-tag", all ? "is-ok" : "is-off") }, all ? "已全部做到" : `已做到 ${done}/${tips.length}`)),
+    h("p", { class: "hint" }, `按下面调整${plugin.name}或 AstrBot 的设置，打钩的已经做到。`
+      + (unknown ? "虚线框的读不到对方设置（插件未加载），无法检查。" : "")),
+    h("ul", { class: "checklist" }, tips.map((tip) => {
+      const state = stateOf(tip);
+      return h("li", { class: `is-${state}`, title: TIP_STATES[state] },
+        h("span", { class: "sr-only" }, `${TIP_STATES[state]}：`), tip.text);
+    })));
 }
 
 function renderPlugins() {

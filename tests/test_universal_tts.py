@@ -168,14 +168,20 @@ class FakeUniversalTTS:
         self._install_send_fallback(event, result, original_chain)
 
 
-def tts_context(universal=None, *, enable=True, provider_id="", dual_output=False, **extra):
+def tts_context(universal=None, *, enable=True, provider_id="", dual_output=False, streaming=False, **extra):
     star = SimpleNamespace(star_cls=universal, activated=True, version="1.4.5") if universal else None
     return SimpleNamespace(
         get_registered_star=lambda name: star if name == UNIVERSAL_TTS_STAR_NAME else None,
         astrbot_config={"provider_tts_settings": {"enable": enable, "provider_id": provider_id,
-                                                  "dual_output": dual_output}},
+                                                  "dual_output": dual_output},
+                        "provider_settings": {"streaming_response": streaming}},
         **extra,
     )
+
+
+def tip_states(context):
+    status = UniversalTTSAdapter(context).status().to_dict()
+    return [tip.state(status) for tip in web_api.EXTERNAL_PLUGINS["universal_tts"].tips]
 
 
 def is_record(comp) -> bool:
@@ -204,16 +210,21 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                    web_api.EXTERNAL_PLUGINS["universal_tts"].details(both.to_dict())}
         self.assertIn("edge_tts", details["AstrBot 内置 TTS 提供商"])
         self.assertIn("各发一遍", details["注意"])
-        self.assertIn("设为 0", details["建议"])
-
-        universal.config["tts_probability"] = 0
-        quiet = UniversalTTSAdapter(tts_context(universal)).status().to_dict()
-        self.assertNotIn("建议", {row["label"] for row in web_api.EXTERNAL_PLUGINS["universal_tts"].details(quiet)})
 
         universal._runtime_enabled = False
         paused = UniversalTTSAdapter(tts_context(universal)).status()
         self.assertTrue(paused.available)
         self.assertIn("/tts_off", paused.message)
+
+    def test_tips_are_checked_against_current_settings(self):
+        universal = FakeUniversalTTS(MimoEngine(), probability=100)
+        # 依次为：触发概率 0、启用 TTS、提供商留空、发送失败回退文字、关闭流式输出。
+        self.assertEqual(tip_states(tts_context(universal)), [False, True, True, True, True])
+        universal.config.update(tts_probability=0, fallback_to_text_on_send_error=False)
+        self.assertEqual(tip_states(tts_context(universal, enable=False, provider_id="edge_tts", streaming=True)),
+                         [True, False, False, False, False])
+        # 没装通用 TTS 时只检查 AstrBot 自己的设置。
+        self.assertEqual(tip_states(tts_context()), [None, True, True, None, True])
 
     async def test_voice_record_reuses_universal_rules(self):
         engine = MimoEngine()

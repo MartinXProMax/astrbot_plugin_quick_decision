@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -166,6 +167,9 @@ class AdapterStatus:
     registered_apis: list[str] = field(default_factory=list)
     message: str = ""
     packs: list[dict[str, Any]] = field(default_factory=list)
+    # 表情包管理器里与本插件重复的两项设置；未加载或读不到时为 None。
+    send_tool_enabled: bool | None = None
+    send_probability: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -178,7 +182,31 @@ class AdapterStatus:
             "registered_apis": list(self.registered_apis),
             "message": self.message,
             "packs": list(self.packs),
+            "send_tool_enabled": self.send_tool_enabled,
+            "send_probability": self.send_probability,
         }
+
+
+def meme_manager_settings(registered: Any) -> dict[str, Any]:
+    """读取表情包管理器的「启用主动发送表情工具」和「表情发送概率」。
+
+    两项在它的配置 generation.emotion 下；缺省值与它的 _conf_schema.json 一致（开启、100）。
+    """
+    instance = unwrap_star(registered)
+    config = getattr(instance, "config", None) if instance is not None else None
+    if not isinstance(config, Mapping):
+        return {"send_tool_enabled": None, "send_probability": None}
+    generation = config.get("generation")
+    emotion = generation.get("emotion") if isinstance(generation, Mapping) else None
+    emotion = emotion if isinstance(emotion, Mapping) else {}
+    tool = emotion.get("send_tool_enabled", True)
+    if isinstance(tool, str):
+        tool = tool.strip().lower() not in ("false", "0", "")
+    try:
+        probability = int(emotion.get("probability", 100))
+    except (TypeError, ValueError):
+        probability = None
+    return {"send_tool_enabled": bool(tool), "send_probability": probability}
 
 
 def discover_meme_manager_data_dir(
@@ -389,6 +417,7 @@ class MemeManagerAdapter:
         plugin_loaded = registered is not None
         version = read_star_version(registered)
         apis = inspect_star_apis(registered)
+        settings = meme_manager_settings(registered)
         data_dir = self.resolve_data_dir()
         if self.require_plugin and not plugin_loaded:
             return AdapterStatus(
@@ -400,6 +429,7 @@ class MemeManagerAdapter:
                 candidate_count=0,
                 registered_apis=apis,
                 message=UNAVAILABLE_HINT,
+                **settings,
             )
         if data_dir is None or not data_dir.is_dir():
             return AdapterStatus(
@@ -411,6 +441,7 @@ class MemeManagerAdapter:
                 candidate_count=0,
                 registered_apis=apis,
                 message=UNAVAILABLE_HINT,
+                **settings,
             )
         packs = self._registry(data_dir)
         candidates = self.list_candidates()
@@ -437,6 +468,7 @@ class MemeManagerAdapter:
             registered_apis=apis,
             message="",
             packs=pack_summaries,
+            **settings,
         )
 
     def list_candidates(self, *, include_undesc: bool = False) -> list[MemeCandidate]:
