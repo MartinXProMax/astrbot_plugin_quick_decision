@@ -249,6 +249,56 @@ class UniversalTTSAdapter:
             logger.debug("读取 AstrBot 会话 TTS 开关失败，按开启处理：%s", umo, exc_info=True)
             return True
 
+    def would_skip(self, text: str) -> bool:
+        """通用 TTS 会不会按自己的规则跳过这段正文：超出字数上限，或命中跳过规则（代码块、纯链接、自定义正则）。
+
+        与它钩子里的判断一致，用来在等语气判断之前排除注定只发文字的回复。读不到规则时按不跳过处理。
+        """
+        instance = self.plugin()
+        text = (text or "").strip()
+        if instance is None or not text:
+            return True
+        config = getattr(instance, "config", None) or {}
+        if _as_bool(config.get("tts_text_limit_enable", False), False):
+            try:
+                if len(text) > int(config.get("tts_text_limit", 50)):
+                    return True
+            except (TypeError, ValueError):
+                pass
+        checker = getattr(instance, "_should_skip_tts", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(text))
+        except Exception:  # noqa: BLE001
+            return False
+
+    @staticmethod
+    def drop_send_fallback(event, before) -> bool:
+        """拆掉通用 TTS 为语音装的「发送失败改发原文」包装。
+
+        只拆最外层、是它的包装函数（1.4.x 名为 _send_with_fallback）且直接包着 before（它装包装前的
+        event.send）的那一层；其他插件的包装或对不上时一概不动。
+        改回文字后不拆的话，文字发送抛错时它会把同一段文字再发一遍。
+        """
+        current = getattr(event, "send", None)
+        if before is None or current is None or current is before:
+            return False
+        if not getattr(event, "_universal_tts_send_wrapped", False):
+            return False
+        if getattr(current, "__name__", "") != "_send_with_fallback":
+            return False
+        for cell in getattr(current, "__closure__", None) or ():
+            try:
+                wrapped = cell.cell_contents
+            except ValueError:
+                continue
+            if wrapped is before:
+                event.send = before
+                event._universal_tts_send_wrapped = False
+                return True
+        return False
+
     def fallback_to_text(self) -> bool:
         """与通用 TTS 的「发送失败时回退为文字」一致。"""
         instance = self.plugin()
@@ -363,14 +413,18 @@ class UniversalTTSAdapter:
         result = event.get_result()
         return has_record(getattr(result, "chain", None))
 
-    def settle(self, result, *, voice: bool, original) -> None:
+    def settle(self, result, *, voice: bool, original) -> bool:
         """所有装饰钩子跑完后落实本轮判断，消除通用 TTS 按自己规则留下的影响。
 
         - 判断只发文字、它却按概率转了语音：把语音换回原来的文字组件；
         - 它跳过时会把结果改标为普通消息，这会关掉 AstrBot 的分段回复，这里改回模型结果。
           但内置 TTS 选了提供商时，链上还有文字就保持普通消息，免得内置 TTS 再转语音。
+
+        Returns:
+            是否把它转出的语音换回了文字。
         """
         chain = list(getattr(result, "chain", None) or ())
+        reverted = False
         if not voice and has_record(chain):
             texts = [c for c in original if isinstance(c, Plain)]
             rebuilt, restored = [], False
@@ -382,16 +436,18 @@ class UniversalTTSAdapter:
                     continue
                 rebuilt.append(comp)
             result.chain = chain = rebuilt
+            reverted = True
             logger.info("通用 TTS 按自己的概率转了语音，本轮判断为只发文字，已改回文字")
         setter = getattr(result, "set_result_content_type", None)
         if not callable(setter):
-            return
+            return reverted
         has_text = any(isinstance(c, Plain) and (c.text or "").strip() for c in chain)
         if has_text and self._core_provider(self._astrbot_tts_settings()):
             if result.is_llm_result():
                 setter(_GENERAL_RESULT)
         elif not result.is_llm_result():
             setter(_LLM_RESULT)
+        return reverted
 
     async def voice_record(self, umo: str, text: str, *, tone: str = "", force: bool = False):
         """主动发言：按通用 TTS 的规则把整段正文转成一条语音；不转或失败时返回 None。

@@ -525,7 +525,9 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         voice = None
         if tts is not None:
             async def voice(body):
-                await self._await_voice_tone(result)
+                # 通用 TTS 反正会跳过（超出字数上限或命中跳过规则）时，不必等语气判断。
+                if not tts.would_skip(body):
+                    await self._await_voice_tone(result)
                 return await tts.voice_record(profile.umo, body, tone=result.voice_tone, force=mode == "voice")
 
         sent_texts: list[str] = []
@@ -920,11 +922,14 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if is_llm:
             event.set_extra("_qd_llm_result", result)
             event.set_extra("_qd_llm_components", list(result.chain))
+            # 通用 TTS 转语音时会再包一层 event.send；改回文字时按这个找回它包之前的发送函数。
+            event.set_extra("_qd_send_before_tts", event.send)
             mode = decision.voice_mode
             tts = self._tts()
             if tts is not None and mode != "text":
-                # 语气在正文生成后判断，先等它；只发文字时不用等。
-                await self._await_voice_tone(decision)
+                # 语气在正文生成后判断，先等它；只发文字、或通用 TTS 反正会跳过这段正文时不用等。
+                if not tts.would_skip(event.get_extra("_qd_undecorated_text") or ""):
+                    await self._await_voice_tone(decision)
                 # 判断要发语音时不看通用 TTS 的触发概率；只给了语气时仍由它按概率决定。
                 if mode == "voice" or decision.voice_tone:
                     await tts.voice_event(event, decision.voice_tone, force=mode == "voice")
@@ -939,7 +944,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         tts = self._tts()
         if tts is None or result is None or result is not event.get_extra("_qd_llm_result"):
             return
-        tts.settle(result, voice=decision.voice_mode == "voice", original=event.get_extra("_qd_llm_components") or [])
+        reverted = tts.settle(result, voice=decision.voice_mode == "voice",
+                              original=event.get_extra("_qd_llm_components") or [])
+        if reverted:
+            tts.drop_send_fallback(event, event.get_extra("_qd_send_before_tts"))
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent):

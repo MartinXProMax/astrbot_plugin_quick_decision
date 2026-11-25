@@ -100,13 +100,14 @@ class AzureEngine(MimoEngine):
 class FakeUniversalTTS:
     """按通用 TTS 1.4.5 tts_hook 的流程写的替身：
 
-    暂停或概率落空时把结果标成普通消息并返回；只处理模型结果；合并全部文字，用会话引擎合成，
-    第一段文字换成一条语音、其余文字删掉；再包一层 event.send，语音发送抛错时改发原始组件。
-    概率介于 0 和 100 之间时用 dice 代替随机数。
+    暂停或概率落空时把结果标成普通消息并返回；只处理模型结果；合并全部文字后检查字数上限和跳过规则
+    （命中也标成普通消息）；用会话引擎合成，第一段文字换成一条语音、其余文字删掉；再包一层 event.send
+    （每个事件只包一次），语音发送抛错时改发原始组件。概率介于 0 和 100 之间时用 dice 代替随机数。
     """
 
     def __init__(self, engine, *, probability: int = 100) -> None:
-        self.config = {"enable": True, "tts_probability": probability, "fallback_to_text_on_send_error": True}
+        self.config = {"enable": True, "tts_probability": probability, "fallback_to_text_on_send_error": True,
+                       "tts_text_limit_enable": False, "tts_text_limit": 50, "tts_skip_code_blocks": True}
         self._engine = engine
         self._runtime_enabled = True
         self._session_bindings: dict[str, str] = {}
@@ -121,17 +122,23 @@ class FakeUniversalTTS:
         if result.is_llm_result():
             result.set_result_content_type(_GENERAL_RESULT)
 
+    def _should_skip_tts(self, text: str) -> str:
+        return "code_block" if self.config.get("tts_skip_code_blocks", True) and "```" in text else ""
+
     def _install_send_fallback(self, event, result, original_chain) -> None:
-        original = event.send
+        if getattr(event, "_universal_tts_send_wrapped", False):
+            return
+        original_send = event.send
         fallback = result.derive(list(original_chain))
 
-        async def send(chain):
+        async def _send_with_fallback(chain):
             try:
-                return await original(chain)
+                return await original_send(chain)
             except Exception:  # noqa: BLE001
-                return await original(fallback)
+                return await original_send(fallback)
 
-        event.send = send
+        event.send = _send_with_fallback
+        event._universal_tts_send_wrapped = True
 
     async def tts_hook(self, event):
         self.hook_calls += 1
@@ -144,6 +151,12 @@ class FakeUniversalTTS:
             return
         text = "".join(c.text for c in result.chain if isinstance(c, Plain) and c.text).strip()
         if not text:
+            return
+        if self.config.get("tts_text_limit_enable") and len(text) > self.config.get("tts_text_limit", 50):
+            self._suppress_core_tts(result)
+            return
+        if self._should_skip_tts(text):
+            self._suppress_core_tts(result)
             return
         engine = self._get_engine_for_session(event.unified_msg_origin)
         if engine is None:
@@ -246,6 +259,39 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(FakeUniversalTTS, "tts_hook", AsyncMock(side_effect=RuntimeError("引擎崩了"))):
             self.assertIsNone(await adapter.voice_record(UMO, "失败时改发文字"))
         self.assertIsNone(await UniversalTTSAdapter(tts_context()).voice_record(UMO, "没装插件"))
+
+    def test_would_skip_matches_universal_rules(self):
+        universal = FakeUniversalTTS(MimoEngine())
+        adapter = UniversalTTSAdapter(tts_context(universal))
+        self.assertFalse(adapter.would_skip("普通的一句话"))
+        self.assertTrue(adapter.would_skip("```代码```"))
+        self.assertTrue(adapter.would_skip("   "))
+        universal.config.update(tts_text_limit_enable=True, tts_text_limit=4)
+        self.assertTrue(adapter.would_skip("超过四个字了"))
+        self.assertFalse(adapter.would_skip("四个字呀"))
+        self.assertTrue(UniversalTTSAdapter(tts_context()).would_skip("没装插件"))
+
+    def test_drop_send_fallback_only_unwraps_its_own_layer(self):
+        async def guard(message):
+            return True
+
+        async def other_plugin(message):
+            return await guard(message)
+
+        universal = FakeUniversalTTS(MimoEngine())
+        event = SimpleNamespace(send=guard)
+        universal._install_send_fallback(event, Result([Plain("x")]), [Plain("x")])
+        self.assertIsNot(event.send, guard)
+        self.assertTrue(UniversalTTSAdapter.drop_send_fallback(event, guard))
+        self.assertIs(event.send, guard)
+        self.assertFalse(event._universal_tts_send_wrapped)
+        # 别的插件后来又包了一层：不知道它包的是谁，原样保留。
+        universal._install_send_fallback(event, Result([Plain("x")]), [Plain("x")])
+        wrapped = event.send
+        event.send = other_plugin
+        self.assertFalse(UniversalTTSAdapter.drop_send_fallback(event, guard))
+        self.assertIs(event.send, other_plugin)
+        self.assertFalse(UniversalTTSAdapter.drop_send_fallback(SimpleNamespace(send=wrapped), None))
 
     async def test_forced_voice_ignores_probability_but_keeps_other_rules(self):
         universal = FakeUniversalTTS(MimoEngine(), probability=0)
@@ -403,6 +449,19 @@ class ProactiveVoiceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(is_record(record))
                 self.assertEqual(self.engine.spoken[-1][:2], ("温柔 温柔", "有人在吗"), "等正文生成后的语气判断")
 
+                # 通用 TTS 反正会跳过的正文不等语气判断：判断永远不结束也照常发出文字。
+                self.universal.config.update(tts_text_limit_enable=True, tts_text_limit=2)
+
+                async def never(context, plan, text, answers, *, decision):
+                    await asyncio.Event().wait()
+
+                with patch.object(main, "evaluate_post_reply", side_effect=never):
+                    sent = await asyncio.wait_for(run(voice_mode="voice", post_plan=plan), 2)
+                for task in list(plugin._post_tasks):
+                    task.cancel()
+                self.assertEqual(sent.text, "有人在吗")
+                self.universal.config["tts_text_limit_enable"] = False
+
                 plugin.config["external_plugins"] = {"universal_tts": {"proactive_voice": False}}
                 self.assertEqual((await run(voice_mode="voice")).text, "有人在吗")
                 plugin.config["external_plugins"] = {"universal_tts": {"enabled": False}}
@@ -537,6 +596,44 @@ class PassiveVoiceTests(unittest.IsolatedAsyncioTestCase):
         decision.tone_judged = asyncio.Event()
         event, _ = await asyncio.wait_for(self.round(decision), 2)
         self.assertEqual([type(c).__name__ for c in event._sends[0].chain], ["Plain"])
+
+    async def test_no_tone_wait_when_universal_would_skip_the_text(self):
+        self.universal.config.update(tts_text_limit_enable=True, tts_text_limit=5)
+        decision = DecisionResult(action="reply", voice_mode="voice")
+        decision.tone_judged = asyncio.Event()
+        event, row = await asyncio.wait_for(self.round(decision, text="这段回复明显超出了字数上限"), 2)
+        self.assertEqual([type(c).__name__ for c in event._sends[0].chain], ["Plain"])
+        self.assertEqual(self.engine.spoken, [])
+
+        self.universal.config["tts_text_limit_enable"] = False
+        decision = DecisionResult(action="reply", voice_mode="voice")
+        decision.tone_judged = asyncio.Event()
+        event, _ = await asyncio.wait_for(self.round(decision, text="看代码：```print(1)```"), 2)
+        self.assertEqual([type(c).__name__ for c in event._sends[0].chain], ["Plain"])
+
+    async def test_text_round_drops_universal_send_fallback(self):
+        attempts = []
+
+        async def send(message):
+            attempts.append([type(c).__name__ for c in message.chain])
+            raise RuntimeError("网络断开")
+
+        with self.assertRaises(RuntimeError):
+            await self.round(DecisionResult(action="reply", voice_mode="text"), send=send)
+        self.assertEqual(attempts, [["Plain"]], "改回文字后发送失败不再由通用 TTS 重发一遍")
+
+    async def test_voice_round_keeps_universal_send_fallback(self):
+        sent = []
+
+        async def send(message):
+            if any(is_record(c) for c in message.chain):
+                raise RuntimeError("NapCat 拒收语音")
+            sent.append([type(c).__name__ for c in message.chain])
+            return True
+
+        event, row = await self.round(DecisionResult(action="reply", voice_mode="voice"), send=send)
+        self.assertEqual(sent, [["Plain"]], "语音失败时仍由通用 TTS 改发原文")
+        self.assertTrue(row["reply_sent"])
 
     async def test_tone_without_voice_decision_is_used_once(self):
         _, row = await self.round(DecisionResult(action="reply", voice_tone="开心"))
