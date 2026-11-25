@@ -560,6 +560,32 @@ class PassiveVoiceTests(unittest.IsolatedAsyncioTestCase):
         await self.round(DecisionResult(action="reply", voice_mode="text"))
         self.assertEqual(self.final_kind, _GENERAL_RESULT, "内置 TTS 选着提供商时不让它转语音")
 
+    async def test_every_round_stays_segmentable_after_universal_skips(self):
+        # 通用 TTS 不转语音时把结果改标为普通消息，AstrBot 分段回复只认模型结果。
+        self.universal.config["tts_probability"] = 0
+        await self.round(DecisionResult(action="reply"))
+        self.assertEqual(self.final_kind, _LLM_RESULT, "没有语音判断的轮次也要能分段")
+        self.universal.config["tts_probability"] = 100
+        self.universal._runtime_enabled = False
+        await self.round(DecisionResult(action="reply"))
+        self.assertEqual(self.final_kind, _LLM_RESULT, "/tts_off 时也要能分段")
+        self.universal._runtime_enabled = True
+        self.universal.config["tts_probability"] = 0
+        self.plugin.config["external_plugins"] = {"universal_tts": {"enabled": False}}
+        await self.round(DecisionResult(action="reply", voice_mode="text"))
+        self.assertEqual(self.final_kind, _LLM_RESULT, "停用适配时也要能分段")
+
+    async def test_restore_needs_universal_and_respects_core_tts(self):
+        self.universal.config["tts_probability"] = 0
+        self.use_context(provider_id="edge_tts")
+        await self.round(DecisionResult(action="reply"))
+        self.assertEqual(self.final_kind, _GENERAL_RESULT, "内置 TTS 选着提供商时保持普通消息")
+        # 没装通用 TTS：别的插件改标的普通消息原样保留（这里由替身代为改标）。
+        self.use_context()
+        self.plugin.tts_adapter = UniversalTTSAdapter(tts_context())
+        await self.round(DecisionResult(action="reply"))
+        self.assertEqual(self.final_kind, _GENERAL_RESULT)
+
     async def test_voice_decision_still_respects_universal_rules(self):
         self.universal._runtime_enabled = False
         event, row = await self.round(DecisionResult(action="reply", voice_mode="voice"))

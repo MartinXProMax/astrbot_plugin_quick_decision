@@ -934,20 +934,26 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 if mode == "voice" or decision.voice_tone:
                     await tts.voice_event(event, decision.voice_tone, force=mode == "voice")
 
-    # 晚于通用 TTS（priority=0）执行：它按自己的概率转出的语音或改标的结果类型，按本轮判断改回来。
+    # 晚于通用 TTS（priority=0）执行，消除它留下的影响：
+    # - 它不转语音时会把结果改标为普通消息，AstrBot 分段回复只认模型结果，这里改回来；
+    #   本插件处理的每一轮都要改回（包括没判断是否用语音、/tts_off、停用适配的轮次），否则回复不分段；
+    # - 判断为只发文字、它却按概率转了语音时，换回原文。
     @filter.on_decorating_result(priority=-10)
     async def settle_voice_choice(self, event: AstrMessageEvent):
         decision = self._pipeline_decision(event)
-        if decision is None or not decision.voice_mode or event.get_extra("_qd_streaming"):
+        if decision is None or event.get_extra("_qd_streaming"):
             return
         result = event.get_result()
-        tts = self._tts()
-        if tts is None or result is None or result is not event.get_extra("_qd_llm_result"):
+        adapter = getattr(self, "tts_adapter", None)
+        if result is None or result is not event.get_extra("_qd_llm_result") or adapter is None:
             return
-        reverted = tts.settle(result, voice=decision.voice_mode == "voice",
-                              original=event.get_extra("_qd_llm_components") or [])
+        # 没装通用 TTS 时不动结果类型：别的插件改标普通消息另有用意。
+        if adapter.plugin() is None:
+            return
+        text_only = decision.voice_mode == "text" and self._tts() is not None
+        reverted = adapter.settle(result, voice=not text_only, original=event.get_extra("_qd_llm_components") or [])
         if reverted:
-            tts.drop_send_fallback(event, event.get_extra("_qd_send_before_tts"))
+            adapter.drop_send_fallback(event, event.get_extra("_qd_send_before_tts"))
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent):
