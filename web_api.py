@@ -22,9 +22,10 @@ from .config_util import (
     OPTION_EFFECTS,
     PluginSettings,
     default_decision_questions,
+    default_graph,
     default_questions,
     load_questions,
-    optional_questions,
+    voice_questions,
 )
 from .decision_engine import ask_decision, evaluate_post_reply, preview_workflow
 from .decision_tools import TOOLS
@@ -125,13 +126,7 @@ def plugin_fields(plugin_id: str) -> tuple[dict, ...]:
 
 def v8_default_questions() -> list[dict]:
     """判断配置页「恢复默认问题」使用的完整默认问题，已转换为选项动作格式。"""
-    questions, _ = migrate_actions(default_questions())
-    return [q.to_dict() for q in questions]
-
-
-def plugin_question_pool() -> dict[str, dict]:
-    """外部插件可提供的题：默认问题加上只在「外部插件」页加入的可选题。"""
-    return {q["id"]: q for q in [*v8_default_questions(), *(q.to_dict() for q in optional_questions())]}
+    return [q.to_dict() for q in default_graph()]
 
 
 def validate_setting(field: dict, value):
@@ -328,6 +323,7 @@ class WebApiMixin:
                         trigger_event=item.get("trigger_event") or ("silence_elapsed" if scene.endswith("_proactive") else "message_received"),
                         timer_roots=set(snapshot["timer_roots"]) if snapshot.get("timer_roots") is not None else None,
                         evaluation_time=snapshot.get("evaluated_at"),
+                        voice_available=getattr(self, "_voice_available", lambda _scene: False)(scene),
                     )
                     post = None
                     if result.post_plan and item.get("reply_text"):
@@ -377,6 +373,7 @@ class WebApiMixin:
         if version in (7, 8) or settings.workflow_version in (5, 6) or referenced:
             questions, migration_warning = migrate_actions(questions)
             defaults, _ = migrate_actions(defaults)
+            defaults = [*defaults, *voice_questions()]
             for obsolete in ("roles", "effects", "tools"):
                 payload.pop(obsolete)
             payload.update(version=8 if referenced else 7, workflow_version=6 if referenced else 5,
@@ -412,7 +409,9 @@ class WebApiMixin:
             {"version": 6 if version == 8 else 5 if version == 7 else 4, "questions": payload.get("decision_questions")}, strict=True)
         if error:
             return error_response(error, status_code=400)
-        return json_response(preview_workflow(settings, payload["scene"], choices, trigger_event=trigger_event))
+        voice = getattr(self, "_voice_available", lambda _scene: False)(payload["scene"])
+        return json_response(preview_workflow(settings, payload["scene"], choices, trigger_event=trigger_event,
+                                              voice_available=voice))
 
     async def web_decision_config(self):
         if request.method == "GET":
@@ -596,7 +595,7 @@ class WebApiMixin:
         return status.to_dict() if hasattr(status, "to_dict") else dict(vars(status))
 
     def _external_plugins_payload(self) -> dict:
-        defaults = plugin_question_pool()
+        defaults = {q["id"]: q for q in v8_default_questions()}
         plugins = []
         for plugin in EXTERNAL_PLUGINS.values():
             status = self._plugin_status(plugin)

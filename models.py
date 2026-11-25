@@ -271,6 +271,8 @@ class DecisionResult:
     followup_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
     reply_sources: list[str] = field(default_factory=list)
     context_fields: dict[str, Any] = field(default_factory=dict)
+    # 判断给出的发送方式："voice" 转语音、"text" 只发文字；空表示交给通用 TTS 自己的概率。
+    voice_mode: str = ""
     # 通用 TTS 合成时叠加的语气；空表示沿用引擎设置。
     voice_tone: str = ""
     voice_sent: bool = False

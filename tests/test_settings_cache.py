@@ -50,6 +50,8 @@ class SettingsCacheTests(unittest.IsolatedAsyncioTestCase):
     def test_unchanged_config_is_parsed_once(self) -> None:
         for raw in (saved_text(), SCHEMA["decision_questions"]["default"], None, json.loads(saved_text())):
             with self.subTest(kind=type(raw).__name__), self.count_builds() as build:
+                # 保存的图与默认图文本相同时会直接命中缓存；每种写法单独计数。
+                self.plugin.__dict__.pop("_settings_cache", None)
                 self.plugin.config["decision_questions"] = raw
                 first = self.plugin.settings
                 for _ in range(5):

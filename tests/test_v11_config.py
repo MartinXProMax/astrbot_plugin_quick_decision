@@ -129,7 +129,7 @@ from astrbot_plugin_quick_decision.config_util import (
     DEFAULT_SHORT_CRITERIA,
     DEFAULT_SHORT_SESSION_HINT,
     PluginSettings,
-    default_decision_questions, default_questions, load_questions,
+    default_decision_questions, default_graph, default_questions, load_questions,
     dump_decision_questions,
     parse_decision_questions,
 )
@@ -176,15 +176,17 @@ class DecisionConfigTests(unittest.TestCase):
         self.assertTrue(schema["decision_questions"]["editor_mode"])
         parsed_schema, warning = load_questions(schema["decision_questions"]["default"], strict=True)
         self.assertIsNone(warning)
-        self.assertEqual([q.to_dict() for q in parsed_schema], [q.to_dict() for q in default_questions()])
+        # 安装默认值与「恢复默认问题」相同，都是选项动作格式，含是否用语音和朗读语气。
+        self.assertEqual([q.to_dict() for q in parsed_schema], [q.to_dict() for q in default_graph()])
+        self.assertEqual([q.id for q in parsed_schema][-2:], ["use_voice", "voice_tone"])
         question = next(q for q in parsed_schema if q.id == "length")
         self.assertEqual(question.id, "length")
         self.assertEqual(question.instructions, DEFAULT_LENGTH_INSTRUCTIONS)
         by_id = {option.id: option for option in question.options}
         self.assertEqual(by_id["short"].criteria, DEFAULT_SHORT_CRITERIA)
-        self.assertEqual(by_id["short"].session_hint, DEFAULT_SHORT_SESSION_HINT)
+        self.assertIn({"tool": "add_context", "text": DEFAULT_SHORT_SESSION_HINT}, question.actions["short"])
         self.assertEqual(by_id["long"].criteria, DEFAULT_LONG_CRITERIA)
-        self.assertEqual(by_id["long"].session_hint, DEFAULT_LONG_SESSION_HINT)
+        self.assertIn({"tool": "add_context", "text": DEFAULT_LONG_SESSION_HINT}, question.actions["long"])
 
     def test_missing_or_blank_questions_use_default(self) -> None:
         for value in (None, "", "  ", "\n"):

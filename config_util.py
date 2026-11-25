@@ -18,7 +18,7 @@ from .models import (
     DecisionQuestion,
     DecisionQuestionOption,
 )
-from .workflow_actions import WORKFLOW_EVENTS, validate_actions
+from .workflow_actions import WORKFLOW_EVENTS, migrate_actions, validate_actions
 
 ACTION_CRITERIA_GROUP = {
     "none": "现在不适合发言，保持沉默",
@@ -262,7 +262,12 @@ def default_questions(legacy=None):
     return migrate_target_gate(questions)[0]
 
 
-VOICE_TONE_PROMPT = "如果这轮回复会转成语音，用什么语气朗读最贴合回复内容和当前气氛？拿不准时选 plain。"
+USE_VOICE_PROMPT = (
+    "这轮回复适合用语音发出吗？简短、口语化、带情绪的回复适合语音；"
+    "需要代码、链接、列表、数字细节或较长说明时选否。"
+)
+VOICE_STYLE_HINT = "本轮正文会转成语音发送：请写口语化、适合朗读的句子，不要使用列表、表格、代码、链接或颜文字。"
+VOICE_TONE_PROMPT = "这轮回复转成语音时，用什么语气朗读最贴合回复内容和当前气氛？拿不准时选 plain。"
 # (选项, 判断标准, 交给通用 TTS 的语气词)；plain 沿用语音引擎自带的语气。
 VOICE_TONES = (
     ("plain", "平静自然，沿用语音引擎默认的语气", ""),
@@ -274,27 +279,47 @@ VOICE_TONES = (
 )
 
 
-def optional_questions() -> list[DecisionQuestion]:
-    """「外部插件」页可以加入、但不在「恢复默认问题」里的题，只对装了对应插件的用户有用。"""
-    actions = {
+def voice_questions() -> list[DecisionQuestion]:
+    """是否用语音及朗读语气。由判断决定是否转语音，不看通用 TTS 的触发概率。
+
+    语音不可用（未装通用 TTS、适配停用或暂停）时，用到语音动作的题在运行时跳过，不多问一次。
+    """
+    tones = {
         key: [{"tool": "voice_tone", "text": tone}, {"tool": "add_context", "label": "语气", "text": tone}]
         for key, _, tone in VOICE_TONES
         if tone
     }
     return [
         DecisionQuestion(
-            "voice_tone",
-            "choice",
-            VOICE_TONE_PROMPT,
-            options=[DecisionQuestionOption(key, criteria) for key, criteria, _ in VOICE_TONES],
+            "use_voice",
+            "boolean",
+            USE_VOICE_PROMPT,
+            use_threshold=True,
             triggers=[
                 {"question": "action", "option": "reply", "ask_with_parent": True},
                 {"question": "idle_action", "option": "proactive", "ask_with_parent": True},
             ],
-            actions=actions,
+            actions={
+                "true": [{"tool": "voice_reply"}, {"tool": "add_context", "text": VOICE_STYLE_HINT}],
+                "false": [{"tool": "text_reply"}],
+            },
+        ),
+        DecisionQuestion(
+            "voice_tone",
+            "choice",
+            VOICE_TONE_PROMPT,
+            options=[DecisionQuestionOption(key, criteria) for key, criteria, _ in VOICE_TONES],
+            triggers=[{"question": "use_voice", "option": "true", "ask_with_parent": True}],
+            actions=tones,
             default_option="plain",
-        )
+        ),
     ]
+
+
+def default_graph() -> list[DecisionQuestion]:
+    """「恢复默认问题」、全新安装和配置缺失时使用的判断图（选项动作格式）。"""
+    questions, _ = migrate_actions(default_questions())
+    return [*questions, *voice_questions()]
 
 
 def dump_decision_questions(questions: list[DecisionQuestion]) -> str:

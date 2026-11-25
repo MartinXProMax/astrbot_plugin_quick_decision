@@ -161,6 +161,14 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             return None
         return adapter
 
+    def _voice_available(self, scene: str) -> bool:
+        """本轮能否转语音；不能时跳过「是否用语音」等用到语音动作的题。"""
+        tts = self._tts()
+        if tts is None or (scene.endswith("_proactive") and not self.settings.tts_proactive_voice):
+            return False
+        status = tts.status()
+        return status.available and status.runtime_enabled
+
     async def terminate(self) -> None:
         if self._silence_task and not self._silence_task.done():
             self._silence_task.cancel()
@@ -315,6 +323,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 at_or_quoted=at_or_quoted,
                 memes=memes,
                 umo=profile.umo,
+                voice_available=self._voice_available(scene),
             )
             if not runtime.pending:
                 break
@@ -488,11 +497,13 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         self._schedule_post_decision(result, text, profile.umo, platform_name)
 
         # 主动发言直接发给平台，不经过官方装饰阶段，通用 TTS 的钩子碰不到，这里替它转语音。
-        tts = self._tts() if settings.tts_proactive_voice else None
+        # 判断给出发送方式时以判断为准：只发文字就不调用它，发语音则不看它的触发概率。
+        mode = result.voice_mode
+        tts = self._tts() if settings.tts_proactive_voice and mode != "text" else None
         voice = None
         if tts is not None:
             async def voice(body):
-                return await tts.voice_record(profile.umo, body, tone=result.voice_tone)
+                return await tts.voice_record(profile.umo, body, tone=result.voice_tone, force=mode == "voice")
 
         sent_texts: list[str] = []
         try:
@@ -588,6 +599,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             "session_hints": result.session_hints,
             "use_meme": result.use_meme,
             "meme_id": result.meme_id,
+            "voice_mode": result.voice_mode,
             "voice_tone": result.voice_tone,
             "target_message_id": result.target_message_id,
             "duration_ms": result.duration_ms,
@@ -753,6 +765,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             last_activity=runtime.last_activity,
             trigger_event=trigger_event,
             timer_roots=timer_roots,
+            voice_available=self._voice_available(scene),
         )
         result.dry_run = settings.dry_run
         runtime.last_decision = result
@@ -873,8 +886,22 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if is_llm:
             event.set_extra("_qd_llm_result", result)
             event.set_extra("_qd_llm_components", list(result.chain))
-            if decision.voice_tone and (tts := self._tts()) is not None:
-                await tts.voice_event(event, decision.voice_tone)
+            mode = decision.voice_mode
+            # 判断要发语音时不看通用 TTS 的触发概率；只给了语气时仍由它按概率决定。
+            if (mode == "voice" or (not mode and decision.voice_tone)) and (tts := self._tts()) is not None:
+                await tts.voice_event(event, decision.voice_tone, force=mode == "voice")
+
+    # 晚于通用 TTS（priority=0）执行：它按自己的概率转出的语音或改标的结果类型，按本轮判断改回来。
+    @filter.on_decorating_result(priority=-10)
+    async def settle_voice_choice(self, event: AstrMessageEvent):
+        decision = self._pipeline_decision(event)
+        if decision is None or not decision.voice_mode or event.get_extra("_qd_streaming"):
+            return
+        result = event.get_result()
+        tts = self._tts()
+        if tts is None or result is None or result is not event.get_extra("_qd_llm_result"):
+            return
+        tts.settle(result, voice=decision.voice_mode == "voice", original=event.get_extra("_qd_llm_components") or [])
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent):

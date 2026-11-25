@@ -45,6 +45,8 @@ const ACTION_UI = {
   add_context: { icon: "context", group: "chat" },
   quote_message: { icon: "quote", group: "send" },
   send_meme: { icon: "image", group: "send" },
+  voice_reply: { icon: "voice", group: "send" },
+  text_reply: { icon: "mute", group: "send" },
   voice_tone: { icon: "voice", group: "send", text: "语气", placeholder: "如 开心、温柔；Azure 引擎填 cheerful 等风格名" },
 };
 const WHEN_LABELS = { on_match: "判断后立即发送", after_send: "正文发送后配图" };
@@ -69,6 +71,7 @@ const ICONS = {
   quote: '<path d="M6 7h5v5c0 3-2 5-5 6"/><path d="M14 7h5v5c0 3-2 5-5 6"/>',
   zap: '<path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z"/>',
   voice: '<path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/>',
+  mute: '<path d="M11 5 6 9H3v6h3l5 4z"/><path d="m16 9 6 6M22 9l-6 6"/>',
   close: '<path d="M6 6l12 12M18 6 6 18"/>',
 };
 
@@ -1402,6 +1405,10 @@ function actionNotes(q, ref, action) {
     if (all.length > 1) notes.push(`多个引用同时命中时，采用排在最后的「${qName(all[all.length - 1].q)}」`);
   } else if (action.tool === "send_meme") {
     notes.push(action.when === "after_send" ? "正文确认发送后再发，本轮不发言就跳过" : "不等正文，本轮不发言也会发送");
+  } else if (action.tool === "voice_reply") {
+    notes.push("不看通用 TTS 的触发概率；它的字数上限、跳过规则、/tts_off 和会话禁音仍然生效");
+  } else if (action.tool === "text_reply") {
+    notes.push("通用 TTS 按自己的概率转了语音时，会改回文字发送");
   } else if (action.tool === "voice_tone") {
     notes.push("通用 TTS 合成本轮语音时叠加这个语气：MiMo 引擎追加在原有风格后，Azure 引擎替换原有风格，其他引擎忽略");
   }
@@ -2437,7 +2444,7 @@ function renderPluginDefaults(plugin) {
       icon("plus"), missing.length === rows.length ? "加入判断配置" : `加入缺少的 ${missing.length} 道题`);
   }
   return pluginPart("自带默认问题",
-    "加入后到「判断配置」检查并保存；判断配置中已有同 ID 的题不会被覆盖。",
+    "与「恢复默认问题」里的同名题相同。加入后到「判断配置」检查并保存；判断配置中已有同 ID 的题不会被覆盖。",
     h("ol", { class: "plugin-questions" }, rows),
     h("div", { class: "plugin-foot" }, action));
 }

@@ -2,10 +2,12 @@
 
 通用 TTS 在 on_decorating_result 里把一条模型回复的全部文字换成一条语音，是否转换由它自己的
 规则决定：插件总开关、/tts_off、AstrBot「启用 TTS」与会话开关、触发概率、字数上限、跳过规则、
-会话绑定的引擎。它没有提供给其他插件调用的接口，所以本适配器只借用它的钩子，不另写一套规则：
+会话绑定的引擎。它没有提供给其他插件调用的接口，所以本适配器借用它的钩子，不另写一套规则：
 
-- 主动发言不经过官方装饰阶段，这里用一个只带会话和正文的事件调用它的 tts_hook，取回生成的语音；
-- 判断给出本轮语气时，替它把会话引擎换成叠加了语气的副本，再执行同一个钩子。
+- 判断要求发语音时，以触发概率 100% 执行它的 tts_hook；其余规则照常生效；
+- 判断要求只发文字时，它按自己的概率转出的语音会被改回原文；
+- 主动发言不经过官方装饰阶段，这里用一个只带会话和正文的事件调用它的钩子，取回生成的语音；
+- 判断给出本轮语气时，把会话引擎换成叠加了语气的副本。
 
 以上依赖它 1.4.x 的方法名（tts_hook、_get_engine_for_session）和引擎属性（style、style_prompt）。
 对不上时退回它的默认行为或只发文字，不中断本轮发送。
@@ -34,6 +36,7 @@ UNAVAILABLE_HINT = (
     "需要语音时请在插件市场安装 CyrilPeng/astrbot_plugin_universal_tts。"
 )
 _LLM_RESULT = getattr(ResultContentType, "LLM_RESULT", "llm_result")
+_GENERAL_RESULT = getattr(ResultContentType, "GENERAL_RESULT", "general_result")
 
 
 def _is_record(component) -> bool:
@@ -82,18 +85,28 @@ def toned_engine(engine, tone: str):
     return toned
 
 
-class _TonedPlugin:
-    """把对通用 TTS 实例的读写原样转过去，只把会话引擎换成带语气的副本。"""
+class _PluginView:
+    """把对通用 TTS 实例的读写原样转过去，只替换本轮要改的两处：
 
-    def __init__(self, instance, tone: str) -> None:
+    - force：触发概率按 100% 计，是否转语音已由判断决定；
+    - tone：会话引擎换成带语气的副本。
+    """
+
+    def __init__(self, instance, tone: str, force: bool) -> None:
         object.__setattr__(self, "_instance", instance)
         object.__setattr__(self, "_tone", tone)
+        object.__setattr__(self, "_force", force)
 
     def __getattr__(self, name):
         return getattr(self._instance, name)
 
     def __setattr__(self, name, value) -> None:
         setattr(self._instance, name, value)
+
+    @property
+    def config(self):
+        config = self._instance.config
+        return {**config, "tts_probability": 100} if self._force else config
 
     def _get_engine_for_session(self, session_id):
         return toned_engine(self._instance._get_engine_for_session(session_id), self._tone)
@@ -272,34 +285,67 @@ class UniversalTTSAdapter:
             status.message = "通用 TTS 已用 /tts_off 暂停，恢复前回复按文字发送"
         return status
 
-    async def _run_hook(self, instance, event, tone: str) -> None:
-        target = _TonedPlugin(instance, tone) if tone else instance
+    async def _run_hook(self, instance, event, tone: str, force: bool) -> None:
+        target = _PluginView(instance, tone, force) if tone or force else instance
         await type(instance).tts_hook(target, event)
 
-    async def voice_event(self, event, tone: str) -> bool:
-        """被动回复：赶在通用 TTS 自己的钩子之前，用本轮语气替它合成一次。
+    async def voice_event(self, event, tone: str = "", *, force: bool = False) -> bool:
+        """被动回复：赶在通用 TTS 自己的钩子之前，按本轮判断替它合成一次。
 
-        它跳过时会把结果标成普通消息，随后它自己的钩子不会再合成；合成失败则交给它的钩子重试默认语气。
+        它按规则跳过时会把结果标成普通消息，随后它自己的钩子不会再合成；合成失败则交给它的钩子重试。
         """
         instance = self.plugin()
-        if instance is None or not tone:
+        if instance is None or not (tone or force):
             return False
         try:
-            await self._run_hook(instance, event, tone)
+            await self._run_hook(instance, event, tone, force)
         except Exception:  # noqa: BLE001
-            logger.exception("调用通用 TTS 合成带语气的语音失败，交还给通用 TTS 默认处理")
+            logger.exception("调用通用 TTS 合成语音失败，交还给通用 TTS 默认处理")
             return False
         result = event.get_result()
         return has_record(getattr(result, "chain", None))
 
-    async def voice_record(self, umo: str, text: str, *, tone: str = ""):
-        """主动发言：按通用 TTS 的规则把整段正文转成一条语音；不转或失败时返回 None。"""
+    def settle(self, result, *, voice: bool, original) -> None:
+        """所有装饰钩子跑完后落实本轮判断，消除通用 TTS 按自己规则留下的影响。
+
+        - 判断只发文字、它却按概率转了语音：把语音换回原来的文字组件；
+        - 它跳过时会把结果改标为普通消息，这会关掉 AstrBot 的分段回复，这里改回模型结果。
+          但内置 TTS 选了提供商时，链上还有文字就保持普通消息，免得内置 TTS 再转语音。
+        """
+        chain = list(getattr(result, "chain", None) or ())
+        if not voice and has_record(chain):
+            texts = [c for c in original if isinstance(c, Plain)]
+            rebuilt, restored = [], False
+            for comp in chain:
+                if _is_record(comp) and not any(comp is item for item in original):
+                    if not restored:
+                        rebuilt.extend(texts)
+                        restored = True
+                    continue
+                rebuilt.append(comp)
+            result.chain = chain = rebuilt
+            logger.info("通用 TTS 按自己的概率转了语音，本轮判断为只发文字，已改回文字")
+        setter = getattr(result, "set_result_content_type", None)
+        if not callable(setter):
+            return
+        has_text = any(isinstance(c, Plain) and (c.text or "").strip() for c in chain)
+        if has_text and self._core_provider(self._astrbot_tts_settings()):
+            if result.is_llm_result():
+                setter(_GENERAL_RESULT)
+        elif not result.is_llm_result():
+            setter(_LLM_RESULT)
+
+    async def voice_record(self, umo: str, text: str, *, tone: str = "", force: bool = False):
+        """主动发言：按通用 TTS 的规则把整段正文转成一条语音；不转或失败时返回 None。
+
+        force 时不看它的触发概率，是否转语音已由判断决定。
+        """
         instance = self.plugin()
         if instance is None or not (text or "").strip():
             return None
         event = _DetachedEvent(umo, _DetachedResult([Plain(text)]))
         try:
-            await self._run_hook(instance, event, tone)
+            await self._run_hook(instance, event, tone, force)
         except Exception:  # noqa: BLE001
             logger.exception("调用通用 TTS 合成主动发言语音失败，改发文字：%s", umo)
             return None

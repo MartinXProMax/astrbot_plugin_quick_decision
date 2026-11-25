@@ -994,7 +994,8 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(initial["version"], 8)
             self.assertTrue(all("role" not in q for q in initial["default_questions"]))
             self.assertEqual(set(initial["actions"]),
-                             {"request_reply", "add_context", "quote_message", "send_meme", "voice_tone"})
+                             {"request_reply", "add_context", "quote_message", "send_meme",
+                              "voice_reply", "text_reply", "voice_tone"})
             request.method = "POST"
             request.json.return_value = initial
             saved = await self.plugin.web_decision_config()

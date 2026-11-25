@@ -1,4 +1,7 @@
-"""对接通用 TTS 的隔离测试：语音替换正文后的记录、主动发言转语音、判断语气。不访问网络，不发 QQ。"""
+"""对接通用 TTS 的隔离测试：由判断决定发语音还是文字、语音替换正文后的记录、主动发言转语音、朗读语气。
+
+不访问网络，不发 QQ。
+"""
 
 # ruff: noqa: E402, I001
 
@@ -19,11 +22,17 @@ from test_official_inbound_handoff import FakeEvent, _make_plugin, _profile
 from test_decision_engine import DecisionBooleanAnswer, choice, message
 from astrbot.api.message_components import Plain
 from astrbot_plugin_quick_decision import reply_generator, web_api
-from astrbot_plugin_quick_decision.config_util import PluginSettings, load_questions, optional_questions
-from astrbot_plugin_quick_decision.decision_engine import ask_decision
+from astrbot_plugin_quick_decision.config_util import PluginSettings, default_graph, load_questions
+from astrbot_plugin_quick_decision.decision_engine import ask_decision, preview_workflow
 from astrbot_plugin_quick_decision.models import DecisionResult
 from astrbot_plugin_quick_decision.reply_generator import send_decision_message, session_hint_text
-from astrbot_plugin_quick_decision.tts_adapter import UNIVERSAL_TTS_STAR_NAME, UniversalTTSAdapter, toned_engine
+from astrbot_plugin_quick_decision.tts_adapter import (
+    _GENERAL_RESULT,
+    _LLM_RESULT,
+    UNIVERSAL_TTS_STAR_NAME,
+    UniversalTTSAdapter,
+    toned_engine,
+)
 
 UMO = "aiocqhttp:GroupMessage:100"
 
@@ -44,14 +53,14 @@ class MessageChain:
 
 
 class Result:
-    """AstrBot MessageEventResult 中通用 TTS 会用到的部分。"""
+    """AstrBot MessageEventResult 中通用 TTS 和快速决策会用到的部分。"""
 
     def __init__(self, chain) -> None:
         self.chain = chain
-        self.kind = "llm"
+        self.kind = _LLM_RESULT
 
     def is_llm_result(self) -> bool:
-        return self.kind == "llm"
+        return self.kind == _LLM_RESULT
 
     def set_result_content_type(self, kind) -> None:
         self.kind = kind
@@ -92,6 +101,7 @@ class FakeUniversalTTS:
 
     暂停或概率落空时把结果标成普通消息并返回；只处理模型结果；合并全部文字，用会话引擎合成，
     第一段文字换成一条语音、其余文字删掉；再包一层 event.send，语音发送抛错时改发原始组件。
+    概率介于 0 和 100 之间时用 dice 代替随机数。
     """
 
     def __init__(self, engine, *, probability: int = 100) -> None:
@@ -101,13 +111,14 @@ class FakeUniversalTTS:
         self._session_bindings: dict[str, str] = {}
         self._tts_audio_text: dict[str, str] = {}
         self.hook_calls = 0
+        self.dice = 100
 
     def _get_engine_for_session(self, session_id):
         return None if self._session_bindings.get(session_id) == "__disabled__" else self._engine
 
     def _suppress_core_tts(self, result) -> None:
         if result.is_llm_result():
-            result.set_result_content_type("general")
+            result.set_result_content_type(_GENERAL_RESULT)
 
     def _install_send_fallback(self, event, result, original_chain) -> None:
         original = event.send
@@ -124,7 +135,8 @@ class FakeUniversalTTS:
     async def tts_hook(self, event):
         self.hook_calls += 1
         result = event.get_result()
-        if not self._runtime_enabled or self.config["tts_probability"] <= 0:
+        probability = self.config["tts_probability"]
+        if not self._runtime_enabled or probability <= 0 or (probability < 100 and self.dice > probability):
             self._suppress_core_tts(result)
             return
         if not result or not result.chain or not result.is_llm_result():
@@ -192,6 +204,11 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
                    web_api.EXTERNAL_PLUGINS["universal_tts"].details(both.to_dict())}
         self.assertIn("edge_tts", details["AstrBot 内置 TTS 提供商"])
         self.assertIn("各发一遍", details["注意"])
+        self.assertIn("设为 0", details["建议"])
+
+        universal.config["tts_probability"] = 0
+        quiet = UniversalTTSAdapter(tts_context(universal)).status().to_dict()
+        self.assertNotIn("建议", {row["label"] for row in web_api.EXTERNAL_PLUGINS["universal_tts"].details(quiet)})
 
         universal._runtime_enabled = False
         paused = UniversalTTSAdapter(tts_context(universal)).status()
@@ -217,6 +234,17 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(await adapter.voice_record(UMO, "失败时改发文字"))
         self.assertIsNone(await UniversalTTSAdapter(tts_context()).voice_record(UMO, "没装插件"))
 
+    async def test_forced_voice_ignores_probability_but_keeps_other_rules(self):
+        universal = FakeUniversalTTS(MimoEngine(), probability=0)
+        adapter = UniversalTTSAdapter(tts_context(universal))
+        self.assertTrue(is_record(await adapter.voice_record(UMO, "判断说用语音", force=True)))
+        self.assertEqual(universal.config["tts_probability"], 0, "不改通用 TTS 自己的配置")
+        universal._runtime_enabled = False
+        self.assertIsNone(await adapter.voice_record(UMO, "/tts_off 仍然有效", force=True))
+        universal._runtime_enabled = True
+        universal._session_bindings[UMO] = "__disabled__"
+        self.assertIsNone(await adapter.voice_record(UMO, "会话禁音仍然有效", force=True))
+
     async def test_tone_uses_a_styled_copy_and_shares_the_client(self):
         engine = MimoEngine(style="温柔，慵懒")
         universal = FakeUniversalTTS(engine)
@@ -237,6 +265,24 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         plain = SimpleNamespace(instance_name="openai")
         self.assertIs(toned_engine(plain, "开心"), plain)
         self.assertIs(toned_engine(azure, "  "), azure)
+
+    def test_settle_reverts_unwanted_voice_and_restores_result_type(self):
+        adapter = UniversalTTSAdapter(tts_context(FakeUniversalTTS(MimoEngine())))
+        text, image = Plain("只发文字"), SimpleNamespace(kind="image")
+        result = Result([Record("/tmp/a.wav"), image])
+        adapter.settle(result, voice=False, original=[text, image])
+        self.assertEqual(result.chain, [text, image])
+        self.assertTrue(result.is_llm_result())
+
+        skipped = Result([text])
+        skipped.kind = _GENERAL_RESULT
+        adapter.settle(skipped, voice=True, original=[text])
+        self.assertTrue(skipped.is_llm_result(), "跳过后改回模型结果，AstrBot 分段回复照常生效")
+
+        core = UniversalTTSAdapter(tts_context(FakeUniversalTTS(MimoEngine()), provider_id="edge_tts"))
+        guarded = Result([text])
+        core.settle(guarded, voice=False, original=[text])
+        self.assertFalse(guarded.is_llm_result(), "内置 TTS 选着提供商时保持普通消息，免得它再转语音")
 
 
 class ProactiveVoiceTests(unittest.IsolatedAsyncioTestCase):
@@ -303,36 +349,50 @@ class ProactiveVoiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         self.assertFalse(any(is_record(c) for chain in self.sent for c in chain))
 
-    async def test_plugin_uses_voice_for_proactive_rounds_unless_turned_off(self):
+    async def test_plugin_follows_the_voice_decision_for_proactive_rounds(self):
+        # 通用 TTS 的概率设为 0：是否转语音只看判断。
+        self.universal.config["tts_probability"] = 0
         with tempfile.TemporaryDirectory() as tmp:
             plugin, main = _make_plugin(tmp)
             plugin.context = self.context
             plugin.tts_adapter = self.adapter
             profile = _profile(FakeEvent(umo=UMO))
+
+            async def run(**decision):
+                await plugin._self_generate_and_send(
+                    profile, DecisionResult(action="proactive", scene="group_proactive", **decision), None)
+                return self.sent[-1][0]
+
             with patch.object(main, "generate_text", AsyncMock(return_value="有人在吗")):
-                await plugin._self_generate_and_send(profile, DecisionResult(action="proactive", scene="group_proactive"), None)
-                self.assertTrue(is_record(self.sent[-1][0]))
+                self.assertTrue(is_record(await run(voice_mode="voice")))
                 self.assertEqual(plugin.sessions.recent_messages(UMO, 5)[-1].text, "有人在吗")
+                self.assertEqual((await run(voice_mode="text")).text, "有人在吗")
+                self.assertEqual((await run()).text, "有人在吗", "没有判断时按通用 TTS 的概率")
+
+                self.universal.config["tts_probability"] = 100
+                calls = self.universal.hook_calls
+                self.assertEqual((await run(voice_mode="text")).text, "有人在吗")
+                self.assertEqual(self.universal.hook_calls, calls, "只发文字时不调用通用 TTS")
 
                 plugin.config["external_plugins"] = {"universal_tts": {"proactive_voice": False}}
-                await plugin._self_generate_and_send(profile, DecisionResult(action="proactive", scene="group_proactive"), None)
-                self.assertEqual(self.sent[-1][0].text, "有人在吗")
-
+                self.assertEqual((await run(voice_mode="voice")).text, "有人在吗")
                 plugin.config["external_plugins"] = {"universal_tts": {"enabled": False}}
-                await plugin._self_generate_and_send(profile, DecisionResult(action="proactive", scene="group_proactive"), None)
-                self.assertFalse(is_record(self.sent[-1][0]))
+                self.assertFalse(is_record(await run(voice_mode="voice")))
 
 
 class PassiveVoiceTests(unittest.IsolatedAsyncioTestCase):
-    """官方流水线：本插件的装饰钩子先跑，随后通用 TTS 的钩子，再由 RespondStage 调 event.send。"""
+    """官方流水线：本插件的装饰钩子先跑，随后通用 TTS，再是本插件的收尾钩子，最后 RespondStage 调 event.send。"""
 
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.plugin, self.main = _make_plugin(self.tmp.name)
         self.engine = MimoEngine()
         self.universal = FakeUniversalTTS(self.engine)
+        self.use_context()
+
+    def use_context(self, **extra):
         context = tts_context(self.universal, conversation_manager=self.plugin.context.conversation_manager,
-                              register_web_api=lambda *a, **k: None)
+                              register_web_api=lambda *a, **k: None, **extra)
         self.plugin.context = context
         self.plugin.tts_adapter = UniversalTTSAdapter(context)
 
@@ -349,6 +409,8 @@ class PassiveVoiceTests(unittest.IsolatedAsyncioTestCase):
         event.set_result(result)
         await self.plugin.on_decorating_result(event)
         await self.universal.tts_hook(event)
+        await self.plugin.settle_voice_choice(event)
+        self.final_kind = result.kind
         await event.send(result)
         await self.plugin.after_message_sent(event)
         return event, self.plugin.sessions.recent_logs()[0]
@@ -385,50 +447,122 @@ class PassiveVoiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(row["reply_sent"])
         self.assertNotIn("reply_voice", row)
 
-    async def test_tone_from_decision_is_used_once(self):
+    async def test_voice_decision_ignores_universal_probability(self):
+        self.universal.config["tts_probability"] = 0
+        event, row = await self.round(DecisionResult(action="reply", voice_mode="voice", voice_tone="开心"))
+        self.assertTrue(is_record(event._sends[0].chain[0]))
+        self.assertTrue(row["reply_voice"])
+        self.assertEqual((row["voice_mode"], row["voice_tone"]), ("voice", "开心"))
+        self.assertEqual([style for style, _, _ in self.engine.spoken], ["温柔 开心"])
+        self.assertEqual(self.final_kind, _LLM_RESULT)
+
+    async def test_text_decision_undoes_probability_voice(self):
+        event, row = await self.round(DecisionResult(action="reply", voice_mode="text", target_message_id="t1"))
+        self.assertEqual([type(c).__name__ for c in event._sends[0].chain], ["Reply", "Plain"])
+        self.assertEqual(event._sends[0].chain[1].text, "今天天气不错")
+        self.assertTrue(row["reply_sent"])
+        self.assertNotIn("reply_voice", row)
+        self.assertEqual(self.final_kind, _LLM_RESULT)
+
+    async def test_text_decision_keeps_segmenting_when_universal_skips(self):
+        self.universal.config["tts_probability"] = 0
+        await self.round(DecisionResult(action="reply", voice_mode="text"))
+        self.assertEqual(self.final_kind, _LLM_RESULT)
+        self.use_context(provider_id="edge_tts")
+        await self.round(DecisionResult(action="reply", voice_mode="text"))
+        self.assertEqual(self.final_kind, _GENERAL_RESULT, "内置 TTS 选着提供商时不让它转语音")
+
+    async def test_voice_decision_still_respects_universal_rules(self):
+        self.universal._runtime_enabled = False
+        event, row = await self.round(DecisionResult(action="reply", voice_mode="voice"))
+        self.assertEqual([type(c).__name__ for c in event._sends[0].chain], ["Plain"])
+        self.assertNotIn("reply_voice", row)
+        self.assertEqual(self.engine.spoken, [])
+
+    async def test_tone_without_voice_decision_is_used_once(self):
         _, row = await self.round(DecisionResult(action="reply", voice_tone="开心"))
         self.assertEqual([style for style, _, _ in self.engine.spoken], ["温柔 开心"])
         self.assertEqual(self.engine.style, "温柔")
         self.assertTrue(row["reply_voice"])
-        self.assertEqual(row["voice_tone"], "开心")
 
-    async def test_tone_ignored_when_adapter_disabled(self):
+    async def test_adapter_disabled_leaves_universal_alone(self):
         self.plugin.config["external_plugins"] = {"universal_tts": {"enabled": False}}
-        await self.round(DecisionResult(action="reply", voice_tone="开心"))
+        event, _ = await self.round(DecisionResult(action="reply", voice_mode="text", voice_tone="开心"))
         self.assertEqual([style for style, _, _ in self.engine.spoken], ["温柔"])
+        self.assertTrue(is_record(event._sends[0].chain[0]))
+
+    def test_voice_questions_need_a_usable_tts(self):
+        self.assertTrue(self.plugin._voice_available("group_passive"))
+        self.assertTrue(self.plugin._voice_available("group_proactive"))
+        self.plugin.config["external_plugins"] = {"universal_tts": {"proactive_voice": False}}
+        self.assertTrue(self.plugin._voice_available("group_passive"))
+        self.assertFalse(self.plugin._voice_available("group_proactive"))
+        self.plugin.config["external_plugins"] = {"universal_tts": {"enabled": False}}
+        self.assertFalse(self.plugin._voice_available("group_passive"))
+        self.plugin.config.pop("external_plugins")
+        self.universal._runtime_enabled = False
+        self.assertFalse(self.plugin._voice_available("group_passive"))
+        self.plugin.tts_adapter = UniversalTTSAdapter(tts_context())
+        self.assertFalse(self.plugin._voice_available("group_passive"))
 
 
-class VoiceToneQuestionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_answer_sets_tone_and_tells_the_reply_model(self):
-        speech = {"id": "talk", "type": "boolean", "instructions": "接话吗？",
-                  "triggers": [{"event": "message_received"}], "actions": {"true": [{"tool": "request_reply"}]}}
-        tone = optional_questions()[0].to_dict()
-        tone["triggers"] = [{"question": "talk", "option": "true", "ask_with_parent": True}]
-        graph = {"version": 6, "questions": [speech, tone]}
+class VoiceQuestionTests(unittest.IsolatedAsyncioTestCase):
+    def settings(self):
+        graph = {"version": 6, "questions": [q.to_dict() for q in default_graph()]}
         loaded, error = load_questions(graph, strict=True)
         self.assertIsNone(error)
-        settings = PluginSettings({"decision_questions": dict(graph, questions=[q.to_dict() for q in loaded])})
-        for picked, expected in (("happy", "开心"), ("plain", "")):
-            with self.subTest(picked):
-                judge = AsyncMock(return_value={"talk": DecisionBooleanAnswer(probability=1),
-                                                "voice_tone": choice(picked, **{picked: 0.9})})
-                result = await ask_decision(SimpleNamespace(decision=SimpleNamespace(ask=judge)), settings=settings,
-                                            scene="group_passive", is_private=False, messages=[message("m1")],
-                                            memes=[], at_or_quoted=False)
-                self.assertFalse(result.failed, result.error)
-                self.assertEqual(result.voice_tone, expected)
-                self.assertEqual("开心" in (session_hint_text(result) or ""), bool(expected))
+        return PluginSettings({"decision_questions": graph})
+
+    async def ask(self, settings, answers, *, voice_available=True):
+        judge = AsyncMock(return_value=answers)
+        result = await ask_decision(SimpleNamespace(decision=SimpleNamespace(ask=judge)), settings=settings,
+                                    scene="group_passive", is_private=False, messages=[message("m1")],
+                                    memes=[], at_or_quoted=True, voice_available=voice_available)
+        self.assertFalse(result.failed, result.error)
+        asked = {qid for call in judge.await_args_list for qid in call.args[0]} if judge.await_args_list else set()
+        return result, asked
+
+    async def test_default_graph_decides_voice_and_tone(self):
+        settings = self.settings()
+        base = {"action": choice("reply", reply=1), "address_message": DecisionBooleanAnswer(probability=0),
+                "length": choice("short", short=1), "use_meme": DecisionBooleanAnswer(probability=0)}
+        voiced, asked = await self.ask(settings, {**base, "use_voice": DecisionBooleanAnswer(probability=0.9),
+                                                  "voice_tone": choice("happy", happy=0.9)})
+        self.assertIn("use_voice", asked)
+        self.assertEqual((voiced.voice_mode, voiced.voice_tone), ("voice", "开心"))
+        hints = session_hint_text(voiced)
+        self.assertIn("适合朗读", hints)
+        self.assertIn("开心", hints)
+
+        texted, _ = await self.ask(settings, {**base, "use_voice": DecisionBooleanAnswer(probability=0.1),
+                                              "voice_tone": choice("happy", happy=0.9)})
+        self.assertEqual((texted.voice_mode, texted.voice_tone), ("text", ""))
+        self.assertNotIn("适合朗读", session_hint_text(texted) or "")
+
+    async def test_voice_questions_are_skipped_without_tts(self):
+        settings = self.settings()
+        answers = {"action": choice("reply", reply=1), "use_voice": DecisionBooleanAnswer(probability=1),
+                   "voice_tone": choice("happy", happy=1)}
+        result, asked = await self.ask(settings, answers, voice_available=False)
+        self.assertFalse(asked & {"use_voice", "voice_tone"})
+        self.assertEqual((result.voice_mode, result.voice_tone), ("", ""))
+
+        preview = preview_workflow(settings, "group_passive", {"action": "reply"}, voice_available=False)
+        self.assertFalse({"use_voice", "voice_tone"} & {q for b in preview["batches"] for q in b["asked"]})
+        preview = preview_workflow(settings, "group_passive", {"action": "reply"})
+        self.assertIn("use_voice", {q for b in preview["batches"] for q in b["asked"]})
 
     def test_tone_action_needs_text(self):
-        tone = optional_questions()[0].to_dict()
+        tone = next(q for q in default_graph() if q.id == "voice_tone").to_dict()
         tone["actions"]["happy"] = [{"tool": "voice_tone"}]
         tone["triggers"] = [{"event": "message_received"}]
         _, error = load_questions({"version": 6, "questions": [tone]}, strict=True)
         self.assertIn("设定语音语气", error)
 
-    def test_optional_question_is_offered_but_not_restored_by_default(self):
-        self.assertNotIn("voice_tone", {q["id"] for q in web_api.v8_default_questions()})
-        self.assertIn("voice_tone", web_api.plugin_question_pool())
+    def test_voice_questions_are_default_questions(self):
+        defaults = [q["id"] for q in web_api.v8_default_questions()]
+        self.assertEqual(defaults[-2:], ["use_voice", "voice_tone"])
+        self.assertEqual(web_api.EXTERNAL_PLUGINS["universal_tts"].default_questions, ("use_voice", "voice_tone"))
         self.assertTrue(PluginSettings({}).tts_proactive_voice)
         off = PluginSettings({"external_plugins": {"universal_tts": {"proactive_voice": False}}})
         self.assertFalse(off.tts_proactive_voice)

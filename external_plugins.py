@@ -60,13 +60,15 @@ def _tts_details(status: dict[str, Any]) -> list[dict[str, str]]:
     rows = [
         {"label": "当前引擎", "value": status.get("engine") or "未配置"},
         {"label": "合成", "value": "已用 /tts_off 暂停" if status.get("runtime_enabled") is False
-         else f"触发概率 {status.get('probability', 100)}%"},
+         else f"通用 TTS 触发概率 {status.get('probability', 100)}%（判断给出是否用语音时以判断为准）"},
         {"label": "AstrBot「启用 TTS」", "value": "已打开" if status.get("astrbot_tts_enabled") else "未打开（通用 TTS 不会合成）"},
         {"label": "AstrBot 内置 TTS 提供商",
          "value": f"{core}（通用 TTS 合成失败时会接手）" if core else "未选择"},
     ]
     if core and status.get("dual_output"):
         rows.append({"label": "注意", "value": "内置 TTS 开着「同时输出语音和文字」，由它接手的回复会语音、文字各发一遍"})
+    if status.get("probability", 0) > 0:
+        rows.append({"label": "建议", "value": "把通用 TTS 的触发概率设为 0：否则判断为只发文字的回复会先被它合成一次，再改回文字"})
     return rows
 
 
@@ -89,13 +91,15 @@ EXTERNAL_PLUGINS: dict[str, ExternalPlugin] = {
             id="universal_tts",
             name="通用 TTS",
             repo="CyrilPeng/astrbot_plugin_universal_tts",
-            summary="回复是否转成语音、用哪个引擎仍由通用 TTS 决定，语音会替换文字发出，不会再发一遍原文。"
-                    "快速决策让冷场和定时发言也走语音，可按判断结果切换朗读语气，并在语音送达后照常记录回复、补发表情。",
+            summary="每轮由判断决定正文发语音还是文字、用什么语气，不再按通用 TTS 的触发概率；"
+                    "合成仍用通用 TTS 的引擎，并遵守它的字数上限、跳过规则、/tts_off 和会话禁音。"
+                    "语音替换文字发出，不会再发一遍原文；冷场和定时发言同样适用，语音送达后照常记录回复、补发表情。",
             adapter_attr="tts_adapter",
-            actions=("voice_tone",),
-            default_questions=("voice_tone",),
-            tips=("在 AstrBot 配置里打开「启用 TTS」，但不要选择 TTS 提供商：通用 TTS 以这个开关为准，"
-                  "选了提供商时，它合成失败的回复会由内置 TTS 再转一次",
+            actions=("voice_reply", "text_reply", "voice_tone"),
+            default_questions=("use_voice", "voice_tone"),
+            tips=("把通用 TTS 的「触发概率」设为 0，是否转语音交给判断决定",
+                  "在 AstrBot 配置里打开「启用 TTS」，但不要选择 TTS 提供商：通用 TTS 以这个开关为准；"
+                  "选了提供商时，为免内置 TTS 把只发文字的回复转成语音，这些回复按普通消息发送，AstrBot 分段回复不生效",
                   "保持「发送失败时回退为文字」开启，语音发不出去时改发原文",
                   "关闭流式输出，流式回复不会转成语音"),
             details=_tts_details,

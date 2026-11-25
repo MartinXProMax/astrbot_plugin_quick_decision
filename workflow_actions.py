@@ -18,8 +18,12 @@ ACTIONS = {
                       "source": "recent_messages"},
     "send_meme": {"label": "发送表情包", "stages": ["pre_reply", "post_reply"], "parameters": ["from", "when"],
                   "source": "memes", "when": ["on_match", "after_send"]},
+    "voice_reply": {"label": "正文转成语音", "stages": ["pre_reply"], "parameters": []},
+    "text_reply": {"label": "正文只发文字", "stages": ["pre_reply"], "parameters": []},
     "voice_tone": {"label": "设定语音语气", "stages": ["pre_reply"], "parameters": ["text"], "required": ["text"]},
 }
+# 需要通用 TTS 的动作；语音不可用时，用到它们的题在运行时跳过。
+VOICE_TOOLS = frozenset({"voice_reply", "text_reply", "voice_tone"})
 
 
 def migrate_actions(questions):

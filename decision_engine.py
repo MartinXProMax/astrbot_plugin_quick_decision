@@ -7,7 +7,7 @@ import random
 import time
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -37,7 +37,7 @@ from .models import (
     ToolCall,
     decision_log_context,
 )
-from .workflow_actions import ACTIONS, migrate_actions
+from .workflow_actions import ACTIONS, VOICE_TOOLS, migrate_actions
 
 Question = DecisionBooleanQuestion | DecisionChoiceQuestion
 
@@ -380,12 +380,17 @@ def _question_info(context, umo, scene, last_activity, clock=None):
 
 def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
                  context=None, umo="", last_activity=None, stage="pre_reply", clock=None,
-                 trigger_event="", timer_roots=None, catalogs=None):
+                 trigger_event="", timer_roots=None, catalogs=None, unavailable_tools=frozenset()):
     specs = []
     info = None
     event = trigger_event or ("silence_elapsed" if scene.endswith("_proactive") else "message_received")
     candidates = {m.message_id: m for m in messages[-8:] if m.role == "user" and m.message_id}
     configured, _ = migrate_actions(configured)
+    if unavailable_tools:
+        # 对应插件不可用时，用到它动作的题视同停用，下游题也不再触发。
+        configured = [replace(q, enabled=False) if q.enabled and any(
+            action.get("tool") in unavailable_tools for actions in (q.actions or {}).values() for action in actions
+        ) else q for q in configured]
     catalogs = deepcopy(catalogs) if catalogs is not None else meme_catalogs(memes)
     available = {key: bool(items) for key, items in catalogs.items()}
     available["recent_messages"] = bool(candidates if targets is None else targets)
@@ -453,6 +458,10 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
                     parts.append(f"{when}发送 {source} 选中的表情")
                 elif name == "voice_tone":
                     parts.append(f"回复转成语音时用「{action['text']}」的语气朗读")
+                elif name == "voice_reply":
+                    parts.append("正文转成语音发送")
+                elif name == "text_reply":
+                    parts.append("正文只发文字，不转语音")
                 else:
                     parts.append(ACTIONS[name]["label"])
             if children := successors.get((item.id, key)):
@@ -661,11 +670,15 @@ def _activate_post(specs, outcomes, post_specs):
     return any(s.is_root for s in post_specs)
 
 
-def preview_workflow(settings, scene, choices, *, trigger_event=""):
-    """以示例候选和用户指定的有效答案预览，不调用提供商或工具。"""
+def preview_workflow(settings, scene, choices, *, trigger_event="", voice_available=True):
+    """以示例候选和用户指定的有效答案预览，不调用提供商或工具。
+
+    voice_available 为假时与实际运行一致，跳过用到语音动作的题。
+    """
     message = BufferedMessage("sample_message", "user", "示例用户", "user", "示例消息")
     specs = _build_specs(settings.decision_questions, scene, [message], [], settings,
-                         stage=None, trigger_event=trigger_event, catalogs=example_catalogs())
+                         stage=None, trigger_event=trigger_event, catalogs=example_catalogs(),
+                         unavailable_tools=frozenset() if voice_available else VOICE_TOOLS)
     batches, outcomes = [], {}
     before = [s for s in specs if s.stage == "pre_reply"]
     after = [s for s in specs if s.stage == "post_reply"]
@@ -770,6 +783,8 @@ def _apply_actions(specs, outcomes, result, prior_inputs=None):
                     result.target_message_id = value
             elif tool == "voice_tone":
                 result.voice_tone = action["text"].strip()
+            elif tool in ("voice_reply", "text_reply"):
+                result.voice_mode = "voice" if tool == "voice_reply" else "text"
             elif tool == "add_context":
                 if "text" not in action and source is None:
                     continue
@@ -861,8 +876,12 @@ async def ask_decision(
     trigger_event: str = "",
     timer_roots: set[str] | None = None,
     evaluation_time: float | None = None,
+    voice_available: bool = False,
 ) -> DecisionResult:
-    """按当前模式评估本轮问题。失败时返回带 error 的结果。"""
+    """按当前模式评估本轮问题。失败时返回带 error 的结果。
+
+    voice_available 为假时（未对接通用 TTS 或主动发言不转语音），跳过用到语音动作的题。
+    """
     started = time.monotonic()
     quote_mode = settings.target_quote_mode
     if settings.decision_questions_warning:
@@ -879,6 +898,7 @@ async def ask_decision(
             settings.decision_questions, scene, messages, memes, settings,
             context=context, umo=umo, last_activity=last_activity, stage=None, clock=round_clock,
             trigger_event=trigger_event, timer_roots=timer_roots,
+            unavailable_tools=frozenset() if voice_available else VOICE_TOOLS,
         )
         specs = [s for s in all_specs if s.stage == "pre_reply"]
         post_specs = [s for s in all_specs if s.stage == "post_reply"]
