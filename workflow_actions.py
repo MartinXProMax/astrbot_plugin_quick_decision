@@ -27,6 +27,33 @@ ACTIONS = {
 VOICE_TOOLS = frozenset({"voice_reply", "text_reply", "voice_tone"})
 
 
+def timer_voice_ready(questions) -> bool:
+    """定时回合能否判断发语音还是文字。
+
+    定时触发的题及其下游里，每个调用会话模型发言的选项，都要触发一道决定发送方式的题
+    （带「正文转成语音」或「正文只发文字」动作）；否则定时消息交给通用 TTS 的触发概率。
+    没有定时发言时视为已满足。
+    """
+    questions, _ = migrate_actions(questions)
+    enabled = [q for q in questions if q.enabled and q.stage == "pre_reply"]
+    reachable = {q.id for q in enabled if any(t.get("event") == "timer_elapsed" for t in q.triggers or [])}
+    changed = True
+    while changed:
+        changed = False
+        for q in enabled:
+            if q.id not in reachable and any(t.get("question") in reachable for t in q.triggers or []):
+                reachable.add(q.id)
+                changed = True
+    speak = [(q.id, key) for q in enabled if q.id in reachable
+             for key, actions in (q.actions or {}).items() if any(a.get("tool") == "request_reply" for a in actions)]
+    if not speak:
+        return True
+    deciders = [q for q in enabled if any(a.get("tool") in ("voice_reply", "text_reply")
+                                          for actions in (q.actions or {}).values() for a in actions)]
+    return all(any(t.get("question") == qid and t.get("option") == key for q in deciders for t in q.triggers or [])
+               for qid, key in speak)
+
+
 def migrate_actions(questions):
     """只解释旧格式。显式事件从 v5 起直接生效。"""
     if all(q.actions is not None for q in questions):

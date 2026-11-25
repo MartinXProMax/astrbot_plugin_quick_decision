@@ -123,6 +123,19 @@ class ExternalPluginsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(tip["text"], tip["done"]) for tip in meme["tips"]],
                          [("关闭「启用主动发送表情工具」", True), ("把「表情发送概率」设为 0", False)])
 
+    async def test_timer_tip_reads_the_decision_config(self):
+        def timer_tip(data):
+            card = next(p for p in data["plugins"] if p["id"] == "universal_tts")
+            return card["tips"][-1]["done"]
+
+        self.assertTrue(timer_tip(await self.call()), "默认配置没有定时发言")
+        graph = [*web_api.v8_default_questions(), {
+            "id": "timer_speak", "type": "boolean", "instructions": "定时发言吗？",
+            "triggers": [{"event": "timer_elapsed", "interval_seconds": 3600}],
+            "actions": {"true": [{"tool": "request_reply"}]}}]
+        self.plugin.config["decision_questions"] = {"version": 6, "questions": graph}
+        self.assertFalse(timer_tip(await self.call()))
+
     def test_meme_manager_settings_follow_its_config_and_defaults(self):
         from astrbot_plugin_quick_decision.meme_adapter import meme_manager_settings
 

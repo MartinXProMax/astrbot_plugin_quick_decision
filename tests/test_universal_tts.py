@@ -180,9 +180,9 @@ def tts_context(universal=None, *, enable=True, provider_id="", dual_output=Fals
     )
 
 
-def tip_states(context):
+def tip_states(context, **graph):
     status = UniversalTTSAdapter(context).status().to_dict()
-    return [tip.state(status) for tip in web_api.EXTERNAL_PLUGINS["universal_tts"].tips]
+    return [tip.state({**status, **graph}) for tip in web_api.EXTERNAL_PLUGINS["universal_tts"].tips]
 
 
 def is_record(comp) -> bool:
@@ -219,13 +219,14 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
 
     def test_tips_are_checked_against_current_settings(self):
         universal = FakeUniversalTTS(MimoEngine(), probability=100)
-        # 依次为：触发概率 0、启用 TTS、提供商留空、发送失败回退文字、关闭流式输出。
-        self.assertEqual(tip_states(tts_context(universal)), [False, True, True, True, True])
+        # 依次为：触发概率 0、启用 TTS、提供商留空、发送失败回退文字、关闭流式输出、定时回合能判断是否用语音。
+        self.assertEqual(tip_states(tts_context(universal), timer_voice_ready=True), [False, True, True, True, True, True])
         universal.config.update(tts_probability=0, fallback_to_text_on_send_error=False)
-        self.assertEqual(tip_states(tts_context(universal, enable=False, provider_id="edge_tts", streaming=True)),
-                         [True, False, False, False, False])
-        # 没装通用 TTS 时只检查 AstrBot 自己的设置。
-        self.assertEqual(tip_states(tts_context()), [None, True, True, None, True])
+        self.assertEqual(tip_states(tts_context(universal, enable=False, provider_id="edge_tts", streaming=True),
+                                    timer_voice_ready=False),
+                         [True, False, False, False, False, False])
+        # 没装通用 TTS 时只检查 AstrBot 自己的设置；不给判断配置时定时这一项无法检查。
+        self.assertEqual(tip_states(tts_context()), [None, True, True, None, True, None])
 
     async def test_voice_record_reuses_universal_rules(self):
         engine = MimoEngine()
@@ -272,6 +273,10 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
     def test_tone_per_engine_type(self):
         azure = AzureEngine(style="calm")
         self.assertEqual(toned_engine(azure, "cheerful").style, "cheerful")
+        # 默认语气是中文，Azure 换成对应风格名；换不成英文名时保留原有 style。
+        self.assertEqual([toned_engine(azure, tone).style for tone in ("开心", "温柔", "俏皮", "难过", "生气")],
+                         ["cheerful", "gentle", "affectionate", "sad", "angry"])
+        self.assertIs(toned_engine(azure, "惊讶"), azure)
         clone = SimpleNamespace(style_prompt="像朋友一样说话")
         self.assertIn("「撒娇」", toned_engine(clone, "撒娇").style_prompt)
         plain = SimpleNamespace(instance_name="openai")
@@ -545,19 +550,52 @@ class PassiveVoiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([style for style, _, _ in self.engine.spoken], ["温柔"])
         self.assertTrue(is_record(event._sends[0].chain[0]))
 
-    def test_voice_questions_need_a_usable_tts(self):
-        self.assertTrue(self.plugin._voice_available("group_passive"))
-        self.assertTrue(self.plugin._voice_available("group_proactive"))
+    async def test_voice_questions_need_a_usable_tts(self):
+        available = self.plugin._voice_available
+        self.assertTrue(await available("group_passive", UMO))
+        self.assertTrue(await available("group_proactive", UMO))
         self.plugin.config["external_plugins"] = {"universal_tts": {"proactive_voice": False}}
-        self.assertTrue(self.plugin._voice_available("group_passive"))
-        self.assertFalse(self.plugin._voice_available("group_proactive"))
+        self.assertTrue(await available("group_passive", UMO))
+        self.assertFalse(await available("group_proactive", UMO))
         self.plugin.config["external_plugins"] = {"universal_tts": {"enabled": False}}
-        self.assertFalse(self.plugin._voice_available("group_passive"))
+        self.assertFalse(await available("group_passive", UMO))
         self.plugin.config.pop("external_plugins")
         self.universal._runtime_enabled = False
-        self.assertFalse(self.plugin._voice_available("group_passive"))
+        self.assertFalse(await available("group_passive", UMO))
+        self.universal._runtime_enabled = True
         self.plugin.tts_adapter = UniversalTTSAdapter(tts_context())
-        self.assertFalse(self.plugin._voice_available("group_passive"))
+        self.assertFalse(await available("group_passive", UMO))
+
+    async def test_streaming_only_blocks_passive_voice(self):
+        self.use_context(streaming=True)
+        self.assertFalse(await self.plugin._voice_available("group_passive", UMO))
+        self.assertTrue(await self.plugin._voice_available("group_proactive", UMO))
+
+    async def test_session_mute_skips_voice_questions(self):
+        self.universal._session_bindings[UMO] = "__disabled__"
+        self.assertFalse(await self.plugin._voice_available("group_passive", UMO))
+        self.assertTrue(await self.plugin._voice_available("group_passive", "aiocqhttp:GroupMessage:200"))
+        self.assertTrue(await self.plugin._voice_available("group_passive"), "预览没有会话，不做会话检查")
+        self.universal._session_bindings.clear()
+
+        switch = SimpleNamespace(is_tts_enabled_for_session=AsyncMock(return_value=False))
+        with patch("astrbot_plugin_quick_decision.tts_adapter._session_service_manager", return_value=switch):
+            self.assertFalse(await self.plugin._voice_available("group_passive", UMO))
+        switch.is_tts_enabled_for_session.assert_awaited_once_with(UMO)
+        broken = SimpleNamespace(is_tts_enabled_for_session=AsyncMock(side_effect=RuntimeError("sp 不可用")))
+        with patch("astrbot_plugin_quick_decision.tts_adapter._session_service_manager", return_value=broken):
+            self.assertTrue(await self.plugin._voice_available("group_passive", UMO), "读不到开关时按开启处理")
+
+    async def test_decision_skips_voice_questions_for_muted_session(self):
+        self.universal._session_bindings[UMO] = "__disabled__"
+        self.plugin.config["decision_questions"] = {"version": 6, "questions": [q.to_dict() for q in default_graph()]}
+        judge = AsyncMock(return_value={"action": choice("reply", reply=1), "use_voice": DecisionBooleanAnswer(probability=1)})
+        self.plugin.context.decision = SimpleNamespace(ask=judge)
+        event = FakeEvent(text="在吗", at_or_wake=True)
+        await self.plugin.on_chat_message(event)
+        asked = {qid for call in judge.await_args_list for qid in call.args[0]}
+        self.assertIn("action", asked)
+        self.assertNotIn("use_voice", asked)
 
 
 class VoiceQuestionTests(unittest.IsolatedAsyncioTestCase):
@@ -618,6 +656,21 @@ class VoiceQuestionTests(unittest.IsolatedAsyncioTestCase):
         tone["triggers"] = [{"event": "message_received"}]
         _, error = load_questions({"version": 6, "questions": [tone]}, strict=True)
         self.assertIn("设定语音语气", error)
+
+    def test_timer_rounds_need_their_own_voice_trigger(self):
+        from astrbot_plugin_quick_decision.workflow_actions import timer_voice_ready
+
+        graph = [q.to_dict() for q in default_graph()]
+        load = lambda qs: load_questions({"version": 6, "questions": qs}, strict=True)[0]  # noqa: E731
+        self.assertTrue(timer_voice_ready(load(graph)), "没有定时发言时视为已满足")
+        timer = {"id": "timer_speak", "type": "boolean", "instructions": "定时发言吗？",
+                 "triggers": [{"event": "timer_elapsed", "interval_seconds": 3600}],
+                 "actions": {"true": [{"tool": "request_reply"}]}}
+        self.assertFalse(timer_voice_ready(load([*graph, timer])))
+        wired = [dict(q) for q in graph]
+        voice = next(q for q in wired if q["id"] == "use_voice")
+        voice["triggers"] = [*voice["triggers"], {"question": "timer_speak", "option": "true", "ask_with_parent": True}]
+        self.assertTrue(timer_voice_ready(load([*wired, timer])))
 
     def test_voice_questions_are_default_questions(self):
         defaults = [q["id"] for q in web_api.v8_default_questions()]

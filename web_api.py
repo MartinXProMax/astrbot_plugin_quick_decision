@@ -31,7 +31,7 @@ from .decision_engine import ask_decision, evaluate_post_reply, preview_workflow
 from .decision_tools import TOOLS
 from .external_plugins import EXTERNAL_PLUGINS
 from .models import QUESTION_ROLES, BufferedMessage
-from .workflow_actions import ACTIONS, SOURCES, WORKFLOW_EVENTS, migrate_actions
+from .workflow_actions import ACTIONS, SOURCES, WORKFLOW_EVENTS, migrate_actions, timer_voice_ready
 
 PLUGIN_NAME = "astrbot_plugin_quick_decision"
 SCHEMA_PATH = Path(__file__).with_name("_conf_schema.json")
@@ -323,7 +323,7 @@ class WebApiMixin:
                         trigger_event=item.get("trigger_event") or ("silence_elapsed" if scene.endswith("_proactive") else "message_received"),
                         timer_roots=set(snapshot["timer_roots"]) if snapshot.get("timer_roots") is not None else None,
                         evaluation_time=snapshot.get("evaluated_at"),
-                        voice_available=getattr(self, "_voice_available", lambda _scene: False)(scene),
+                        voice_available=await self._voice_for(scene, str(item.get("umo") or "")),
                     )
                     post = None
                     if result.post_plan and item.get("reply_text"):
@@ -409,7 +409,7 @@ class WebApiMixin:
             {"version": 6 if version == 8 else 5 if version == 7 else 4, "questions": payload.get("decision_questions")}, strict=True)
         if error:
             return error_response(error, status_code=400)
-        voice = getattr(self, "_voice_available", lambda _scene: False)(payload["scene"])
+        voice = await self._voice_for(payload["scene"])
         return json_response(preview_workflow(settings, payload["scene"], choices, trigger_event=trigger_event,
                                               voice_available=voice))
 
@@ -583,6 +583,11 @@ class WebApiMixin:
             values[field["key"]] = field["default"] if error else value
         return values
 
+    async def _voice_for(self, scene: str, umo: str = "") -> bool:
+        """与实际运行一致的「能否转语音」；预览和重放用它决定是否跳过语音题。"""
+        checker = getattr(self, "_voice_available", None)
+        return bool(await checker(scene, umo)) if callable(checker) else False
+
     def _plugin_status(self, plugin) -> dict:
         adapter = getattr(self, plugin.adapter_attr, None)
         if adapter is None:
@@ -596,6 +601,11 @@ class WebApiMixin:
 
     def _external_plugins_payload(self) -> dict:
         defaults = {q["id"]: q for q in v8_default_questions()}
+        # 有的建议要看判断配置本身，与适配器状态一起交给检查。
+        try:
+            graph = {"timer_voice_ready": timer_voice_ready(self.settings.decision_questions)}
+        except Exception:  # noqa: BLE001
+            graph = {}
         plugins = []
         for plugin in EXTERNAL_PLUGINS.values():
             status = self._plugin_status(plugin)
@@ -624,7 +634,7 @@ class WebApiMixin:
                 "catalogs": catalogs,
                 "default_questions": [deepcopy(defaults[qid]) for qid in plugin.default_questions if qid in defaults],
                 # done：True 已做到，False 未做到，None 无法检查（对方插件没加载或读不到配置）。
-                "tips": [{"text": tip.text, "done": tip.state(status)} for tip in plugin.tips],
+                "tips": [{"text": tip.text, "done": tip.state({**status, **graph})} for tip in plugin.tips],
             })
         return {"plugins": plugins}
 

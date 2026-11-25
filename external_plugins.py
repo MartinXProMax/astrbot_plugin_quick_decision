@@ -135,7 +135,10 @@ EXTERNAL_PLUGINS: dict[str, ExternalPlugin] = {
                   Tip("保持通用 TTS 的「发送失败时回退为文字」开启，语音发不出去时改发原文",
                       _equals("fallback_to_text", True, needs_plugin=True)),
                   Tip("在 AstrBot 配置里关闭流式输出，流式回复不会转成语音",
-                      _equals("streaming", False))),
+                      _equals("streaming", False)),
+                  Tip("有定时发言的题时，让「是否用语音」（use_voice）也从定时题的发言选项触发，"
+                      "否则定时消息按通用 TTS 的触发概率决定，概率为 0 时只发文字",
+                      _equals("timer_voice_ready", True))),
             details=_tts_details,
         ),
     )

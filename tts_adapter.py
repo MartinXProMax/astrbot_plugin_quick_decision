@@ -37,6 +37,16 @@ UNAVAILABLE_HINT = (
 )
 _LLM_RESULT = getattr(ResultContentType, "LLM_RESULT", "llm_result")
 _GENERAL_RESULT = getattr(ResultContentType, "GENERAL_RESULT", "general_result")
+# 通用 TTS 用来表示「本会话禁音」的绑定值（/tts_bind 0）。
+DISABLED_ENGINE = "__disabled__"
+# Azure 的 express-as 只认英文风格名；默认语气和常见说法换成对应的风格。
+AZURE_STYLES = {
+    "开心": "cheerful", "高兴": "cheerful", "快乐": "cheerful",
+    "温柔": "gentle", "俏皮": "affectionate", "撒娇": "affectionate", "亲切": "affectionate",
+    "难过": "sad", "伤心": "sad", "委屈": "sad",
+    "生气": "angry", "愤怒": "angry",
+    "平静": "calm", "兴奋": "excited", "友好": "friendly", "严肃": "serious",
+}
 
 
 def _is_record(component) -> bool:
@@ -59,7 +69,8 @@ def toned_engine(engine, tone: str):
     """复制引擎并叠加本轮语气；引擎不支持语气时原样返回。
 
     - MiMo V2.5-TTS：style 是一组风格词，追加在原有风格之后，如「温柔 慵懒 开心」；
-    - Azure：express-as 只能有一个 style（有 role 属性），本轮语气替换原有 style；
+    - Azure：express-as 只能有一个 style（有 role 属性），本轮语气替换原有 style。中文语气先换成
+      Azure 风格名（开心 → cheerful 等）；换不成英文名时保留原有 style，免得 Azure 不认、语气反而没了；
     - MiMo VoiceClone 只有自然语言的 style_prompt，在末尾补一句语气要求。
     """
     tone = " ".join(str(tone or "").split())
@@ -69,6 +80,12 @@ def toned_engine(engine, tone: str):
     prompt = getattr(engine, "style_prompt", None)
     if not isinstance(style, str) and not isinstance(prompt, str):
         return engine
+    azure = isinstance(style, str) and hasattr(engine, "role")
+    if azure:
+        tone = AZURE_STYLES.get(tone, tone)
+        if not tone.isascii():
+            logger.debug("Azure 不认识语气「%s」，本轮沿用原有风格", tone)
+            return engine
     try:
         get_client = getattr(engine, "_get_client", None)
         if callable(get_client):
@@ -79,10 +96,19 @@ def toned_engine(engine, tone: str):
         logger.debug("无法复制通用 TTS 引擎，本轮沿用默认语气", exc_info=True)
         return engine
     if isinstance(style, str):
-        toned.style = tone if hasattr(engine, "role") else f"{style} {tone}".strip()
+        toned.style = tone if azure else f"{style} {tone}".strip()
     else:
         toned.style_prompt = f"{prompt.strip()}\n用「{tone}」的语气朗读。".strip()
     return toned
+
+
+def _session_service_manager():
+    """AstrBot 的会话服务开关（与通用 TTS 的读法相同）；新版没有这个模块时返回 None。"""
+    try:
+        from astrbot.core.star.session_llm_manager import SessionServiceManager
+    except Exception:  # noqa: BLE001
+        return None
+    return SessionServiceManager
 
 
 class _PluginView:
@@ -204,6 +230,24 @@ class UniversalTTSAdapter:
         if instance is None or not callable(getattr(type(instance), "tts_hook", None)):
             return None
         return instance
+
+    async def session_voice_enabled(self, umo: str) -> bool:
+        """本会话能否转语音：没有被 /tts_bind 0 禁音，AstrBot 也没有关掉本会话的 TTS。"""
+        instance = self.plugin()
+        if instance is None:
+            return False
+        bindings = getattr(instance, "_session_bindings", None)
+        if isinstance(bindings, dict) and bindings.get(umo) == DISABLED_ENGINE:
+            return False
+        manager = _session_service_manager()
+        checker = getattr(manager, "is_tts_enabled_for_session", None)
+        if not callable(checker):
+            return True
+        try:
+            return bool(await checker(umo))
+        except Exception:  # noqa: BLE001
+            logger.debug("读取 AstrBot 会话 TTS 开关失败，按开启处理：%s", umo, exc_info=True)
+            return True
 
     def fallback_to_text(self) -> bool:
         """与通用 TTS 的「发送失败时回退为文字」一致。"""

@@ -173,13 +173,22 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         except TimeoutError:
             logger.warning("等待语气判断超过 %s 秒，本轮按引擎默认语气合成：%s", VOICE_TONE_WAIT_SECONDS, decision.round_id)
 
-    def _voice_available(self, scene: str) -> bool:
-        """本轮能否转语音；不能时跳过「是否用语音」等用到语音动作的题。"""
+    async def _voice_available(self, scene: str, umo: str = "") -> bool:
+        """本轮能否转语音；不能时跳过「是否用语音」等用到语音动作的题。
+
+        给了 umo 时还检查本会话：通用 TTS 的 /tts_bind 0 禁音和 AstrBot 的会话 TTS 开关。
+        """
         tts = self._tts()
-        if tts is None or (scene.endswith("_proactive") and not self.settings.tts_proactive_voice):
+        proactive = scene.endswith("_proactive")
+        if tts is None or (proactive and not self.settings.tts_proactive_voice):
             return False
         status = tts.status()
-        return status.available and status.runtime_enabled
+        if not (status.available and status.runtime_enabled):
+            return False
+        # 流式回复不经过发送前处理，被动回复转不了语音；主动发言不走流式，不受影响。
+        if not proactive and status.streaming:
+            return False
+        return await tts.session_voice_enabled(umo) if umo else True
 
     async def terminate(self) -> None:
         if self._silence_task and not self._silence_task.done():
@@ -321,6 +330,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         result: DecisionResult | None = None
         if memes is None:
             memes = self._meme_candidates(settings)
+        voice_available = await self._voice_available(scene, profile.umo)
         for _ in range(3):
             runtime.pending.clear()
             messages = self.sessions.recent_messages(
@@ -335,7 +345,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 at_or_quoted=at_or_quoted,
                 memes=memes,
                 umo=profile.umo,
-                voice_available=self._voice_available(scene),
+                voice_available=voice_available,
             )
             if not runtime.pending:
                 break
@@ -778,7 +788,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             last_activity=runtime.last_activity,
             trigger_event=trigger_event,
             timer_roots=timer_roots,
-            voice_available=self._voice_available(scene),
+            voice_available=await self._voice_available(scene, profile.umo),
         )
         result.dry_run = settings.dry_run
         runtime.last_decision = result
