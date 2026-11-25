@@ -718,6 +718,8 @@ def _make_plugin(tmp: str, *, config=None, conv_mgr=None):
             available=False, message="stub", plugin_version="", registered_apis=[], pack_count=0, candidate_count=0
         ),
     )
+    # 没有 get_registered_star：视同未安装通用 TTS。
+    plugin.tts_adapter = main_mod.UniversalTTSAdapter(plugin.context)
     plugin._silence_task = None
     plugin._post_tasks = set()
     plugin._proactive_tasks = set()
@@ -991,7 +993,8 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             initial = await self.plugin.web_decision_config()
             self.assertEqual(initial["version"], 8)
             self.assertTrue(all("role" not in q for q in initial["default_questions"]))
-            self.assertEqual(set(initial["actions"]), {"request_reply", "add_context", "quote_message", "send_meme"})
+            self.assertEqual(set(initial["actions"]),
+                             {"request_reply", "add_context", "quote_message", "send_meme", "voice_tone"})
             request.method = "POST"
             request.json.return_value = initial
             saved = await self.plugin.web_decision_config()

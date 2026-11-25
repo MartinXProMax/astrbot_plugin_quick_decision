@@ -262,6 +262,41 @@ def default_questions(legacy=None):
     return migrate_target_gate(questions)[0]
 
 
+VOICE_TONE_PROMPT = "如果这轮回复会转成语音，用什么语气朗读最贴合回复内容和当前气氛？拿不准时选 plain。"
+# (选项, 判断标准, 交给通用 TTS 的语气词)；plain 沿用语音引擎自带的语气。
+VOICE_TONES = (
+    ("plain", "平静自然，沿用语音引擎默认的语气", ""),
+    ("happy", "开心、轻快，适合玩笑、夸奖和好消息", "开心"),
+    ("gentle", "温柔、安抚，适合关心、安慰和道晚安", "温柔"),
+    ("playful", "俏皮、撒娇，适合调侃和亲近的闲聊", "俏皮"),
+    ("sad", "低落、委屈，适合遗憾或难过的话题", "难过"),
+    ("angry", "生气、不满，适合抱怨或被冒犯的时候", "生气"),
+)
+
+
+def optional_questions() -> list[DecisionQuestion]:
+    """「外部插件」页可以加入、但不在「恢复默认问题」里的题，只对装了对应插件的用户有用。"""
+    actions = {
+        key: [{"tool": "voice_tone", "text": tone}, {"tool": "add_context", "label": "语气", "text": tone}]
+        for key, _, tone in VOICE_TONES
+        if tone
+    }
+    return [
+        DecisionQuestion(
+            "voice_tone",
+            "choice",
+            VOICE_TONE_PROMPT,
+            options=[DecisionQuestionOption(key, criteria) for key, criteria, _ in VOICE_TONES],
+            triggers=[
+                {"question": "action", "option": "reply", "ask_with_parent": True},
+                {"question": "idle_action", "option": "proactive", "ask_with_parent": True},
+            ],
+            actions=actions,
+            default_option="plain",
+        )
+    ]
+
+
 def dump_decision_questions(questions: list[DecisionQuestion]) -> str:
     return json.dumps(
         [item.to_dict() for item in questions],
@@ -810,6 +845,10 @@ class PluginSettings:
             for plugin_id in EXTERNAL_PLUGINS
             if isinstance(plugins.get(plugin_id), Mapping)
             and not _as_bool(plugins[plugin_id].get("enabled"), True)
+        )
+        tts = plugins.get("universal_tts")
+        self.tts_proactive_voice = _as_bool(
+            tts.get("proactive_voice") if isinstance(tts, Mapping) else None, True
         )
 
     def plugin_enabled(self, plugin_id: str) -> bool:

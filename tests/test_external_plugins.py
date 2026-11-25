@@ -34,7 +34,7 @@ class Config(dict):
 
 class RegistryTests(unittest.TestCase):
     def test_every_adapter_declares_known_capabilities_and_its_own_default_questions(self):
-        defaults = {q["id"]: q for q in web_api.v8_default_questions()}
+        defaults = web_api.plugin_question_pool()
         claimed = []
         for plugin in EXTERNAL_PLUGINS.values():
             with self.subTest(plugin.id):

@@ -24,6 +24,7 @@ from .config_util import (
     default_decision_questions,
     default_questions,
     load_questions,
+    optional_questions,
 )
 from .decision_engine import ask_decision, evaluate_post_reply, preview_workflow
 from .decision_tools import TOOLS
@@ -126,6 +127,11 @@ def v8_default_questions() -> list[dict]:
     """判断配置页「恢复默认问题」使用的完整默认问题，已转换为选项动作格式。"""
     questions, _ = migrate_actions(default_questions())
     return [q.to_dict() for q in questions]
+
+
+def plugin_question_pool() -> dict[str, dict]:
+    """外部插件可提供的题：默认问题加上只在「外部插件」页加入的可选题。"""
+    return {q["id"]: q for q in [*v8_default_questions(), *(q.to_dict() for q in optional_questions())]}
 
 
 def validate_setting(field: dict, value):
@@ -590,7 +596,7 @@ class WebApiMixin:
         return status.to_dict() if hasattr(status, "to_dict") else dict(vars(status))
 
     def _external_plugins_payload(self) -> dict:
-        defaults = {q["id"]: q for q in v8_default_questions()}
+        defaults = plugin_question_pool()
         plugins = []
         for plugin in EXTERNAL_PLUGINS.values():
             status = self._plugin_status(plugin)

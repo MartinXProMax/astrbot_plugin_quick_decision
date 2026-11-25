@@ -66,6 +66,7 @@ from .reply_generator import (
     send_followup_tools,
 )
 from .session_store import SessionStore
+from .tts_adapter import UniversalTTSAdapter, has_record
 from .web_api import WebApiMixin
 
 PLUGIN_NAME = "astrbot_plugin_quick_decision"
@@ -97,6 +98,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         self.config = config
         self.data_dir = load_plugin_data_dir(PLUGIN_NAME)
         self.meme_adapter = MemeManagerAdapter(self.context)
+        self.tts_adapter = UniversalTTSAdapter(self.context)
         self.sessions = SessionStore(
             self.data_dir, log_limit=self.settings.decision_log_limit
         )
@@ -144,6 +146,20 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             )
         else:
             logger.warning("%s", status.message or UNAVAILABLE_HINT)
+        tts = self.tts_adapter.status()
+        if tts.plugin_loaded:
+            logger.info("已对接通用 TTS：version=%s engine=%s %s", tts.plugin_version or "未知",
+                        tts.engine or "未配置", tts.message)
+            if tts.core_provider:
+                logger.warning("AstrBot 内置 TTS 仍选着提供商 %s：通用 TTS 合成失败的回复会由它再转一次，"
+                               "建议把 TTS 提供商留空", tts.core_provider)
+
+    def _tts(self) -> UniversalTTSAdapter | None:
+        """在「外部插件」中启用了通用 TTS 适配时返回适配器。"""
+        adapter = getattr(self, "tts_adapter", None)
+        if adapter is None or not self.settings.plugin_enabled("universal_tts"):
+            return None
+        return adapter
 
     async def terminate(self) -> None:
         if self._silence_task and not self._silence_task.done():
@@ -471,11 +487,19 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         platform_name = platform_name_from_event(event)
         self._schedule_post_decision(result, text, profile.umo, platform_name)
 
+        # 主动发言直接发给平台，不经过官方装饰阶段，通用 TTS 的钩子碰不到，这里替它转语音。
+        tts = self._tts() if settings.tts_proactive_voice else None
+        voice = None
+        if tts is not None:
+            async def voice(body):
+                return await tts.voice_record(profile.umo, body, tone=result.voice_tone)
+
         sent_texts: list[str] = []
         try:
             await send_decision_message(
                 self.context, umo=profile.umo, text=text, resolver=self.meme_adapter,
                 decision=result, dry_run=False, platform_name=platform_name, sent_texts=sent_texts,
+                voice=voice, voice_fallback=tts.fallback_to_text() if tts is not None else True,
             )
         finally:
             if sent_texts:
@@ -564,6 +588,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             "session_hints": result.session_hints,
             "use_meme": result.use_meme,
             "meme_id": result.meme_id,
+            "voice_tone": result.voice_tone,
             "target_message_id": result.target_message_id,
             "duration_ms": result.duration_ms,
             "error": result.error,
@@ -584,6 +609,8 @@ class QuickDecisionPlugin(Star, WebApiMixin):
     async def _update_log_reply(self, result: DecisionResult, text: str, *, complete=True) -> None:
         if result.round_id and text:
             fields = {"reply_sent": True, "reply_complete": complete}
+            if result.voice_sent:
+                fields["reply_voice"] = True
             if self.settings.decision_log_include_content:
                 fields["reply_text"] = _log_text(text, 80)
             await self.sessions.update_round_log(result.round_id, **fields)
@@ -816,7 +843,8 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if self._pipeline_decision(event):
             event.set_extra("_qd_intermediate_receipt", None)
 
-    @filter.on_decorating_result()
+    # 先于通用 TTS（priority=0）执行：它会把文字换成语音，并在跳过时把结果改标为普通消息。
+    @filter.on_decorating_result(priority=10)
     async def on_decorating_result(self, event: AstrMessageEvent):
         decision = self._pipeline_decision(event)
         if decision is None:
@@ -824,7 +852,8 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         result = event.get_result()
         if result is None:
             return
-        if getattr(result, "is_llm_result", lambda: False)() and not event.get_extra("_qd_streaming"):
+        is_llm = getattr(result, "is_llm_result", lambda: False)() and not event.get_extra("_qd_streaming")
+        if is_llm:
             decision.text_sent = None
             event.set_extra("_qd_text_receipt", False)
             event.set_extra("_qd_sent_text", "")
@@ -841,6 +870,11 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             event.stop_event()
             await self._cancel_official_round(event, decision, "已取消正文发送")
             return
+        if is_llm:
+            event.set_extra("_qd_llm_result", result)
+            event.set_extra("_qd_llm_components", list(result.chain))
+            if decision.voice_tone and (tts := self._tts()) is not None:
+                await tts.voice_event(event, decision.voice_tone)
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent):
@@ -870,6 +904,9 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                     for comp in result.chain
                     if isinstance(comp, Plain)
                 ).strip()
+                if not text and has_record(result.chain) and official_text_was_sent(event):
+                    # 通用 TTS 把文字换成了语音（或语音失败后改发了原文），链上已经没有文字。
+                    text = (event.get_extra("_qd_undecorated_text") or "").strip()
             if text:
                 self._record_bot_text(runtime.profile, text)
                 if stream_text is not None:
@@ -920,6 +957,18 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 result.round_id, [asdict(c) for c in result.tool_calls.values()]
             )
 
+    def _voice_status_line(self, settings) -> str:
+        adapter = getattr(self, "tts_adapter", None)
+        if not settings.plugin_enabled("universal_tts"):
+            return "已在快速决策中停用通用 TTS 适配，主动发言只发文字"
+        if adapter is None:
+            return "未对接，按文字发送"
+        status = adapter.status()
+        if not status.available:
+            return status.message or "未对接，按文字发送"
+        line = f"通用 TTS {status.plugin_version or ''}，引擎 {status.engine}"
+        return f"{line}（{status.message}）" if status.message else line
+
     def _pipeline_decision(self, event: AstrMessageEvent) -> DecisionResult | None:
         extra = event.get_extra("quick_decision")
         if isinstance(extra, DecisionResult):
@@ -949,6 +998,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 if (status := self.meme_adapter.status()).available
                 else (status.message or "不可用，仅发文字")
             ),
+            "语音：" + self._voice_status_line(settings),
         ]
         if settings.decision_mode == "model":
             lines.extend(

@@ -451,6 +451,8 @@ def _build_specs(configured, scene, messages, memes, settings, *, targets=None,
                 elif name == "send_meme":
                     when = "正文发送成功后" if action.get("when", "on_match") == "after_send" else "命中后"
                     parts.append(f"{when}发送 {source} 选中的表情")
+                elif name == "voice_tone":
+                    parts.append(f"回复转成语音时用「{action['text']}」的语气朗读")
                 else:
                     parts.append(ACTIONS[name]["label"])
             if children := successors.get((item.id, key)):
@@ -766,6 +768,8 @@ def _apply_actions(specs, outcomes, result, prior_inputs=None):
             elif tool == "quote_message":
                 if dynamic:
                     result.target_message_id = value
+            elif tool == "voice_tone":
+                result.voice_tone = action["text"].strip()
             elif tool == "add_context":
                 if "text" not in action and source is None:
                     continue

@@ -341,6 +341,7 @@ export function newAction(questions, catalog, q, ref, toolName) {
   const action = { tool: toolName, from: null };
   if (tool?.parameters?.includes("from")) action.from = sourceChoices(questions, catalog, q, ref, toolName)[0] ?? null;
   if (tool?.when?.length) action.when = tool.when.includes("after_send") ? "after_send" : tool.when[0];
+  if (tool?.required?.includes("text")) action.text = "";
   return action;
 }
 
@@ -367,6 +368,7 @@ export function actionIssue(questions, catalog, q, ref, action) {
   for (const key of Object.keys(data)) {
     if (key !== "tool" && !tool.parameters.includes(key)) return "动作参数无效";
   }
+  if ((tool.required || []).some((key) => data[key] === undefined)) return `「${tool.label}」还没有填写`;
   if (action.text !== undefined && action.from) return "内容来源和固定文本只能选一个";
   if (action.text !== undefined && !action.text.trim()) return "固定文本还没有填写";
   if (action.when !== undefined && !(tool.when || []).includes(action.when)) return "执行时机无效";
