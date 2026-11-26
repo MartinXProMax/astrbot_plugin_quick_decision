@@ -11,7 +11,7 @@
 
 判断模型只根据描述选图，适配器不会读取图片像素内容。
 缺依赖时只报告不可用，调用方应改发纯文字，不得回退到旧自制图库。
-按图库注册表和语义元数据的修改时间缓存候选；管理器改描述或图包后会自动失效。
+按图库注册表、语义元数据和图片的修改时间与大小缓存候选；管理器改描述或图包后会自动失效。
 """
 
 from __future__ import annotations
@@ -346,18 +346,24 @@ class MemeManagerAdapter:
         self.require_plugin = (
             context is not None if require_plugin is None else require_plugin
         )
-        self._registry_cache_key: tuple[str, int | None] | None = None
+        self._registry_cache_key: tuple[str, tuple[int, int] | None] | None = None
         self._registry_cache: list[dict[str, Any]] = []
         self._candidate_cache: dict[
             bool, tuple[tuple[Any, ...], list[MemeCandidate]]
         ] = {}
 
     @staticmethod
-    def _mtime(path: Path) -> int | None:
+    def _mtime(path: Path) -> tuple[int, int] | None:
+        """文件的修改时间和大小，作缓存键用。
+
+        FAT、exFAT、SMB 和部分 FUSE 挂载的修改时间精度粗，同一刻度内替换图片或改描述时
+        修改时间不变，再看大小才能察觉。
+        """
         try:
-            return path.stat().st_mtime_ns
+            stat = path.stat()
         except OSError:
             return None
+        return stat.st_mtime_ns, stat.st_size
 
     def _registry(self, data_dir: Path) -> list[dict[str, Any]]:
         path = data_dir / "registry.json"
