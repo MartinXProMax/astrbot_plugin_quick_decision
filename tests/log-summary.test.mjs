@@ -11,6 +11,9 @@ test("连续跳过并成一条时显示次数和第一次的时间，跨天带�
   assert.equal(skipText({ raw: { skip_reason: "冷却中跳过" }, skip_count: 2, time, first_time: "2026-11-25T23:59:10+0800" }),
     "冷却中跳过（连续 2 次，自 11月25日 23:59:10 起）");
   assert.equal(skipText({ raw: { skip_reason: "冷却中跳过" }, skip_count: 3 }), "冷却中跳过（连续 3 次）");
+  assert.equal(skipText({ raw: { skip_reason: "上限已满" }, timer_roots: ["morning", "noon"] }), "上限已满（定时题 morning、noon）");
+  assert.equal(skipText({ raw: { skip_reason: "上限已满" }, timer_roots: ["morning"], skip_count: 2, time,
+    first_time: "2026-11-26T09:00:00+0800" }), "上限已满（定时题 morning；连续 2 次，自 09:00:00 起）");
 });
 
 test("统计区分失败与沉默，跳过的回合不稀释平均判断耗时", () => {
@@ -22,6 +25,18 @@ test("统计区分失败与沉默，跳过的回合不稀释平均判断耗时",
   ]);
   assert.deepEqual(stats, { count: 4, speakingRate: 0.25, failureRate: 0.25, averageMs: 200 });
   assert.equal(summarizeLogs([]).averageMs, null);
+});
+
+test("连续跳过并成的一条按跳过次数计入发言率和失败率", () => {
+  const stats = summarizeLogs([
+    { action: "reply", duration_ms: 100 },
+    { action: "none", duration_ms: 0, raw: { skip_reason: "冷却中跳过" }, skip_count: 29 },
+    { action: "none", duration_ms: 50, error: "provider failure" },
+  ]);
+  assert.equal(stats.count, 3);
+  assert.equal(stats.speakingRate, 1 / 31);
+  assert.equal(stats.failureRate, 1 / 31);
+  assert.equal(stats.averageMs, 75);
 });
 
 test("会话优先显示群名，缺失群名时回退为易读会话编号", () => {

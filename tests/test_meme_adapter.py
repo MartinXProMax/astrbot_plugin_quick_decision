@@ -304,6 +304,16 @@ class MemeAdapterTests(unittest.TestCase):
             adapter.existing_content_hashes()
             self.assertEqual(digest.call_count, 2)
 
+    def test_unreadable_images_are_not_offered(self) -> None:
+        # 不读内容时也要排除读不了的图片，否则选中后发送失败。
+        _make_pack(self.manager_dir, "pack-a", [("smile.png", PNG, "微笑点头"), ("cry.jpg", JPEG, "大哭")])
+        adapter = MemeManagerAdapter(data_dir=self.manager_dir, require_plugin=False)
+        from astrbot_plugin_quick_decision import meme_adapter as module
+
+        real_access = module.os.access
+        with patch.object(module.os, "access", side_effect=lambda p, mode: Path(p).name != "cry.jpg" and real_access(p, mode)):
+            self.assertEqual([item["description"] for item in adapter.described_catalog()], ["微笑点头"])
+
     def test_missing_file_and_updated_description_sync(self) -> None:
         _make_pack(self.manager_dir, "pack-a", [("smile.png", PNG, "微笑点头")])
         adapter = MemeManagerAdapter(data_dir=self.manager_dir, require_plugin=False)

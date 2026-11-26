@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -310,6 +311,9 @@ def iter_pack_images(
                     file_sha = content_sha256(safe.read_bytes())
                 except OSError:
                     continue
+            elif not os.access(safe, os.R_OK):
+                # 不读内容也要排除读不了的图片，免得被选中后发送失败。
+                continue
             if not has_entry_id:
                 entry_id = semantic_entry_id(file_sha, category, relative_path)
             candidates.append(

@@ -23,7 +23,9 @@ def _skip_key(row: dict) -> tuple | None:
     """跳过记录的合并依据；不是跳过记录时为 None。"""
     raw = row.get("raw")
     reason = raw.get("skip_reason") if isinstance(raw, dict) else None
-    return (reason, row.get("scene"), row.get("trigger_event")) if reason else None
+    if not reason:
+        return None
+    return reason, row.get("scene"), row.get("trigger_event"), tuple(row.get("timer_roots") or ())
 
 
 @dataclass

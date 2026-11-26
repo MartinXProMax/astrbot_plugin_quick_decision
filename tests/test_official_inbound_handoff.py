@@ -1131,7 +1131,9 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             return await self.plugin.on_chat_message(event)
 
         await message("一", "c1")
-        first_time = self.plugin.sessions.recent_logs()[0]["time"]
+        # 几条记录都在同一秒内写入；把第一条的时间改早，才能确认 first_time 取自第一条。
+        first_time = "2000-01-01T08:00:00+0800"
+        await self.plugin.sessions.update_round_log(self.plugin.sessions.recent_logs()[0]["round_id"], time=first_time)
         await message("别的群", "o1", "aiocqhttp:GroupMessage:other")
         await message("二", "c2")
         await message("三", "c3")
@@ -1153,6 +1155,19 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("skip_count", latest)
         self.assertEqual(len(self.plugin.sessions.recent_logs(umo=umo)), 3)
 
+    async def test_timer_skips_for_different_questions_stay_apart(self) -> None:
+        from astrbot_plugin_quick_decision.event_utils import event_profile
+
+        self.plugin.config["group"]["hourly_proactive_limit"] = 0
+        event = FakeEvent(umo="aiocqhttp:GroupMessage:timers", text="hi", message_id="t1", timestamp=10)
+        runtime = self.plugin.sessions.ensure(event_profile(event))
+        for roots in ({"morning"}, {"morning"}, {"night"}):
+            await self.plugin._run_proactive(runtime, timer_roots=roots)
+        logs = self.plugin.sessions.recent_logs(umo=event.unified_msg_origin)
+        self.assertEqual([(log["timer_roots"], log.get("skip_count")) for log in logs],
+                         [(["night"], None), (["morning"], 2)])
+        self.assertTrue(all(log["raw"]["skip_reason"] == "每小时主动发言上限已满，跳过判断" for log in logs))
+
     async def test_silence_without_any_possible_action_starts_no_round(self) -> None:
         import time
 
@@ -1170,6 +1185,9 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._run_proactive.assert_not_awaited()
         self.assertEqual(self.plugin.sessions.recent_logs(), [])
         self.assertTrue(self.plugin.sessions.silence_already_evaluated(event.unified_msg_origin))
+        # 不写日志，但 /decision status 的「最近一次决策」能看到冷场被跳过。
+        self.assertEqual(runtime.last_decision.scene, "group_proactive")
+        self.assertEqual(runtime.last_decision.raw["skip_reason"], "冷场主动发言已关闭，跳过判断")
 
         # 有命中即执行的动作（如命中后立刻发表情）时仍要起回合，由回合内按候选细查。
         runtime.last_user_ts = time.time() - 3999

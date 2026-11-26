@@ -108,6 +108,16 @@ class SettingsCacheTests(unittest.IsolatedAsyncioTestCase):
             self.plugin.settings
             self.assertEqual(warn.call_count, 2)
 
+    def test_question_warning_is_logged_once_when_config_cannot_be_cached(self) -> None:
+        import astrbot_plugin_quick_decision.main as main_mod
+
+        self.plugin.config["decision_questions"] = '{"version": 99, "questions": []}'
+        self.plugin.config["loop"] = self.plugin.config  # 循环引用：无法序列化，也就无法缓存
+        with patch.object(main_mod.logger, "warning") as warn:
+            for _ in range(3):
+                self.assertTrue(self.plugin.settings.decision_questions_warning)
+        self.assertEqual(warn.call_count, 1)
+
     async def test_judging_does_not_repeat_the_question_warning(self) -> None:
         import astrbot_plugin_quick_decision.decision_engine as engine
 

@@ -126,15 +126,21 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         try:
             key = json.dumps(self.config, sort_keys=True, ensure_ascii=False, default=str)
         except (TypeError, ValueError):
-            return PluginSettings(self.config)
+            key = None
         cached = getattr(self, "_settings_cache", None)
-        if cached is None or cached[0] != key:
-            settings = PluginSettings(self.config)
-            if settings.decision_questions_warning:
-                # 每次配置改动只提醒一次，不在每轮判断里重复。
-                logger.warning("判断问题配置：%s", settings.decision_questions_warning)
-            cached = self._settings_cache = (key, settings)
-        return cached[1]
+        if key is not None and cached is not None and cached[0] == key:
+            return cached[1]
+        settings = PluginSettings(self.config)
+        warning = settings.decision_questions_warning
+        # 问题配置的警告每次配置改动只提醒一次，不在每轮判断里重复；
+        # 配置无法序列化、没法缓存时每次都重新解析，改为按警告内容去重。
+        if warning and (key is not None or warning != getattr(self, "_uncached_warning", None)):
+            logger.warning("判断问题配置：%s", warning)
+        if key is None:
+            self._uncached_warning = warning
+        else:
+            self._settings_cache = (key, settings)
+        return settings
 
     async def initialize(self) -> None:
         try:
@@ -650,6 +656,9 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             "session_name": runtime.display_name if runtime else "",
             "reply_sent": None if result.should_speak() and not result.dry_run else False,
         }
+        if log_context.get("timer_roots") is not None:
+            # 本轮到期的定时题；跳过记录也据此区分，不同定时题的跳过不会并成一条。
+            record["timer_roots"] = log_context["timer_roots"]
         if self.settings.decision_log_include_content:
             record["replay_context"] = log_context
             if trigger:
@@ -757,11 +766,15 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             if now - runtime.last_activity < settings.silence_seconds(profile.is_private):
                 continue
             scene = "private_proactive" if profile.is_private else "group_proactive"
-            if self._proactive_skip_reason(settings, profile, False) and not has_on_match_actions(
-                settings.decision_questions, scene, trigger_event="silence_elapsed"
-            ):
-                # 不能开口、也没有命中即执行的动作：本段冷场到此为止，不起回合，也不写跳过日志。
+            reason = self._proactive_skip_reason(settings, profile, False)
+            if reason and not has_on_match_actions(settings.decision_questions, scene, trigger_event="silence_elapsed"):
+                # 不能开口、也没有命中即执行的动作：本段冷场到此为止，不起回合，也不写跳过日志；
+                # 仍记为本会话最近一次决策，/decision status 能看到冷场被跳过。
                 self.sessions.mark_silence_evaluated(profile.umo)
+                runtime.last_decision = DecisionResult(
+                    scene=scene, trigger_event="silence_elapsed", decision_mode=settings.decision_mode,
+                    raw={"skip_reason": reason}, dry_run=settings.dry_run,
+                )
                 continue
             if len(self._proactive_tasks) >= PROACTIVE_CONCURRENCY:
                 continue
