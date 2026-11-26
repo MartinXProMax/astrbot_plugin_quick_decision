@@ -54,7 +54,7 @@ import astrbot_plugin_quick_decision.reply_generator as reply_generator
 importlib.reload(reply_generator)
 
 from astrbot_plugin_quick_decision.config_util import PluginSettings
-from astrbot_plugin_quick_decision.decision_engine import _build_questions, _parse_answers
+from engine_helpers import _build_questions, _parse_answers, build_meme_chain
 from astrbot_plugin_quick_decision.legacy_meme_index import LegacyMemeIndex
 from astrbot_plugin_quick_decision.meme_adapter import (
     MemeManagerAdapter,
@@ -67,10 +67,7 @@ from astrbot_plugin_quick_decision.meme_migrate import (
     rollback_migration,
 )
 from astrbot_plugin_quick_decision.models import DecisionResult
-from astrbot_plugin_quick_decision.reply_generator import (
-    build_meme_chain,
-    build_send_chain,
-)
+from astrbot_plugin_quick_decision.reply_generator import build_send_chain
 from astrbot.api.provider import DecisionBooleanAnswer, DecisionChoiceAnswer
 
 PNG = bytes.fromhex(

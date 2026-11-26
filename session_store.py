@@ -6,7 +6,7 @@ import asyncio
 import json
 import threading
 import time
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,7 +33,6 @@ class SessionRuntime:
     pending: list[BufferedMessage] = field(default_factory=list)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     deciding: bool = False
-    debounce_task: asyncio.Task[None] | None = None
     last_user_ts: float = 0.0
     last_bot_ts: float = 0.0
     silence_evaluated_at_user_ts: float = 0.0
@@ -71,7 +70,6 @@ class SessionStore:
         self.log_path = data_dir / "decision_logs.jsonl"
         self.log_limit = log_limit
         self._sessions: dict[str, SessionRuntime] = {}
-        self._session_locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
         # 每项为（序列化后的行, 解析后的记录），按写入顺序排列。
         self._log_entries: list[tuple[str, dict]] | None = None
         self._log_dirty = False
@@ -104,24 +102,19 @@ class SessionStore:
         cutoff = time.time() - max(max_idle_seconds, 1)
         removed = 0
         for umo, runtime in list(self._sessions.items()):
-            lock = self._session_locks.get(umo)
             if (
                 runtime.deciding
                 or runtime.pending_pipeline is not None
                 or runtime.pending
                 or runtime.timer_due
-                or (lock is not None and lock.locked())
+                or runtime.lock.locked()
             ):
                 continue
             last_activity = runtime.last_activity
             if last_activity and last_activity < cutoff:
                 self._sessions.pop(umo, None)
-                self._session_locks.pop(umo, None)
                 removed += 1
         return removed
-
-    def session_lock(self, umo: str) -> asyncio.Lock:
-        return self._session_locks[umo]
 
     def append_message(
         self, profile: SessionProfile, message: BufferedMessage, limit: int

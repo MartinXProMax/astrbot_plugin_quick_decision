@@ -25,6 +25,8 @@ venv/
 *.sqlite3
 .DS_Store
 Thumbs.db
+# FUSE 挂载上删除仍被打开的文件时留下的副本
+.fuse_hidden*
 
 # do not commit live runtime data if a data tree is copied by mistake
 plugin_data/

@@ -762,7 +762,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.tmp.cleanup()
 
     def test_web_catalog_covers_questions_used_in_all_scenes(self) -> None:
-        from astrbot_plugin_quick_decision.decision_engine import _build_questions
+        from engine_helpers import _build_questions
         from astrbot_plugin_quick_decision.models import BufferedMessage
 
         payload = self.plugin._decision_config_payload()

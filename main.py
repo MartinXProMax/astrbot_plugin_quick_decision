@@ -127,7 +127,11 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             return PluginSettings(self.config)
         cached = getattr(self, "_settings_cache", None)
         if cached is None or cached[0] != key:
-            cached = self._settings_cache = (key, PluginSettings(self.config))
+            settings = PluginSettings(self.config)
+            if settings.decision_questions_warning:
+                # 每次配置改动只提醒一次，不在每轮判断里重复。
+                logger.warning("判断问题配置：%s", settings.decision_questions_warning)
+            cached = self._settings_cache = (key, settings)
         return cached[1]
 
     async def initialize(self) -> None:

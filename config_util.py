@@ -809,7 +809,7 @@ class PluginSettings:
         self.dry_run = _as_bool(data.get("dry_run"), False)
         self.decision_mode = "random" if data.get("decision_mode") == "random" else "model"
         self.decision_provider_id = str(data.get("decision_provider_id") or "").strip()
-        self.vision_provider_id = str(data.get("vision_provider_id") or "").strip()
+        # vision_provider_id 自 1.2.0 起停用；配置结构里仍保留该键以免覆盖用户配置，这里不再读取。
         self.choice_threshold = _as_float(data.get("choice_threshold"), 0.5)
         self.choice_temperature = _as_float(
             data.get("choice_temperature"), 0.0, maximum=2.0

@@ -136,28 +136,3 @@ def event_has_command_handler(event: AstrMessageEvent) -> bool:
         ):
             return True
     return False
-
-
-def extract_images(event: AstrMessageEvent) -> list[Image]:
-    images: list[Image] = []
-    for comp in event.get_messages() or []:
-        if isinstance(comp, Image):
-            images.append(comp)
-        elif isinstance(comp, Reply) and comp.chain:
-            for inner in comp.chain:
-                if isinstance(inner, Image):
-                    images.append(inner)
-    return images
-
-
-def remainder_after_command(event: AstrMessageEvent, *keywords: str) -> str:
-    """从 message_str 中截取指定子指令后的剩余文本。"""
-    text = (event.message_str or "").strip()
-    tokens = text.split()
-    if not tokens:
-        return ""
-    lowered_keywords = {item.lower() for item in keywords}
-    for index, token in enumerate(tokens):
-        if token.lower() in lowered_keywords:
-            return " ".join(tokens[index + 1 :]).strip()
-    return text

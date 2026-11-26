@@ -43,10 +43,7 @@ importlib.reload(reply_generator)
 from astrbot.api.provider import DecisionChoiceAnswer
 from astrbot_plugin_quick_decision.config_util import PluginSettings
 from astrbot_plugin_quick_decision.config_util import ACTION_CRITERIA_GROUP, ACTION_CRITERIA_PROACTIVE
-from astrbot_plugin_quick_decision.decision_engine import (
-    _build_questions,
-    _parse_answers,
-)
+from engine_helpers import _build_questions, _parse_answers
 from astrbot_plugin_quick_decision.models import (
     BufferedMessage,
     DecisionResult,

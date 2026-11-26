@@ -133,11 +133,8 @@ from astrbot_plugin_quick_decision.config_util import (
     dump_decision_questions,
     parse_decision_questions,
 )
-from astrbot_plugin_quick_decision.decision_engine import (
-    _build_questions,
-    _parse_answers,
-    build_state,
-)
+from astrbot_plugin_quick_decision.decision_engine import build_state
+from engine_helpers import _build_questions, _parse_answers
 from astrbot_plugin_quick_decision.models import (
     BufferedMessage,
     DecisionQuestion,

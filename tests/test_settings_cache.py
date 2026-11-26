@@ -92,6 +92,32 @@ class SettingsCacheTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.plugin.settings.decision_questions, [])
             self.assertTrue(self.plugin.settings.decision_questions_warning)
 
+    def test_question_warning_is_logged_once_per_config_change(self) -> None:
+        import astrbot_plugin_quick_decision.main as main_mod
+
+        with patch.object(main_mod.logger, "warning") as warn:
+            self.plugin.config["decision_questions"] = '{"version": 99, "questions": []}'
+            for _ in range(3):
+                self.plugin.settings
+            self.assertEqual(warn.call_count, 1)
+            self.plugin.config["decision_questions"] = '{"version": 98, "questions": []}'
+            self.plugin.settings
+            self.plugin.settings
+            self.assertEqual(warn.call_count, 2)
+            self.plugin.config["decision_questions"] = saved_text()
+            self.plugin.settings
+            self.assertEqual(warn.call_count, 2)
+
+    async def test_judging_does_not_repeat_the_question_warning(self) -> None:
+        import astrbot_plugin_quick_decision.decision_engine as engine
+
+        settings = PluginSettings({"decision_questions": '{"version": 99, "questions": []}'})
+        self.assertTrue(settings.decision_questions_warning)
+        with patch.object(engine.logger, "warning") as warn:
+            await ask_decision(SimpleNamespace(), settings=settings, scene="group_passive", is_private=False,
+                               messages=[], at_or_quoted=False, memes=[])
+        warn.assert_not_called()
+
     def test_settings_built_elsewhere_are_independent(self) -> None:
         # 引擎测试和日志重放会自行构造并修改设置，它们不能影响插件缓存或彼此。
         self.plugin.config["decision_questions"] = saved_text()

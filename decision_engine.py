@@ -28,7 +28,7 @@ from .candidate_sources import (
     meme_catalogs,
     source_question,
 )
-from .config_util import PluginSettings, default_questions
+from .config_util import PluginSettings
 from .models import (
     BufferedMessage,
     DecisionOutcome,
@@ -227,25 +227,6 @@ def _evaluate_random(spec: DecisionSpec) -> DecisionOutcome:
     else:
         outcome.value = selected == "true" if spec.kind == "boolean" else selected
     return outcome
-
-
-async def evaluate_specs(
-    decision,
-    specs: list[DecisionSpec],
-    *,
-    state: dict[str, Any],
-    provider_id: str = "",
-) -> dict[str, DecisionOutcome]:
-    """批量提问并评估；批次异常交由调用者按原场景规则降级。"""
-    questions = {spec.id: spec.question for spec in specs if spec.question is not None}
-    answers = {}
-    if questions:
-        answers = await decision.ask(
-            questions,
-            state=state,
-            **({"provider_id": provider_id} if provider_id else {}),
-        )
-    return _evaluate_answers(specs, dict(answers))
 
 
 def build_state(
@@ -739,25 +720,6 @@ async def evaluate_post_reply(context, plan: PostDecisionPlan, text: str, previo
     return report
 
 
-def _build_questions(scene, messages, memes, configured=None):
-    settings = PluginSettings({})
-    specs = _build_specs(
-        default_questions() if configured is None else configured,
-        scene,
-        messages,
-        memes,
-        settings,
-    )
-    by_id = {s.id: s for s in specs}
-    for _ in specs:
-        for spec in specs:
-            parent = by_id.get(spec.source_question)
-            if parent:
-                items = [child for candidate in parent.candidate_items.values() for child in candidate.get("children", [])]
-                _set_candidates(spec, items)
-    return {s.id: s.question for s in specs if s.question is not None}
-
-
 def _action_inputs(specs, outcomes):
     """动作只解析本轮实际采纳的答案和提问时的候选快照。"""
     return {s.id: (s, o.value) for s in specs if (o := outcomes.get(s.id)) and o.has_answer}
@@ -826,42 +788,6 @@ def _assemble_result(specs, outcomes, *, scene):
     return result
 
 
-def _parse_answers(
-    answers: dict[str, object],
-    *,
-    scene: SceneType,
-    settings: PluginSettings,
-    memes: list[dict[str, str]],
-    target_message_ids: set[str] | None = None,
-) -> DecisionResult:
-    """保留本地解析入口；实际调用通过 evaluate_specs 使用提问时的同一快照。"""
-    targets = target_message_ids
-    if targets is None:
-        target = next(
-            (q for q in settings.decision_questions if q.role == "target" or q.candidate_source == "recent_messages"), None
-        )
-        answer = answers.get(target.id) if target else None
-        if isinstance(answer, DecisionChoiceAnswer):
-            targets = set(answer.probabilities) | {answer.choice}
-    specs = _build_specs(
-        settings.decision_questions,
-        scene,
-        [],
-        memes,
-        settings,
-        targets={k: k for k in targets or ()},
-    )
-    outcomes = {}
-    workflow = _workflow(specs, outcomes, [])
-    batch = next(workflow, None)
-    while batch:
-        try:
-            batch = workflow.send(answers)
-        except StopIteration:
-            break
-    return _assemble_result(specs, outcomes, scene=scene)
-
-
 async def ask_decision(
     context,
     *,
@@ -884,8 +810,6 @@ async def ask_decision(
     """
     started = time.monotonic()
     quote_mode = settings.target_quote_mode
-    if settings.decision_questions_warning:
-        logger.warning("判断问题配置：%s", settings.decision_questions_warning)
     specs = []
     outcomes = {}
     batches = []

@@ -54,9 +54,9 @@ import astrbot_plugin_quick_decision.reply_generator as reply_generator
 importlib.reload(reply_generator)
 
 from astrbot_plugin_quick_decision.models import DecisionResult, SessionProfile
+from engine_helpers import build_meme_chain
 from astrbot_plugin_quick_decision.reply_generator import (
     after_official_text_sent,
-    build_meme_chain,
     build_send_chain,
     official_text_was_sent,
     prepare_official_result_chain,
@@ -231,15 +231,20 @@ class MemeFollowupTests(unittest.TestCase):
         self.assertTrue(sent)
         self.assertEqual(sent_texts, ["一段", "三段"])
 
-    def test_idle_sessions_and_locks_are_pruned(self) -> None:
+    def test_idle_sessions_are_pruned_unless_their_lock_is_held(self) -> None:
         store = SessionStore(Path(self.temp.name))
-        profile = SessionProfile(umo="old", is_private=False)
-        runtime = store.ensure(profile)
+        runtime = store.ensure(SessionProfile(umo="old", is_private=False))
         runtime.last_user_ts = time.time() - 90000
-        store.session_lock("old")
-        self.assertEqual(store.prune_idle(), 1)
+        busy = store.ensure(SessionProfile(umo="busy", is_private=False))
+        busy.last_user_ts = time.time() - 90000
+
+        async def prune_while_locked():
+            async with busy.lock:
+                return store.prune_idle()
+
+        self.assertEqual(asyncio.run(prune_while_locked()), 1)
         self.assertIsNone(store.get("old"))
-        self.assertNotIn("old", store._session_locks)
+        self.assertIs(store.get("busy"), busy)
 
     def test_no_image_sends_text_only(self) -> None:
         context = _RecordingContext()

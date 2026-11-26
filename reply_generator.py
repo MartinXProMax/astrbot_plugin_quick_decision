@@ -13,7 +13,7 @@ from astrbot.api.message_components import Plain, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import TextPart
 
-from .decision_tools import meme_chain, run_tools, send_chain, skip_tools
+from .decision_tools import run_tools, send_chain, skip_tools
 from .models import DecisionResult
 from .tts_adapter import has_record
 
@@ -94,11 +94,6 @@ def build_send_chain(
     if text:
         chain.message(text)
     return chain
-
-
-def build_meme_chain(resolver: ImageResolver, decision: DecisionResult) -> MessageChain:
-    """构造不含文字、默认不引用的独立表情消息；最多一张。缺图时为空链。"""
-    return meme_chain(resolver, decision.meme_id if decision.use_meme else None)
 
 
 def take_event_decision(event) -> DecisionResult | None:
