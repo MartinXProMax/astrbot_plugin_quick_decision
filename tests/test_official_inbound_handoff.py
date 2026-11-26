@@ -1340,7 +1340,8 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(runtime.pending_pipeline, stale)
         self.assertFalse(task.done())
 
-        await self.plugin._release_stale_pipelines(now=runtime.pipeline_started_at + grace)
+        # 边界各留 1 秒：(started + grace) - started 的浮点结果可能略小于 grace。
+        await self.plugin._release_stale_pipelines(now=runtime.pipeline_started_at + grace + 1)
         self.assertIsNone(await task)
         self.assertEqual(self.decision_calls, 2)
         self.assertIs(self.plugin.sessions.find_log(stale.round_id)["reply_sent"], False)
@@ -1366,7 +1367,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
             await self.plugin._release_stale_pipelines(now=later)
             self.assertIs(runtime.pending_pipeline, decision)
             self.assertEqual(runtime.pipeline_active_at, later)
-            await self.plugin._release_stale_pipelines(now=started + self.main_mod.PIPELINE_MAX_SECONDS)
+            await self.plugin._release_stale_pipelines(now=started + self.main_mod.PIPELINE_MAX_SECONDS + 1)
         self.assertIsNone(runtime.pending_pipeline)
         self.assertIsNone(runtime.pipeline_event)
         self.assertFalse(runtime.deciding)
@@ -1397,7 +1398,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         release_official_pipeline(runtime)
         current = DecisionResult(action="reply")
         begin_official_pipeline(runtime, current)
-        runtime.pipeline_active_at -= grace
+        runtime.pipeline_active_at -= grace + 1
         await self.plugin.on_using_llm_tool(event, None, {})
         await self.plugin._release_stale_pipelines()
         self.assertIsNone(runtime.pending_pipeline)
