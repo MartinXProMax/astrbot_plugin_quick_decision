@@ -1,5 +1,44 @@
 # 更新日志
 
+## v1.6.2
+
+本版本接续 v1.6.1 更新日志已覆盖的 `f039db9`，记录从 `b42b655` 到 `ee746fd` 的全部 9 个已推送提交（`f039db9..ee746fd`），包含 1 个 v1.6.1 发布提交和 8 个修复、整理提交。
+
+- 发布 v1.6.1，更新版本号与更新日志（[`b42b655`](https://github.com/MartinXProMax/astrbot_plugin_quick_decision/commit/b42b655d8723f5e03d597722672448adf2befbae)）
+- 表情候选缓存同时按修改时间和文件大小失效（[`bc8cf0c`](https://github.com/MartinXProMax/astrbot_plugin_quick_decision/commit/bc8cf0c1a1713c50c272871f7a5dfc27786ab21d)）
+- AstrBot 没有回调发送完成时释放会话（[`5166df8`](https://github.com/MartinXProMax/astrbot_plugin_quick_decision/commit/5166df85d2f73f5648a975b4e289eee46e970391)）
+- 刷新表情候选时不再逐张读取图片（[`446da16`](https://github.com/MartinXProMax/astrbot_plugin_quick_decision/commit/446da1645ddaddc89bba8fc022657b26834e65d1)）
+- 同一会话连续同因跳过时合并为一条日志（[`d685399`](https://github.com/MartinXProMax/astrbot_plugin_quick_decision/commit/d6853998d766d071c1b5ceeb7f69bbdae8aed7ec)）
+- 删除无用代码，只供测试使用的入口移到测试目录（[`7521080`](https://github.com/MartinXProMax/astrbot_plugin_quick_decision/commit/7521080a39a00d018ea0b7a6261beee2680028c4)）
+- 插件钩子和发送也算作回复仍在进行（[`6ffdf3f`](https://github.com/MartinXProMax/astrbot_plugin_quick_decision/commit/6ffdf3ff32eed882c9caa91a18eff9e726e55b0f)）
+- 日志统计按跳过次数加权，并处理审查发现的其余问题（[`73d1c1b`](https://github.com/MartinXProMax/astrbot_plugin_quick_decision/commit/73d1c1b25d044f9ff85290982244e94638009513)）
+- 超时测试在边界处留出余量，不再偶发失败（[`ee746fd`](https://github.com/MartinXProMax/astrbot_plugin_quick_decision/commit/ee746fd78c78802c954b9305f8f30bd5a50faf53)）
+
+### 会话不再永久失声
+
+- 修复一次回复没发出去后，整个会话再也不回复：AstrBot 在结果为空、正文为空、只剩引用或 @、`send_message_to_user` 已发过同样的文字、流式结果没有数据流时，不会调用发送完成钩子。此前本插件会一直占着会话，之后的消息（包括 @ 机器人）都不再回复，冷场和定时判断也一直跳过，只能重载插件恢复。
+- 现在后台每 15 秒检查一次：官方 Agent 仍在运行时最多等 30 分钟；否则从最后一次动静（官方 Agent 运行、插件钩子触发、发送消息）起再等 180 秒，超时就释放会话。这一轮记为未发送，发送后的表情跳过。迟到的发送钩子只结束自己那一轮，不会提前结束下一轮。
+
+### 表情包
+
+- 表情包管理器加图或改描述后，第一次选图不再把整个图库读一遍：元数据带 `entry_id` 时只读元数据，800 张 300KB 的图库从约 530 ms 降到 64 ms。读不了的图片不再作为候选。旧库迁移按内容去重时仍逐张读取，改在线程中执行，不卡住消息处理。
+- 候选缓存同时看修改时间和文件大小，在 FAT、exFAT、SMB 和部分 FUSE、Docker 挂载上替换图片或改描述也能及时生效。
+
+### 决策日志
+
+- 同一会话连续因同一原因跳过时（例如群聊冷却期内每条未 @ 的消息）合并为一条，记下次数和开始时间，日志页显示为「冷却中跳过（连续 7 次，自 10:01:30 起）」，不再把真正的判断挤出保留条数。定时题的跳过按题目分开，并显示是哪道定时题。发言率和失败率按跳过次数计算。
+- 冷场时既不能开口（开关关闭、冷却中或已达每小时上限）、也没有命中即执行的动作时，不再起回合、不写跳过日志；`/decision status` 仍能看到冷场被跳过。
+- 判断问题配置有警告时，每次配置改动只提醒一次，不再每轮判断重复。
+
+### 代码整理
+
+- 删除未使用的 `debounce_task`、`extract_images`、`remainder_after_command`、`session_lock` 和对 `vision_provider_id` 的读取；该配置项仍保留，以免覆盖已有配置。清理闲置会话时改为检查会话实际使用的锁。只供测试使用的 `_parse_answers`、`_build_questions`、`evaluate_specs`、`build_meme_chain` 移到 `tests/engine_helpers.py`。`.gitignore` 忽略 FUSE 留下的 `.fuse_hidden*` 文件。
+
+### 兼容性与验证
+
+- 版本更新为 `1.6.2`，继续支持 AstrBot `>=4.29.4,<5` 与 `aiocqhttp`，无需新增 Python 第三方依赖；判断配置与编辑接口不变。决策日志新增可选字段 `skip_count`、`first_time`、`timer_roots`，旧日志照常读取。
+- 回归覆盖发送完成钩子缺失时的超时释放、官方 Agent 仍在运行或仍有动静时继续等待、迟到的钩子不影响下一轮、跳过记录合并与统计、表情候选不读图片与排除读不了的图片，以及旧库迁移在线程中执行。本次发布检查运行 317 项 Python 测试和 37 项前端测试，全部通过；此前受文件修改时间精度影响的 2 项表情包缓存测试也随缓存修复通过。前端语法检查和配置 JSON 校验通过。
+
 ## v1.6.1
 
 本版本接续 v1.6.0 更新日志已覆盖的 `e83d517`，记录从 `e68c9e7` 到 `f039db9` 的全部 2 个已推送提交（`e83d517..f039db9`），包含 1 个 v1.6.0 发布提交和 1 个修复提交。
