@@ -164,6 +164,15 @@ def begin_official_pipeline(runtime, result, event=None) -> None:
     runtime.pipeline_released.clear()
 
 
+def touch_official_pipeline(runtime, decision) -> None:
+    """官方流水线仍有动静（模型请求、工具调用、模型回复、装饰、发送）时记下时刻，推迟超时释放。
+
+    只认仍占用会话的这一轮：已被超时释放的旧事件迟到的动静不能延长下一轮。
+    """
+    if runtime is not None and decision is not None and getattr(runtime, "pending_pipeline", None) is decision:
+        runtime.pipeline_active_at = time.monotonic()
+
+
 def release_official_pipeline(runtime, decision=None) -> bool:
     """结束官方流水线对会话的占用。
 

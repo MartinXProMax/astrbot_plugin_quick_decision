@@ -1354,6 +1354,36 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(runtime.deciding)
         self.assertTrue(runtime.pipeline_released.is_set())
 
+    async def test_hooks_and_sends_keep_a_slow_pipeline_alive(self) -> None:
+        # 读不到官方 Agent 状态时，插件钩子和发送也说明本轮仍在运行，不能从开始算满 180 秒就释放。
+        event = FakeEvent(umo="aiocqhttp:FriendMessage:slow-hooks", text="查一下", is_private=True,
+                          at_or_wake=True, message_id="h1", timestamp=10)
+        await self.plugin.on_chat_message(event)
+        runtime = self.plugin.sessions.get(event.unified_msg_origin)
+        decision = runtime.pending_pipeline
+        grace = self.main_mod.PIPELINE_GRACE_SECONDS
+        pokes = {
+            "tool": lambda: self.plugin.on_using_llm_tool(event, None, {}),
+            "response": lambda: self.plugin.on_llm_response(event, None),
+            "send": lambda: event.send(SimpleNamespace(chain=[])),
+        }
+        for name, poke in pokes.items():
+            with self.subTest(poke=name):
+                runtime.pipeline_started_at -= grace
+                runtime.pipeline_active_at -= grace
+                await poke()
+                await self.plugin._release_stale_pipelines()
+                self.assertIs(runtime.pending_pipeline, decision)
+
+        # 已被释放的旧事件迟到的动静不延长下一轮。
+        release_official_pipeline(runtime)
+        current = DecisionResult(action="reply")
+        begin_official_pipeline(runtime, current)
+        runtime.pipeline_active_at -= grace
+        await self.plugin.on_using_llm_tool(event, None, {})
+        await self.plugin._release_stale_pipelines()
+        self.assertIsNone(runtime.pending_pipeline)
+
     async def test_initialize_runs_legacy_migration_off_the_event_loop(self) -> None:
         import threading
 

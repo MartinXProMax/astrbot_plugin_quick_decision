@@ -50,6 +50,7 @@ from .official_handoff import (
     session_release_event,
     should_use_default_official_agent,
     suppress_default_official_agent,
+    touch_official_pipeline,
 )
 from .official_segment import platform_name_from_event
 from .plugin_paths import load_plugin_data_dir
@@ -75,8 +76,9 @@ LOG_TEXT_LIMIT = 120
 PROACTIVE_CONCURRENCY = 4
 # 合成语音前最多等多久正文生成后的语气判断；超时就用引擎默认语气。
 VOICE_TONE_WAIT_SECONDS = 15
-# 官方 Agent 结束（或开始占用）后，最多等多久发送完成钩子；超时视为本轮已结束并释放会话。
-# AstrBot 在结果为空、正文为空或只剩引用段等情况下直接结束发送阶段，不调用 after_message_sent。
+# 官方流水线最后一次有动静后（官方 Agent 仍在运行，或插件钩子、发送被调用），最多等多久发送完成钩子；
+# 超时视为本轮已结束并释放会话。AstrBot 在结果为空、正文为空或只剩引用段等情况下直接结束发送阶段，
+# 不调用 after_message_sent。
 PIPELINE_GRACE_SECONDS = 180
 # 官方 Agent 一直显示在运行时，占用会话的上限。
 PIPELINE_MAX_SECONDS = 1800
@@ -447,7 +449,8 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         result.official_llm = True
         await self._log_decision(profile, result)
         event.set_extra("quick_decision", result)
-        install_group_quote_guard(event, result, on_stream_end=self._finish_official_send, private=profile.is_private)
+        install_group_quote_guard(event, result, on_stream_end=self._finish_official_send, private=profile.is_private,
+                                  on_activity=lambda: touch_official_pipeline(runtime, result))
         begin_official_pipeline(runtime, result, event)
         return request
 
@@ -683,8 +686,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
     async def _release_stale_pipelines(self, now: float | None = None) -> None:
         """释放迟迟没有回调发送完成钩子的官方流水线，免得会话永久挂起、之后的消息都不再回复。
 
-        官方 Agent 仍在运行时一直等（最多 PIPELINE_MAX_SECONDS）；它结束后再等 PIPELINE_GRACE_SECONDS，
-        留给装饰、语音合成和分段发送。不在插件停用时跳过：停用期间卡住的会话，重新启用后也要能恢复。
+        官方 Agent 仍在运行时一直等（最多 PIPELINE_MAX_SECONDS）；否则从最后一次动静起再等
+        PIPELINE_GRACE_SECONDS，留给装饰、语音合成和分段发送。动静还包括插件钩子和发送（_touch_pipeline），
+        读不到官方 Agent 状态时（其他 AstrBot 版本、第三方执行器）全靠它们。
+        不在插件停用时跳过：停用期间卡住的会话，重新启用后也要能恢复。
         """
         now = time.monotonic() if now is None else now
         for runtime in self.sessions.all_sessions():
@@ -870,6 +875,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         decision = self._pipeline_decision(event)
         if decision is None:
             return
+        self._touch_pipeline(event, decision)
         if self.settings.dry_run:
             event.stop_event()
             await self._cancel_official_round(event, decision, "已切换到试运行")
@@ -925,6 +931,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         decision = self._pipeline_decision(event)
         if decision is None:
             return
+        self._touch_pipeline(event, decision)
         if resp and resp.role == "err":
             event.set_extra("_qd_llm_error", True)
             return
@@ -940,7 +947,8 @@ class QuickDecisionPlugin(Star, WebApiMixin):
 
     @filter.on_using_llm_tool()
     async def on_using_llm_tool(self, event, tool, tool_args):
-        if self._pipeline_decision(event):
+        if decision := self._pipeline_decision(event):
+            self._touch_pipeline(event, decision)
             event.set_extra("_qd_intermediate_receipt", None)
 
     # 先于通用 TTS（priority=0）执行：它会把文字换成语音，并在跳过时把结果改标为普通消息。
@@ -949,6 +957,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         decision = self._pipeline_decision(event)
         if decision is None:
             return
+        self._touch_pipeline(event, decision)
         result = event.get_result()
         if result is None:
             return
@@ -1098,6 +1107,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             return status.message or "未对接，按文字发送"
         line = f"通用 TTS {status.plugin_version or ''}，引擎 {status.engine}"
         return f"{line}（{status.message}）" if status.message else line
+
+    def _touch_pipeline(self, event, decision: DecisionResult) -> None:
+        """官方流水线仍有动静，推迟超时释放；读不到官方 Agent 状态时全靠这些信号。"""
+        touch_official_pipeline(self.sessions.get(event.unified_msg_origin), decision)
 
     def _pipeline_decision(self, event: AstrMessageEvent) -> DecisionResult | None:
         extra = event.get_extra("quick_decision")

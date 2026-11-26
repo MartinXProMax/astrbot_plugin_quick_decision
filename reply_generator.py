@@ -181,8 +181,12 @@ def official_generation_failed(event) -> bool:
     return runner is not None and getattr(runner.get_final_llm_resp(), "role", None) == "err"
 
 
-def install_group_quote_guard(event, decision: DecisionResult, *, on_stream_end=None, private=False) -> None:
-    """只改写本轮模型输出的最终发送链，包括官方缓存或实时分段的流式正文。"""
+def install_group_quote_guard(event, decision: DecisionResult, *, on_stream_end=None, private=False,
+                              on_activity=None) -> None:
+    """只改写本轮模型输出的最终发送链，包括官方缓存或实时分段的流式正文。
+
+    on_activity 在本事件每次发送时调用，告诉插件官方流水线仍在运行。
+    """
     original = event.send
     # after_message_sent 会消费一次性的工具计划，同一事件的下一份模型结果仍需使用引用策略。
     event.set_extra("_qd_quote_decision", decision)
@@ -216,6 +220,8 @@ def install_group_quote_guard(event, decision: DecisionResult, *, on_stream_end=
 
     async def send(message, *args, **kwargs):
         nonlocal quoted, last_result
+        if on_activity is not None:
+            on_activity()
         chain = getattr(message, "chain", None)
         if not chain or event.get_extra("_qd_quote_decision") is not decision:
             return await original(message, *args, **kwargs)
@@ -266,6 +272,8 @@ def install_group_quote_guard(event, decision: DecisionResult, *, on_stream_end=
 
     async def send_streaming(*args, **kwargs):
         nonlocal quoted
+        if on_activity is not None:
+            on_activity()
         if (event.get_extra("quick_decision") is not decision or streaming_response_event is None
                 or streaming_response_event.get(None) is not event):
             return await original_stream(*args, **kwargs)
