@@ -1246,6 +1246,68 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(follow_up, ProviderRequest)
         self.assertEqual(self.decision_calls, 2)
 
+    async def test_pipeline_without_after_send_is_released_after_grace(self) -> None:
+        # AstrBot 在正文为空等情况下不调用 after_message_sent，会话不能因此永久挂起。
+        first = FakeEvent(umo="aiocqhttp:FriendMessage:stale", text="你好", is_private=True,
+                          at_or_wake=True, message_id="s1", timestamp=10)
+        await self.plugin.on_chat_message(first)
+        runtime = self.plugin.sessions.get(first.unified_msg_origin)
+        stale = first.get_extra("quick_decision")
+        self.assertIs(runtime.pending_pipeline, stale)
+        self.assertIs(runtime.pipeline_event, first)
+
+        second = FakeEvent(umo=first.unified_msg_origin, text="在吗", is_private=True,
+                           at_or_wake=True, message_id="s2", timestamp=20)
+        task = asyncio.create_task(self.plugin.on_chat_message(second))
+        await asyncio.sleep(0)
+        grace = self.main_mod.PIPELINE_GRACE_SECONDS
+        await self.plugin._release_stale_pipelines(now=runtime.pipeline_started_at + grace - 1)
+        self.assertIs(runtime.pending_pipeline, stale)
+        self.assertFalse(task.done())
+
+        await self.plugin._release_stale_pipelines(now=runtime.pipeline_started_at + grace)
+        self.assertIsNone(await task)
+        self.assertEqual(self.decision_calls, 2)
+        self.assertIs(self.plugin.sessions.find_log(stale.round_id)["reply_sent"], False)
+        self.assertFalse(stale.text_sent)
+
+        # 第二轮占用会话后，第一轮迟到的发送钩子不能把它释放掉。
+        current = second.get_extra("quick_decision")
+        self.assertIs(runtime.pending_pipeline, current)
+        await self.plugin.after_message_sent(first)
+        self.assertIs(runtime.pending_pipeline, current)
+        self.assertTrue(runtime.deciding)
+
+    async def test_running_official_agent_keeps_pipeline_until_cap(self) -> None:
+        event = FakeEvent(umo="aiocqhttp:FriendMessage:slow-agent", text="查一下", is_private=True,
+                          at_or_wake=True, message_id="a1", timestamp=10)
+        await self.plugin.on_chat_message(event)
+        runtime = self.plugin.sessions.get(event.unified_msg_origin)
+        decision = runtime.pending_pipeline
+        started = runtime.pipeline_started_at
+        runner = SimpleNamespace(done=lambda: False)
+        with patch.object(self.main_mod, "active_event_runner", lambda ev: runner if ev is event else None):
+            later = started + self.main_mod.PIPELINE_GRACE_SECONDS * 2
+            await self.plugin._release_stale_pipelines(now=later)
+            self.assertIs(runtime.pending_pipeline, decision)
+            self.assertEqual(runtime.pipeline_active_at, later)
+            await self.plugin._release_stale_pipelines(now=started + self.main_mod.PIPELINE_MAX_SECONDS)
+        self.assertIsNone(runtime.pending_pipeline)
+        self.assertIsNone(runtime.pipeline_event)
+        self.assertFalse(runtime.deciding)
+        self.assertTrue(runtime.pipeline_released.is_set())
+
+    async def test_release_ignores_other_rounds(self) -> None:
+        from astrbot_plugin_quick_decision.session_store import SessionRuntime
+
+        runtime = SessionRuntime(profile=SessionProfile("aiocqhttp:GroupMessage:guard", False))
+        current, old = DecisionResult(action="reply"), DecisionResult(action="reply")
+        begin_official_pipeline(runtime, current)
+        self.assertFalse(release_official_pipeline(runtime, old))
+        self.assertIs(runtime.pending_pipeline, current)
+        self.assertTrue(release_official_pipeline(runtime, current))
+        self.assertIsNone(runtime.pending_pipeline)
+
     async def test_follow_up_rejudgement_still_obeys_cooldown(self) -> None:
         first = FakeEvent(
             umo="aiocqhttp:GroupMessage:follow-up-cooldown",

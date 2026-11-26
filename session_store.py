@@ -9,6 +9,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from astrbot.api import logger
 
@@ -33,6 +34,10 @@ class SessionRuntime:
     proactive_times: deque[float] = field(default_factory=deque)
     last_decision: DecisionResult | None = None
     pending_pipeline: DecisionResult | None = None
+    # 占用会话的官方事件，以及开始占用、最后一次看到官方 Agent 仍在运行的时刻（monotonic）。
+    pipeline_event: Any = None
+    pipeline_started_at: float = 0.0
+    pipeline_active_at: float = 0.0
     pipeline_released: asyncio.Event = field(default_factory=asyncio.Event)
     proactive_running: bool = False
     proactive_released: asyncio.Event = field(default_factory=asyncio.Event)

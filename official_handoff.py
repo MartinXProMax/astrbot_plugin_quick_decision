@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Iterable
 
 from astrbot.api import logger
@@ -154,18 +155,29 @@ def is_official_pipeline_busy(runtime) -> bool:
     )
 
 
-def begin_official_pipeline(runtime, result) -> None:
+def begin_official_pipeline(runtime, result, event=None) -> None:
+    """占用会话直到官方流水线发完本轮正文；event 供超时检查查看官方 Agent 是否仍在运行。"""
     runtime.pending_pipeline = result
+    runtime.pipeline_event = event
+    runtime.pipeline_started_at = runtime.pipeline_active_at = time.monotonic()
     runtime.deciding = True
     runtime.pipeline_released.clear()
 
 
-def release_official_pipeline(runtime) -> None:
+def release_official_pipeline(runtime, decision=None) -> bool:
+    """结束官方流水线对会话的占用。
+
+    给了 decision 时只释放这一轮：超时释放后，旧事件迟到的发送钩子不能结束下一轮。
+    """
     if runtime is None:
-        return
+        return False
+    if decision is not None and getattr(runtime, "pending_pipeline", None) is not decision:
+        return False
     runtime.pending_pipeline = None
+    runtime.pipeline_event = None
     runtime.deciding = False
     runtime.pipeline_released.set()
+    return True
 
 
 def begin_proactive_round(runtime) -> None:

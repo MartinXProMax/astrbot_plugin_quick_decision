@@ -75,6 +75,11 @@ LOG_TEXT_LIMIT = 120
 PROACTIVE_CONCURRENCY = 4
 # 合成语音前最多等多久正文生成后的语气判断；超时就用引擎默认语气。
 VOICE_TONE_WAIT_SECONDS = 15
+# 官方 Agent 结束（或开始占用）后，最多等多久发送完成钩子；超时视为本轮已结束并释放会话。
+# AstrBot 在结果为空、正文为空或只剩引用段等情况下直接结束发送阶段，不调用 after_message_sent。
+PIPELINE_GRACE_SECONDS = 180
+# 官方 Agent 一直显示在运行时，占用会话的上限。
+PIPELINE_MAX_SECONDS = 1800
 
 
 def _log_text(value: str, limit: int = LOG_TEXT_LIMIT) -> str:
@@ -437,7 +442,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         await self._log_decision(profile, result)
         event.set_extra("quick_decision", result)
         install_group_quote_guard(event, result, on_stream_end=self._finish_official_send, private=profile.is_private)
-        begin_official_pipeline(runtime, result)
+        begin_official_pipeline(runtime, result, event)
         return request
 
     def _resolve_passive_scene(
@@ -658,12 +663,42 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         while True:
             try:
                 await asyncio.sleep(15)
+                await self._release_stale_pipelines()
                 await self._check_timers()
                 await self._check_silence()
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
                 logger.exception("检查定时判断或冷场主动发言时出错")
+
+    async def _release_stale_pipelines(self, now: float | None = None) -> None:
+        """释放迟迟没有回调发送完成钩子的官方流水线，免得会话永久挂起、之后的消息都不再回复。
+
+        官方 Agent 仍在运行时一直等（最多 PIPELINE_MAX_SECONDS）；它结束后再等 PIPELINE_GRACE_SECONDS，
+        留给装饰、语音合成和分段发送。不在插件停用时跳过：停用期间卡住的会话，重新启用后也要能恢复。
+        """
+        now = time.monotonic() if now is None else now
+        for runtime in self.sessions.all_sessions():
+            decision = runtime.pending_pipeline
+            if decision is None:
+                continue
+            try:
+                runner = active_event_runner(runtime.pipeline_event) if runtime.pipeline_event is not None else None
+                if runner is not None and not runner.done():
+                    runtime.pipeline_active_at = now
+            except Exception:  # noqa: BLE001
+                logger.debug("无法读取官方 Agent 状态：%s", runtime.profile.umo, exc_info=True)
+            held = now - runtime.pipeline_started_at
+            if now - runtime.pipeline_active_at < PIPELINE_GRACE_SECONDS and held < PIPELINE_MAX_SECONDS:
+                continue
+            if not release_official_pipeline(runtime, decision):
+                continue
+            logger.warning("官方流水线 %d 秒未回调发送完成（可能是正文为空或被其他插件中止），已释放会话：%s",
+                           held, runtime.profile.umo)
+            try:
+                await self._finish_tool_log(decision, "官方流水线未回调发送完成")
+            except Exception:  # noqa: BLE001
+                logger.exception("无法记录超时释放的回合：%s", decision.round_id)
 
     async def _check_timers(self) -> None:
         settings = self.settings
@@ -998,7 +1033,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                     self._schedule_post_decision(decision, text, event.unified_msg_origin, platform_name_from_event(event))
             elif stream_text is None:
                 self.sessions.mark_bot_sent(runtime.profile.umo)
-            release_official_pipeline(runtime)
+            release_official_pipeline(runtime, decision)
         try:
             await after_official_text_sent(
                 event,
@@ -1016,7 +1051,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
     async def _cancel_official_round(self, event, decision, reason):
         event.set_extra("quick_decision", None)
         event.set_extra("_qd_quote_decision", None)
-        release_official_pipeline(self.sessions.get(event.unified_msg_origin))
+        release_official_pipeline(self.sessions.get(event.unified_msg_origin), decision)
         await self._finish_tool_log(decision, reason)
 
     async def _finish_tool_log(self, result, reason="正文未确认发送"):
