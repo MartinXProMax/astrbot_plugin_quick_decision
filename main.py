@@ -132,8 +132,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
 
     async def initialize(self) -> None:
         try:
-            maybe_migrate_legacy_library(
-                self.data_dir, self.meme_adapter.resolve_data_dir()
+            # 迁移会读写整个旧图库，并逐张读取表情包管理器的图片做内容去重，放到线程里免得卡住事件循环。
+            # 迁移自建适配器实例，不与 self.meme_adapter 共用缓存。
+            await asyncio.to_thread(
+                maybe_migrate_legacy_library, self.data_dir, self.meme_adapter.resolve_data_dir()
             )
         except Exception:  # noqa: BLE001
             logger.exception("旧自制图库迁移失败，旧库保持原样，本轮不回退旧库发图")

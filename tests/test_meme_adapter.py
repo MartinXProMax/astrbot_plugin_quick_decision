@@ -270,14 +270,42 @@ class MemeAdapterTests(unittest.TestCase):
             adapter.described_catalog()
             self.assertEqual(load.call_count, 1)
 
-    def test_catalog_cache_reloads_when_image_is_replaced(self) -> None:
+    def test_content_derived_id_follows_replaced_image(self) -> None:
+        # 元数据没有 entry_id 时，ID 由图片内容算出；原地替换图片后缓存必须失效。
         _make_pack(self.manager_dir, "pack-a", [("smile.png", PNG, "微笑点头")])
+        semantic_path = self.manager_dir / "packs/pack-a/semantic_metadata.json"
+        data = json.loads(semantic_path.read_text(encoding="utf-8"))
+        for rec in data["images"].values():
+            rec.pop("entry_id")
+        semantic_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         adapter = MemeManagerAdapter(data_dir=self.manager_dir, require_plugin=False)
-        path = self.manager_dir / "packs/pack-a/memes/imported/smile.png"
-        first = adapter.list_candidates()[0].content_sha256
-        path.write_bytes(JPEG)
-        second = adapter.list_candidates()[0].content_sha256
-        self.assertNotEqual(first, second)
+        rel = "memes/imported/smile.png"
+        self.assertEqual(adapter.list_candidates()[0].id, semantic_entry_id(content_sha256(PNG), "imported", rel))
+        (self.manager_dir / "packs/pack-a" / rel).write_bytes(JPEG)
+        self.assertEqual(adapter.list_candidates()[0].id, semantic_entry_id(content_sha256(JPEG), "imported", rel))
+
+    def test_existing_content_hashes_read_current_images(self) -> None:
+        _make_pack(self.manager_dir, "pack-a", [("smile.png", PNG, "微笑点头"), ("blank.png", JPEG, "")])
+        adapter = MemeManagerAdapter(data_dir=self.manager_dir, require_plugin=False)
+        self.assertEqual(set(adapter.existing_content_hashes()), {content_sha256(PNG), content_sha256(JPEG)})
+        (self.manager_dir / "packs/pack-a/memes/imported/smile.png").write_bytes(JPEG + b"\0")
+        self.assertEqual(set(adapter.existing_content_hashes()),
+                         {content_sha256(JPEG + b"\0"), content_sha256(JPEG)})
+
+    def test_catalog_does_not_read_images_when_metadata_has_ids(self) -> None:
+        # 图库可能有几百兆；选图和发图只靠元数据，不能每次缓存失效都整库读一遍。
+        _make_pack(self.manager_dir, "pack-a", [("smile.png", PNG, "微笑点头"), ("cry.jpg", JPEG, "大哭")])
+        adapter = MemeManagerAdapter(data_dir=self.manager_dir, require_plugin=False)
+        from astrbot_plugin_quick_decision import meme_adapter as module
+
+        with patch.object(module, "content_sha256", wraps=module.content_sha256) as digest:
+            catalog = adapter.described_catalog()
+            self.assertEqual(len(catalog), 2)
+            self.assertIsNotNone(adapter.resolve_image(catalog[0]["id"]))
+            self.assertEqual(adapter.status().candidate_count, 2)
+            self.assertEqual(digest.call_count, 0)
+            adapter.existing_content_hashes()
+            self.assertEqual(digest.call_count, 2)
 
     def test_missing_file_and_updated_description_sync(self) -> None:
         _make_pack(self.manager_dir, "pack-a", [("smile.png", PNG, "微笑点头")])

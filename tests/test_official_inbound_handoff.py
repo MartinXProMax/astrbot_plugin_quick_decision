@@ -1297,6 +1297,25 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(runtime.deciding)
         self.assertTrue(runtime.pipeline_released.is_set())
 
+    async def test_initialize_runs_legacy_migration_off_the_event_loop(self) -> None:
+        import threading
+
+        calls = []
+        self.plugin.data_dir = Path(self.tmp.name)
+        self.plugin.meme_adapter.resolve_data_dir = lambda: Path(self.tmp.name) / "meme_manager"
+
+        def fake_migrate(data_dir, meme_dir):
+            calls.append((data_dir, meme_dir, threading.current_thread()))
+
+        with patch.object(self.main_mod, "maybe_migrate_legacy_library", fake_migrate):
+            await self.plugin.initialize()
+        self.plugin._silence_task.cancel()
+        await asyncio.gather(self.plugin._silence_task, return_exceptions=True)
+        self.assertEqual(len(calls), 1)
+        data_dir, meme_dir, thread = calls[0]
+        self.assertEqual((data_dir, meme_dir), (Path(self.tmp.name), Path(self.tmp.name) / "meme_manager"))
+        self.assertIsNot(thread, threading.main_thread())
+
     async def test_release_ignores_other_rounds(self) -> None:
         from astrbot_plugin_quick_decision.session_store import SessionRuntime
 

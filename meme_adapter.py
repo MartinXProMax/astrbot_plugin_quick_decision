@@ -152,7 +152,8 @@ class MemeCandidate:
     relative_path: str
     description: str
     path: Path
-    content_sha256: str
+    # 图片内容的 SHA256。只有元数据缺少合法 entry_id 或调用方要求时才读文件计算，否则为空。
+    content_sha256: str = ""
     caption_status: str = ""
 
 
@@ -273,8 +274,13 @@ def _semantic_captions(pack_dir: Path) -> dict[str, dict[str, Any]]:
 
 
 def iter_pack_images(
-    pack_dir: Path, pack_id: str, *, include_undesc: bool = False
+    pack_dir: Path, pack_id: str, *, include_undesc: bool = False, with_hashes: bool = False
 ) -> list[MemeCandidate]:
+    """列出图包里的图片候选。
+
+    元数据给出合法 entry_id 时不读图片内容：图库可能有几百兆，每次缓存失效都整库读一遍会卡住事件循环。
+    with_hashes 为真时总是读取并计算内容哈希，供旧库迁移按内容去重。
+    """
     memes_dir = pack_dir / "memes"
     if not memes_dir.is_dir():
         return []
@@ -296,12 +302,15 @@ def iter_pack_images(
             if not caption and not include_undesc:
                 continue
             description = caption or "（暂无描述）"
-            try:
-                file_sha = content_sha256(safe.read_bytes())
-            except OSError:
-                continue
             entry_id = str(rec.get("entry_id") or "").strip().lower()
-            if not ENTRY_ID_RE.match(entry_id):
+            has_entry_id = bool(ENTRY_ID_RE.match(entry_id))
+            file_sha = ""
+            if with_hashes or not has_entry_id:
+                try:
+                    file_sha = content_sha256(safe.read_bytes())
+                except OSError:
+                    continue
+            if not has_entry_id:
                 entry_id = semantic_entry_id(file_sha, category, relative_path)
             candidates.append(
                 MemeCandidate(
@@ -488,6 +497,18 @@ class MemeManagerAdapter:
         cached = self._candidate_cache.get(include_undesc)
         if cached and cached[0] == cache_key:
             return cached[1]
+        candidates = self._scan(data_dir, packs, include_undesc=include_undesc)
+        self._candidate_cache[include_undesc] = (cache_key, candidates)
+        return candidates
+
+    @staticmethod
+    def _scan(
+        data_dir: Path,
+        packs: list[dict[str, Any]],
+        *,
+        include_undesc: bool,
+        with_hashes: bool = False,
+    ) -> list[MemeCandidate]:
         packs_root = data_dir / "packs"
         candidates: list[MemeCandidate] = []
         seen_ids: set[str] = set()
@@ -499,13 +520,12 @@ class MemeManagerAdapter:
             if pack_dir is None:
                 continue
             for candidate in iter_pack_images(
-                pack_dir, pack_id, include_undesc=include_undesc
+                pack_dir, pack_id, include_undesc=include_undesc, with_hashes=with_hashes
             ):
                 if candidate.id in seen_ids:
                     continue
                 seen_ids.add(candidate.id)
                 candidates.append(candidate)
-        self._candidate_cache[include_undesc] = (cache_key, candidates)
         return candidates
 
     def described_catalog(self) -> list[dict[str, str]]:
@@ -527,7 +547,16 @@ class MemeManagerAdapter:
         return None
 
     def existing_content_hashes(self) -> dict[str, MemeCandidate]:
-        return {
-            item.content_sha256: item
-            for item in self.list_candidates(include_undesc=True)
-        }
+        """按内容哈希索引全部图片（含无描述的），供旧库迁移去重。
+
+        会读取每一张图片且不缓存；只在迁移时调用，调用方应放到线程里执行。
+        """
+        if self.require_plugin and self.get_registered_star() is None:
+            return {}
+        data_dir = self.resolve_data_dir()
+        if data_dir is None:
+            return {}
+        candidates = self._scan(
+            data_dir, self._registry(data_dir), include_undesc=True, with_hashes=True
+        )
+        return {item.content_sha256: item for item in candidates}
