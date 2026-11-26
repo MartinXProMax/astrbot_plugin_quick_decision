@@ -1,5 +1,5 @@
 import { probabilityRows } from "./log-probabilities.mjs";
-import { logHasIssue, sessionLabel, summarizeLogs } from "./log-summary.mjs";
+import { logHasIssue, sessionLabel, skipText, summarizeLogs } from "./log-summary.mjs";
 import * as sm from "./settings-model.mjs";
 import * as wf from "./workflow-model.mjs";
 
@@ -1969,7 +1969,7 @@ function renderLog(item) {
       sub,
       item.trigger_text ? h("p", { class: "log-message" }, h("b", null, "触发"), item.trigger_text) : null,
       item.reply_text ? h("p", { class: "log-message is-reply" }, h("b", null, (item.reply_complete === false ? "部分回复" : "回复") + (item.reply_voice ? "（语音）" : "")), item.reply_text) : null,
-      item.raw?.skip_reason ? h("p", { class: "log-meta" }, item.raw.skip_reason) : null,
+      item.raw?.skip_reason ? h("p", { class: "log-meta" }, skipText(item)) : null,
       item.error ? h("p", { class: "log-error" }, item.error) : null,
       item.umo ? h("p", { class: "log-umo", title: item.umo }, sessionLabel(item.umo, item.session_name)) : null,
       detail,

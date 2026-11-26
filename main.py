@@ -648,7 +648,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             if trigger:
                 record.update(trigger_text=_log_text(trigger["text"]),
                               trigger_sender=trigger["sender_name"] or trigger["sender_id"])
-        await self.sessions.append_log(record)
+        if result.raw.get("skip_reason") and not result.outcomes:
+            await self.sessions.append_skip_log(record)
+        else:
+            await self.sessions.append_log(record)
 
     async def _update_log_reply(self, result: DecisionResult, text: str, *, complete=True) -> None:
         if result.round_id and text:
@@ -743,6 +746,13 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             if self.sessions.silence_already_evaluated(profile.umo):
                 continue
             if now - runtime.last_activity < settings.silence_seconds(profile.is_private):
+                continue
+            scene = "private_proactive" if profile.is_private else "group_proactive"
+            if self._proactive_skip_reason(settings, profile, False) and not has_on_match_actions(
+                settings.decision_questions, scene, trigger_event="silence_elapsed"
+            ):
+                # 不能开口、也没有命中即执行的动作：本段冷场到此为止，不起回合，也不写跳过日志。
+                self.sessions.mark_silence_evaluated(profile.umo)
                 continue
             if len(self._proactive_tasks) >= PROACTIVE_CONCURRENCY:
                 continue

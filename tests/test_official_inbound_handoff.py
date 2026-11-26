@@ -1121,6 +1121,63 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         log = self.plugin.sessions.recent_logs()[0]
         self.assertEqual(log["raw"]["skip_reason"], "冷却中跳过")
 
+    async def test_consecutive_cooldown_skips_share_one_log_record(self) -> None:
+        self.plugin.config["cooldown_seconds"] = 300
+        umo = "aiocqhttp:GroupMessage:busy-cooldown"
+
+        async def message(text, mid, target=umo, cooling=True):
+            event = FakeEvent(umo=target, text=text, message_id=mid, timestamp=10)
+            self.plugin.sessions.ensure(_profile(event)).last_bot_ts = 10**12 if cooling else 0
+            return await self.plugin.on_chat_message(event)
+
+        await message("一", "c1")
+        first_time = self.plugin.sessions.recent_logs()[0]["time"]
+        await message("别的群", "o1", "aiocqhttp:GroupMessage:other")
+        await message("二", "c2")
+        await message("三", "c3")
+        logs = self.plugin.sessions.recent_logs(umo=umo)
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["skip_count"], 3)
+        self.assertEqual(logs[0]["first_time"], first_time)
+        self.assertEqual(logs[0]["trigger_text"], "三")
+        # 并入的记录移到末尾，保持日志按时间排列。
+        self.assertEqual(self.plugin.sessions.recent_logs()[0]["umo"], umo)
+        self.assertEqual(len(self.plugin.sessions.recent_logs()), 2)
+
+        # 中间有一轮真正的判断时，之后的跳过重新计数。
+        self.assertIsInstance(await message("现在可以说话了", "c4", cooling=False), ProviderRequest)
+        release_official_pipeline(self.plugin.sessions.get(umo))
+        await message("四", "c5")
+        latest = self.plugin.sessions.recent_logs(umo=umo)[0]
+        self.assertEqual(latest["raw"]["skip_reason"], "冷却中跳过")
+        self.assertNotIn("skip_count", latest)
+        self.assertEqual(len(self.plugin.sessions.recent_logs(umo=umo)), 3)
+
+    async def test_silence_without_any_possible_action_starts_no_round(self) -> None:
+        import time
+
+        from astrbot_plugin_quick_decision.event_utils import event_profile
+
+        self.plugin.config["group"]["enable_proactive_after_silence"] = False
+        self.plugin._run_proactive = AsyncMock()
+        event = FakeEvent(umo="aiocqhttp:GroupMessage:quiet", text="hi", message_id="q1", timestamp=10)
+        runtime = self.plugin.sessions.ensure(event_profile(event))
+        runtime.last_user_ts = time.time() - 4000
+
+        await self.plugin._check_silence()
+        await self.plugin._check_silence()
+        await _drain_proactive(self.plugin)
+        self.plugin._run_proactive.assert_not_awaited()
+        self.assertEqual(self.plugin.sessions.recent_logs(), [])
+        self.assertTrue(self.plugin.sessions.silence_already_evaluated(event.unified_msg_origin))
+
+        # 有命中即执行的动作（如命中后立刻发表情）时仍要起回合，由回合内按候选细查。
+        runtime.last_user_ts = time.time() - 3999
+        with patch.object(self.main_mod, "has_on_match_actions", lambda *a, **k: True):
+            await self.plugin._check_silence()
+        await _drain_proactive(self.plugin)
+        self.plugin._run_proactive.assert_awaited_once()
+
     async def test_empty_meme_candidates_do_not_keep_cooldown_judgement_alive(self) -> None:
         self.plugin.config.update(
             cooldown_seconds=300,

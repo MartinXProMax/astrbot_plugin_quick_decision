@@ -19,6 +19,13 @@ from .models import BufferedMessage, DecisionResult, SessionProfile
 LOG_FLUSH_DELAY = 1.0
 
 
+def _skip_key(row: dict) -> tuple | None:
+    """跳过记录的合并依据；不是跳过记录时为 None。"""
+    raw = row.get("raw")
+    reason = raw.get("skip_reason") if isinstance(raw, dict) else None
+    return (reason, row.get("scene"), row.get("trigger_event")) if reason else None
+
+
 @dataclass
 class SessionRuntime:
     profile: SessionProfile
@@ -210,6 +217,25 @@ class SessionStore:
         self._entries().append((line, json.loads(line)))
         self._trim_logs()
         self._schedule_flush()
+
+    async def append_skip_log(self, record: dict) -> None:
+        """记录一次跳过判断。同一会话连续因同一原因跳过时并成一条，免得冷却期内每条消息各占一条日志、
+        把真正的判断挤出保留条数。
+
+        并入的记录移到末尾，保留最新一次的触发消息和上下文；skip_count 记连续次数，first_time 记第一次的时间。
+        """
+        key = _skip_key(record)
+        entries = self._entries()
+        for i in range(len(entries) - 1, -1, -1):
+            row = entries[i][1]
+            if row.get("umo") != record.get("umo"):
+                continue
+            if key is not None and _skip_key(row) == key:
+                record = {**record, "skip_count": int(row.get("skip_count") or 1) + 1,
+                          "first_time": row.get("first_time") or row.get("time")}
+                del entries[i]
+            break
+        await self.append_log(record)
 
     async def update_tool_log(self, round_id: str, calls: list[dict]) -> None:
         await self.update_round_log(round_id, tool_calls=calls)
