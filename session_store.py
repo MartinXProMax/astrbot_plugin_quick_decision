@@ -32,7 +32,11 @@ def _skip_key(row: dict) -> tuple | None:
 class SessionRuntime:
     profile: SessionProfile
     messages: deque[BufferedMessage] = field(default_factory=lambda: deque(maxlen=80))
-    pending: list[BufferedMessage] = field(default_factory=list)
+    # 最近分配的消息序号，以及被动判断已经看过的最大序号；之间的用户消息尚待判断。
+    seq: int = 0
+    consumed_seq: int = 0
+    # 仍在 on_chat_message 里（判断中或排队等待）的入站消息处理器数。
+    handlers: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     deciding: bool = False
     last_user_ts: float = 0.0
@@ -56,6 +60,14 @@ class SessionRuntime:
     @property
     def last_activity(self) -> float:
         return max(self.last_user_ts, self.last_bot_ts)
+
+    def unconsumed_user_messages(self, upto_seq: int | None = None) -> list[BufferedMessage]:
+        """上一轮被动判断之后到达的用户消息，按到达顺序；给了 upto_seq 时只取到该序号为止。"""
+        upto = self.seq if upto_seq is None else upto_seq
+        return [m for m in self.messages if m.role == "user" and self.consumed_seq < m.seq <= upto]
+
+    def has_user_messages_after(self, seq: int) -> bool:
+        return any(m.role == "user" and m.seq > seq for m in self.messages)
 
 
 class SessionStore:
@@ -107,7 +119,7 @@ class SessionStore:
             if (
                 runtime.deciding
                 or runtime.pending_pipeline is not None
-                or runtime.pending
+                or runtime.handlers
                 or runtime.timer_due
                 or runtime.lock.locked()
             ):
@@ -124,6 +136,8 @@ class SessionStore:
         runtime = self.ensure(profile)
         if runtime.messages.maxlen != max(limit * 2, 20):
             runtime.messages = deque(runtime.messages, maxlen=max(limit * 2, 20))
+        runtime.seq += 1
+        message.seq = runtime.seq
         runtime.messages.append(message)
         received_at = time.time()
         timestamp = min(received_at, message.timestamp or received_at)

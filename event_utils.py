@@ -118,6 +118,7 @@ def to_buffered_message(event: AstrMessageEvent) -> BufferedMessage:
         text=text,
         is_at_bot=is_at,
         is_quote_bot=is_quote,
+        is_wake=bool(getattr(event, "is_at_or_wake_command", False)),
         quote_id=quote_id,
         quote_sender_id=quote_sender,
         quote_text=quote_text[:80],

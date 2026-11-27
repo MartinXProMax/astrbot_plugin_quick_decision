@@ -44,43 +44,20 @@ def should_use_default_official_agent(
     return bool(official_would_run) and not has_merged_messages
 
 
-def merged_user_messages(
-    messages: Iterable[BufferedMessage],
-    *,
-    first_message_id: str,
-    first_timestamp: float,
-) -> list[BufferedMessage]:
-    """取出本轮 debounce / 判断窗口内的用户消息，不带入更早的历史。"""
-    window_start = max(first_timestamp - 0.5, 0.0)
-    selected: list[BufferedMessage] = []
-    for item in messages:
-        if item.role != "user":
-            continue
-        if first_message_id and item.message_id:
-            if item.message_id == first_message_id or item.timestamp >= window_start:
-                selected.append(item)
-        elif item.timestamp >= window_start:
-            selected.append(item)
-    return selected
-
-
 def build_inbound_user_prompt(
     *,
     event_text: str,
-    messages: Iterable[BufferedMessage],
-    first_message_id: str,
-    first_timestamp: float,
+    batch: Iterable[BufferedMessage],
     merged: bool,
 ) -> str:
-    """构造交给官方 request_llm 的本轮用户文本。合并时不得丢掉窗口内用户消息。"""
+    """构造交给官方 request_llm 的本轮用户文本。
+
+    合并时按到达顺序带上本轮判断看过的全部用户消息（上一轮判断之后到达的），不带更早已回复过的消息。
+    """
     if not merged:
         return (event_text or "").strip()
     parts: list[str] = []
-    for item in merged_user_messages(
-        messages,
-        first_message_id=first_message_id,
-        first_timestamp=first_timestamp,
-    ):
+    for item in batch:
         text = (item.text or "").strip()
         if not text:
             continue
@@ -204,7 +181,7 @@ def end_proactive_round(runtime) -> None:
 def session_release_event(runtime):
     """返回占用会话的官方流水线或主动回合的结束信号。
 
-    进行中的被动回合会自行合并新消息并重新判断，此时返回 None。
+    被动回合之间由 runtime.lock 排队，不经过这里；没有流水线或主动回合占用时返回 None。
     """
     if getattr(runtime, "pending_pipeline", None) is not None:
         return runtime.pipeline_released

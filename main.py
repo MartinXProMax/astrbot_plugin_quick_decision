@@ -29,7 +29,6 @@ from .event_utils import (
     event_has_command_handler,
     event_profile,
     event_session_name,
-    event_timestamp,
     inspect_mentions,
     is_self_message,
     to_buffered_message,
@@ -240,47 +239,43 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             profile, buffered, self.settings.context_message_limit
         )
         runtime.display_name = event_session_name(event) or runtime.display_name
-        if not self.settings.enabled:
-            return
-        if (not profile.is_private and not runtime.display_name and callable(getattr(event, "get_group", None))
-                and time.time() - runtime.name_checked_at > 300):
-            runtime.name_checked_at = time.time()
-            task = asyncio.create_task(self._resolve_session_name(event, runtime))
-            self._post_tasks.add(task)
-            task.add_done_callback(self._post_tasks.discard)
-        if is_official_pipeline_busy(runtime):
-            runtime.pending.append(buffered)
-            if session_release_event(runtime) is None:
-                # 被动回合仍在防抖或判断，会合并这条消息后重新判断。
-                event.stop_event()
-                return
-            try:
-                # 先持锁再等待：释放后到本回合开始之间，定时与冷场检查不会抢占会话。
-                async with runtime.lock:
-                    while runtime.pending and (released := session_release_event(runtime)) is not None:
-                        await released.wait()
-                    if not runtime.pending or is_official_pipeline_busy(runtime):
-                        event.stop_event()
-                        return
-                    runtime.deciding = True
-                    try:
-                        return await self._run_passive_round(event, profile)
-                    finally:
-                        if runtime.pending_pipeline is None:
-                            runtime.deciding = False
-                            runtime.pending.clear()
-            except asyncio.CancelledError:
-                if buffered in runtime.pending:
-                    runtime.pending.remove(buffered)
-                raise
-
-        runtime.deciding = True
+        runtime.handlers += 1
         try:
-            return await self._run_passive_round(event, profile)
+            if not self.settings.enabled:
+                return
+            if (not profile.is_private and not runtime.display_name and callable(getattr(event, "get_group", None))
+                    and time.time() - runtime.name_checked_at > 300):
+                runtime.name_checked_at = time.time()
+                task = asyncio.create_task(self._resolve_session_name(event, runtime))
+                self._post_tasks.add(task)
+                task.add_done_callback(self._post_tasks.discard)
+            return await self._judge_in_turn(event, profile, runtime, buffered.seq)
         finally:
-            if runtime.pending_pipeline is None:
-                runtime.deciding = False
-                runtime.pending.clear()
+            runtime.handlers -= 1
+            if runtime.handlers == 0:
+                # 本会话没有处理器还在排队：停用期间到达、或等待中被取消而没轮到判断的消息，不再并入以后的回合。
+                runtime.consumed_seq = runtime.seq
+
+    async def _judge_in_turn(self, event: AstrMessageEvent, profile: SessionProfile, runtime, seq: int):
+        """按到达顺序逐轮判断入站消息，同一会话同时只进行一轮被动判断。
+
+        判断、官方流水线或主动回合进行期间到达的消息排队等待。轮到时，已被上一轮判断看过的消息直接结束；
+        否则以全部尚未判断的消息为一批，再判断一轮。
+        """
+        # 先持锁再等待：释放后到本回合开始之间，定时与冷场检查不会抢占会话。
+        async with runtime.lock:
+            while seq > runtime.consumed_seq and (released := session_release_event(runtime)) is not None:
+                await released.wait()
+            if seq <= runtime.consumed_seq:
+                event.stop_event()
+                return None
+            runtime.deciding = True
+            try:
+                return await self._run_passive_round(event, profile)
+            finally:
+                runtime.consumed_seq = max(runtime.consumed_seq, seq)
+                if runtime.pending_pipeline is None:
+                    runtime.deciding = False
 
     async def _resolve_session_name(self, event, runtime) -> None:
         get_group = getattr(event, "get_group", None)
@@ -301,17 +296,19 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         settings = self.settings
         runtime = self.sessions.ensure(profile)
         runtime.pending_pipeline = None
-        first_message_id = str(getattr(event.message_obj, "message_id", "") or "")
-        first_timestamp = event_timestamp(event)
         wait = settings.debounce_seconds
         if wait > 0:
             await asyncio.sleep(wait)
 
-        runtime = self.sessions.ensure(profile)
-        at_or_quoted, scene = self._resolve_passive_scene(event, profile)
+        # 本轮处理上一轮判断之后到达的全部用户消息，到每次判断前的快照为止；之后到达的留给下一轮。
+        seen = runtime.seq
+        batch = runtime.unconsumed_user_messages(seen)
+        at_or_quoted, scene = self._resolve_passive_scene(event, profile, batch)
+        # 默认官方 Agent 只会在本事件上运行；放行冷却和插话开关时，看本轮任意一条是否 @ 或唤醒。
         official_would_run = bool(event.is_at_or_wake_command)
+        woken = official_would_run or any(item.is_wake for item in batch)
         skip_reason = self._passive_skip_reason(
-            settings, profile, scene, at_or_quoted, official_would_run
+            settings, profile, scene, at_or_quoted, woken
         )
         messages = self.sessions.recent_messages(
             profile.umo, settings.context_message_limit
@@ -332,6 +329,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 },
             )
         if skip_reason and not immediate_actions:
+            runtime.consumed_seq = max(runtime.consumed_seq, seen)
             result = DecisionResult(
                 scene=scene,
                 trigger_event="message_received",
@@ -351,7 +349,9 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             memes = self._meme_candidates(settings)
         voice_available = await self._voice_available(scene, profile.umo)
         for _ in range(3):
-            runtime.pending.clear()
+            seen = runtime.seq
+            batch = runtime.unconsumed_user_messages(seen)
+            at_or_quoted, scene = self._resolve_passive_scene(event, profile, batch)
             messages = self.sessions.recent_messages(
                 profile.umo, settings.context_message_limit
             )
@@ -366,9 +366,12 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 umo=profile.umo,
                 voice_available=voice_available,
             )
-            if not runtime.pending:
+            if not runtime.has_user_messages_after(seen):
                 break
             logger.info("决策期间收到新消息，将合并后重新判断：%s", profile.umo)
+        # 最后一次判断之后到达的消息仍在排队，本轮结束后另起一轮判断。
+        runtime.consumed_seq = max(runtime.consumed_seq, seen)
+        woken = official_would_run or any(item.is_wake for item in batch)
 
         if result is None:
             return
@@ -394,7 +397,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if (
             scene == "group_passive"
             and not at_or_quoted
-            and not official_would_run
+            and not woken
             and (not settings.group_enable_interrupt or self.sessions.in_cooldown(profile.umo, settings.cooldown_seconds))
         ):
             skip_tools(result, "群聊插话已关闭或会话冷却中")
@@ -403,9 +406,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             event.stop_event()
             return
 
-        merged = self._has_merged_messages(
-            event, runtime, first_message_id, first_timestamp
-        )
+        merged = len(batch) > 1
         use_default_official = should_use_default_official_agent(
             official_would_run=official_would_run,
             has_merged_messages=merged,
@@ -420,7 +421,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
 
         request = None
         if not use_default_official:
-            # 群聊未 @ 插话，或 debounce 合并了多条用户消息：yield 公开 request_llm。
+            # 群聊未 @ 插话，或本轮合并了多条用户消息：yield 公开 request_llm。
             # 主生成事件不 stop_event，以免跳过装饰/发送/after-send；用 should_call_llm(True)
             # 阻止默认第二条 Agent。兄弟事件仍在 on_chat_message 里 stop_event。
             suppress_default_official_agent(event)
@@ -431,11 +432,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 await self._log_decision(profile, result)
                 return None
             prompt = build_inbound_user_prompt(
-                event_text=event.message_str or "",
-                messages=runtime.messages,
-                first_message_id=first_message_id,
-                first_timestamp=first_timestamp,
-                merged=merged,
+                event_text=event.message_str or "", batch=batch, merged=merged
             )
             image_urls, audio_urls = collect_event_media_urls(event)
             if not prompt and not image_urls and not audio_urls:
@@ -461,46 +458,16 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         return request
 
     def _resolve_passive_scene(
-        self, event: AstrMessageEvent, profile: SessionProfile
+        self, event: AstrMessageEvent, profile: SessionProfile, batch: list[BufferedMessage]
     ) -> tuple[bool, SceneType]:
-        recent = self.sessions.recent_messages(
-            profile.umo, self.settings.context_message_limit
-        )
-        # 以本轮合并窗口内是否出现 @ / 引用为准（大约为 debounce 前后到达的消息）。
-        window_start = time.time() - max(self.settings.debounce_seconds, 0) - 1
-        at_or_quoted = any(
-            (item.is_at_bot or item.is_quote_bot) and item.timestamp >= window_start
-            for item in recent
-        )
+        """本轮任意一条消息 @ 或引用了机器人，就按被 @ 处理。"""
+        at_or_quoted = any(item.is_at_bot or item.is_quote_bot for item in batch)
         if not at_or_quoted:
             is_at, is_quote, _ = inspect_mentions(event)
             at_or_quoted = is_at or is_quote
         if profile.is_private:
             return at_or_quoted, "private_passive"
         return at_or_quoted, "group_passive"
-
-    def _has_merged_messages(
-
-        self,
-        event: AstrMessageEvent,
-        runtime,
-        first_message_id: str,
-        first_timestamp: float,
-    ) -> bool:
-        """判断在本事件等待或判断期间是否还并入了其他用户消息。"""
-        for item in runtime.messages:
-            if item.role != "user":
-                continue
-            if (
-                first_message_id
-                and item.message_id
-                and item.message_id != first_message_id
-            ):
-                if item.timestamp >= max(first_timestamp - 0.5, 0):
-                    return True
-            elif not first_message_id and item.timestamp > first_timestamp:
-                return True
-        return bool(runtime.pending)
 
     async def _self_generate_and_send(
         self,

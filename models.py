@@ -77,6 +77,10 @@ class BufferedMessage:
     quote_text: str = ""
     timestamp: float = 0.0
     sent_at: int | None = None
+    # 入站时是否唤醒了官方流水线（@、唤醒词、引用机器人等，即 event.is_at_or_wake_command）。
+    is_wake: bool = False
+    # 会话内的到达序号，由 SessionStore.append_message 分配；只在运行时使用，不写入日志。
+    seq: int = field(default=0, compare=False)
 
     def to_state_dict(self) -> dict[str, Any]:
         item: dict[str, Any] = {
@@ -100,10 +104,16 @@ class BufferedMessage:
         return item
 
 
+def _log_message(message: BufferedMessage) -> dict[str, Any]:
+    item = dict(asdict(message), text=message.text[:500], quote_text=message.quote_text[:80])
+    item.pop("seq", None)
+    return item
+
+
 def decision_log_context(messages, *, evaluated_at, at_or_quoted=False, last_activity=None, timer_roots=None):
     """保存有长度限制的判断输入，供日志重放使用。"""
     return {
-        "messages": [dict(asdict(m), text=m.text[:500], quote_text=m.quote_text[:80]) for m in messages],
+        "messages": [_log_message(m) for m in messages],
         "at_or_quoted": at_or_quoted,
         "last_activity": last_activity,
         "timer_roots": sorted(timer_roots) if timer_roots is not None else None,

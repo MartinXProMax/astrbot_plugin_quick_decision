@@ -148,7 +148,6 @@ from astrbot_plugin_quick_decision.official_handoff import (
     default_official_agent_would_run,
     is_official_pipeline_busy,
     make_official_llm_request,
-    merged_user_messages,
     release_official_pipeline,
     resolve_session_conversation,
     should_use_default_official_agent,
@@ -318,6 +317,14 @@ class FakeConvMgr:
         )
 
 
+def _at_bot(self_id="bot"):
+    from astrbot.api.message_components import At
+
+    comp = At()
+    comp.qq = self_id
+    return comp
+
+
 def _user(mid, text, ts, sender="u1", name="U1") -> BufferedMessage:
     return BufferedMessage(
         message_id=mid,
@@ -400,43 +407,38 @@ class OfficialContractTests(unittest.TestCase):
 
 
 class MergePromptTests(unittest.TestCase):
-    def test_merge_prompt_keeps_all_window_user_messages(self) -> None:
-        messages = [
-            _user("old", "更早的话", 10),
+    def test_merge_prompt_lists_the_batch_in_arrival_order(self) -> None:
+        batch = [
             _user("m1", "第一句", 1000, sender="a", name="甲"),
             _user("m2", "第二句", 1000.2, sender="b", name="乙"),
-            _user("m3", "第三句", 1000.4, sender="a", name="甲"),
+            _user("m3", "", 1000.3, sender="b", name="乙"),
+            _user("m4", "第三句", 1000.4, sender="a", name="甲"),
         ]
-        prompt = build_inbound_user_prompt(
-            event_text="第一句",
-            messages=messages,
-            first_message_id="m1",
-            first_timestamp=1000.0,
-            merged=True,
-        )
-        self.assertIn("第一句", prompt)
-        self.assertIn("第二句", prompt)
-        self.assertIn("第三句", prompt)
-        self.assertNotIn("更早的话", prompt)
+        prompt = build_inbound_user_prompt(event_text="第一句", batch=batch, merged=True)
         self.assertEqual(prompt, "甲: 第一句\n乙: 第二句\n甲: 第三句")
 
     def test_unmerged_prompt_is_current_event_only(self) -> None:
         prompt = build_inbound_user_prompt(
-            event_text="  当前  ",
-            messages=[_user("m1", "当前", 1), _user("m2", "其它", 2)],
-            first_message_id="m1",
-            first_timestamp=1,
-            merged=False,
+            event_text="  当前  ", batch=[_user("m1", "当前", 1), _user("m2", "其它", 2)], merged=False
         )
         self.assertEqual(prompt, "当前")
 
-    def test_merged_window_helper(self) -> None:
-        items = merged_user_messages(
-            [_user("m1", "a", 5), _user("m2", "b", 5.2), _user("old", "z", 1)],
-            first_message_id="m1",
-            first_timestamp=5,
-        )
-        self.assertEqual([i.text for i in items], ["a", "b"])
+    def test_batch_is_what_arrived_after_the_last_judgement(self) -> None:
+        store = SessionStore(Path(tempfile.gettempdir()), log_limit=5)
+        profile = SessionProfile(umo="aiocqhttp:GroupMessage:batch", is_private=False)
+        for mid in ("old", "answered"):
+            store.append_message(profile, _user(mid, mid, 1), 20)
+        runtime = store.get(profile.umo)
+        runtime.consumed_seq = runtime.seq
+        store.append_message(profile, BufferedMessage("", "bot", "bot", "assistant", "回复"), 20)
+        # 平台时间戳早于已判断的消息也照样算新到的：只看到达顺序。
+        for mid in ("new1", "new2", "late"):
+            store.append_message(profile, _user(mid, mid, 0), 20)
+        seen = runtime.seq - 1
+
+        self.assertEqual([m.message_id for m in runtime.unconsumed_user_messages(seen)], ["new1", "new2"])
+        self.assertTrue(runtime.has_user_messages_after(seen))
+        self.assertFalse(runtime.has_user_messages_after(runtime.seq))
 
 
 class HintsAndHistoryTests(unittest.TestCase):
@@ -1223,76 +1225,40 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.decision_calls, 0)
 
     async def test_merged_messages_one_generation_and_full_prompt(self) -> None:
-        first = FakeEvent(
-            umo="aiocqhttp:FriendMessage:9",
-            text="第一句",
-            is_private=True,
-            at_or_wake=True,
-            message_id="a",
-            timestamp=50,
-            sender="u",
-            sender_name="用户",
-        )
-        # 开一个未完成的决策，让后续消息并入。
-        runtime = self.plugin.sessions.ensure(_profile(first))
-        runtime.deciding = True
-        # 先写入第一条
-        self.plugin.sessions.append_message(
-            _profile(first),
-            _user("a", "第一句", 50, sender="u", name="用户"),
-            20,
-        )
-        second = FakeEvent(
-            umo=first.unified_msg_origin,
-            text="第二句请一起看",
-            is_private=True,
-            at_or_wake=True,
-            message_id="b",
-            timestamp=50.3,
-            sender="u",
-            sender_name="用户",
-        )
-        sibling = await self.plugin.on_chat_message(second)
-        self.assertIsNone(sibling)
+        self.plugin.config["debounce_seconds"] = 0.05
+        umo = "aiocqhttp:FriendMessage:9"
+
+        def private(mid, text):
+            return FakeEvent(umo=umo, text=text, is_private=True, at_or_wake=True, message_id=mid,
+                             timestamp=50, sender="u", sender_name="用户")
+
+        first = private("a", "第一句")
+        first_task = asyncio.create_task(self.plugin.on_chat_message(first))
+        await asyncio.sleep(0)
+        # 第一条还在防抖等待，第二条排队，随后并入同一轮。
+        second = private("b", "第二句请一起看")
+        sibling_task = asyncio.create_task(self.plugin.on_chat_message(second))
+        req = await first_task
+        self.assertIsNone(await sibling_task)
         self.assertTrue(second.is_stopped())
         self.assertFalse(second.call_llm)
-        self.assertEqual(self.decision_calls, 0)
 
-        # 主事件此时才完成判断并交接。手动构造已缓冲的窗口后调用 _run_passive_round。
-        first_run = FakeEvent(
-            umo=first.unified_msg_origin,
-            text="第一句",
-            is_private=True,
-            at_or_wake=True,
-            message_id="a",
-            timestamp=50,
-            sender="u",
-            sender_name="用户",
-        )
-        runtime.deciding = True
-        req = await self.plugin._run_passive_round(first_run, _profile(first_run))
         self.assertIsInstance(req, ProviderRequest)
-        self.assertIn("第一句", req.prompt)
-        self.assertIn("第二句请一起看", req.prompt)
-        self.assertTrue(first_run.call_llm)
-        self.assertFalse(first_run.is_stopped())
+        self.assertEqual(req.prompt, "用户: 第一句\n用户: 第二句请一起看")
+        self.assertTrue(first.call_llm)
+        self.assertFalse(first.is_stopped())
         self.assertEqual(self.decision_calls, 1)
 
-        # 官方生成尚未结束时，第三条挂起；释放后补一轮判断。
-        third = FakeEvent(
-            umo=first.unified_msg_origin,
-            text="第三句",
-            is_private=True,
-            at_or_wake=True,
-            message_id="c",
-            timestamp=51,
-        )
+        # 官方生成尚未结束时，第三条挂起；释放后补一轮判断，只含第三条。
+        runtime = self.plugin.sessions.get(umo)
+        third = private("c", "第三句")
         again_task = asyncio.create_task(self.plugin.on_chat_message(third))
         await asyncio.sleep(0)
         self.assertFalse(again_task.done())
         release_official_pipeline(runtime)
         again = await again_task
         self.assertIsNone(again)
+        self.assertFalse(third.is_stopped())
         self.assertEqual(self.decision_calls, 2)
 
     async def test_message_during_official_reply_is_rejudged_after_release(self) -> None:
@@ -1458,7 +1424,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second.is_stopped())
         self.assertEqual(self.decision_calls, 1)
 
-    async def test_cancelled_follow_up_is_removed_from_pending(self) -> None:
+    async def test_cancelled_follow_up_is_not_merged_later(self) -> None:
         first = FakeEvent(
             umo="aiocqhttp:GroupMessage:follow-up-cancel",
             text="第一句",
@@ -1479,7 +1445,142 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
 
-        self.assertEqual(self.plugin.sessions.get(first.unified_msg_origin).pending, [])
+        runtime = self.plugin.sessions.get(first.unified_msg_origin)
+        self.assertEqual(runtime.unconsumed_user_messages(), [])
+        self.assertEqual(runtime.handlers, 0)
+
+    async def _start_official_reply(self, umo):
+        first = FakeEvent(umo=umo, text="第一句", message_id="p0", timestamp=10)
+        self.assertIsInstance(await self.plugin.on_chat_message(first), ProviderRequest)
+        return self.plugin.sessions.get(umo)
+
+    async def _queue(self, event):
+        task = asyncio.create_task(self.plugin.on_chat_message(event))
+        await asyncio.sleep(0)
+        return task
+
+    def _gate_on_match_tools(self):
+        """让判断结束后的命中即执行工具停在闸门上，模拟交接前的空档。"""
+        gate = asyncio.Event()
+        original = self.main_mod.run_tools
+
+        async def gated(*a, **k):
+            await gate.wait()
+            return await original(*a, **k)
+
+        return gate, patch.object(self.main_mod, "run_tools", gated)
+
+    async def test_queued_mention_after_other_message_still_bypasses_cooldown(self) -> None:
+        for wake_only in (False, True):
+            with self.subTest(wake_only=wake_only):
+                umo = f"aiocqhttp:GroupMessage:queued-mention-{wake_only}"
+                calls_before = self.decision_calls
+                runtime = await self._start_official_reply(umo)
+                chatter = FakeEvent(umo=umo, text="哈哈", message_id="c", timestamp=11, sender="x")
+                mention = FakeEvent(umo=umo, text="机器人你好", message_id="m", timestamp=12, sender="y",
+                                    at_or_wake=True, components=[] if wake_only else [_at_bot()])
+                chatter_task = await self._queue(chatter)
+                mention_task = await self._queue(mention)
+                # 上一轮刚发完回复，会话进入冷却；未 @ 的「哈哈」排在 @ 消息前面。
+                self.plugin.config["cooldown_seconds"] = 300
+                runtime.last_bot_ts = 10**12
+                release_official_pipeline(runtime)
+
+                req = await chatter_task
+                self.assertIsNone(await mention_task)
+                self.assertIsInstance(req, ProviderRequest)
+                self.assertEqual(req.prompt, "Alice: 哈哈\nAlice: 机器人你好")
+                self.assertTrue(mention.is_stopped())
+                self.assertEqual(self.decision_calls - calls_before, 2)
+                self.plugin.config["cooldown_seconds"] = 0
+
+    async def test_answered_messages_are_not_resubmitted_in_the_next_round(self) -> None:
+        umo = "aiocqhttp:GroupMessage:no-repeat"
+        runtime = await self._start_official_reply(umo)
+        gate, gated = self._gate_on_match_tools()
+        with gated:
+            b_task = await self._queue(FakeEvent(umo=umo, text="B句", message_id="b", timestamp=20))
+            c_event = FakeEvent(umo=umo, text="C句", message_id="c", timestamp=21)
+            c_task = await self._queue(c_event)
+            release_official_pipeline(runtime)
+            for _ in range(10):
+                await asyncio.sleep(0)
+            # B、C 已判断完，回合停在交接前；此时 D 到达。
+            d_event = FakeEvent(umo=umo, text="D句", message_id="d", timestamp=22)
+            d_task = await self._queue(d_event)
+            gate.set()
+            b_req = await b_task
+            self.assertEqual(b_req.prompt, "Alice: B句\nAlice: C句")
+            self.assertIsNone(await c_task)
+            self.assertTrue(c_event.is_stopped())
+            self.assertFalse(d_task.done())
+
+            release_official_pipeline(runtime)
+            d_req = await d_task
+        self.assertEqual(d_req.prompt, "D句")
+        self.assertEqual(self.decision_calls, 3)
+
+    async def test_message_after_the_final_judgement_gets_its_own_round(self) -> None:
+        umo = "aiocqhttp:GroupMessage:late-message"
+        seen: list[tuple[list[str], bool]] = []
+
+        async def ask(*_a, **k):
+            ids = [m.message_id for m in k["messages"] if m.role == "user"]
+            seen.append((ids, k["at_or_quoted"]))
+            return DecisionResult(action="reply" if "g" in ids else "none", scene=k["scene"])
+
+        self.main_mod.ask_decision = ask
+        gate, gated = self._gate_on_match_tools()
+        with gated:
+            a_task = await self._queue(FakeEvent(umo=umo, text="随便聊聊", message_id="a", timestamp=30))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            late = FakeEvent(umo=umo, text="在吗", message_id="g", timestamp=31, at_or_wake=True,
+                             components=[_at_bot()])
+            late_task = await self._queue(late)
+            gate.set()
+            self.assertIsNone(await a_task)
+            self.assertIsNone(await late_task)
+
+        self.assertEqual(seen, [(["a"], False), (["a", "g"], True)])
+        self.assertFalse(late.is_stopped())
+        self.assertTrue(late.get_extra("quick_decision").official_llm)
+        self.assertIsNotNone(self.plugin.sessions.get(umo).pending_pipeline)
+
+    async def test_mention_during_judgement_is_rejudged_as_a_mention(self) -> None:
+        umo = "aiocqhttp:GroupMessage:mention-while-judging"
+        gate = asyncio.Event()
+        flags: list[bool] = []
+
+        async def ask(*_a, **k):
+            flags.append(k["at_or_quoted"])
+            if len(flags) == 1:
+                await gate.wait()
+            return DecisionResult(action="reply", scene=k["scene"])
+
+        self.main_mod.ask_decision = ask
+        first_task = await self._queue(FakeEvent(umo=umo, text="随便聊聊", message_id="a", timestamp=40))
+        mention = FakeEvent(umo=umo, text="你怎么看", message_id="m", timestamp=41, at_or_wake=True,
+                            components=[_at_bot()])
+        mention_task = await self._queue(mention)
+        gate.set()
+        req = await first_task
+        self.assertIsNone(await mention_task)
+
+        self.assertEqual(flags, [False, True])
+        self.assertEqual(req.prompt, "Alice: 随便聊聊\nAlice: 你怎么看")
+        self.assertTrue(mention.is_stopped())
+
+    async def test_messages_while_disabled_are_not_merged_after_reenabling(self) -> None:
+        umo = "aiocqhttp:GroupMessage:disabled"
+        self.plugin.config["enabled"] = False
+        self.assertIsNone(await self.plugin.on_chat_message(
+            FakeEvent(umo=umo, text="停用时说的", message_id="off", timestamp=50)))
+        self.plugin.config["enabled"] = True
+        req = await self.plugin.on_chat_message(FakeEvent(umo=umo, text="启用后说的", message_id="on", timestamp=51))
+
+        self.assertEqual(req.prompt, "启用后说的")
+        self.assertEqual(self.decision_calls, 1)
 
     async def test_mention_during_proactive_round_is_judged_after_it_ends(self) -> None:
         import time
@@ -1518,7 +1619,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.decision_calls, 1)
         self.assertIsNotNone(runtime.pending_pipeline)
 
-    async def test_cancelled_wait_for_proactive_round_is_removed_from_pending(self) -> None:
+    async def test_cancelled_wait_for_proactive_round_is_not_merged_later(self) -> None:
         import time
 
         from astrbot_plugin_quick_decision.event_utils import event_profile
@@ -1543,7 +1644,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         await silence
         await _drain_proactive(self.plugin)
 
-        self.assertEqual(runtime.pending, [])
+        self.assertEqual(runtime.unconsumed_user_messages(), [])
         self.assertFalse(runtime.lock.locked())
         self.assertFalse(runtime.deciding)
         self.assertEqual(self.decision_calls, 0)
