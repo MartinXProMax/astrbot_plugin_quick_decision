@@ -1729,6 +1729,92 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(runtime.last_decision.should_speak())
                 self.assertTrue(runtime.last_decision.outcomes)
 
+    async def test_messages_the_default_agent_skips_never_hold_the_session(self) -> None:
+        from astrbot.api.message_components import Reply
+
+        quote = Reply(id="q1")
+        quote.sender_id, quote.chain, quote.message_str, quote.text = "u2", [], "原消息", ""
+        prefixed = {"provider_settings": {"wake_prefix": "/ai"}, "wake_prefix": ["/"]}
+        cases = (
+            # (说明, 事件参数, 事件上的其他标记, AstrBot 配置, 是否交给默认 Agent)
+            ("只 @ 了机器人", dict(text="", components=[_at_bot()]), {}, {}, False),
+            ("只引用了一条消息", dict(text="", components=[quote]), {}, {}, True),
+            ("其他插件已回复", dict(text="早安"), {"_has_send_oper": True}, {}, False),
+            ("其他插件已接管", dict(text="早安"), {"call_llm": True}, {}, False),
+            ("缺少 LLM 唤醒前缀", dict(text="你好"), {}, prefixed, False),
+            ("带了 LLM 唤醒前缀", dict(text="ai 你好"), {}, prefixed, True),
+            ("WebChat 不要求 LLM 唤醒前缀", dict(text="你好"), {"get_platform_name": lambda: "webchat"}, prefixed, True),
+            ("AI 能力关闭", dict(text="你好"), {}, {"provider_settings": {"enable": False}}, False),
+        )
+        for index, (label, kwargs, marks, config, handed) in enumerate(cases):
+            for private in (False, True):
+                with self.subTest(label, private=private):
+                    self.plugin.context.get_config = lambda umo, config=config: config
+                    kind = "FriendMessage" if private else "GroupMessage"
+                    ev = FakeEvent(umo=f"aiocqhttp:{kind}:skip-{index}", is_private=private, at_or_wake=True, **kwargs)
+                    for name, value in marks.items():
+                        setattr(ev, name, value)
+                    self.assertIsNone(await self.plugin.on_chat_message(ev))
+                    runtime = self.plugin.sessions.get(ev.unified_msg_origin)
+                    self.assertEqual(runtime.pending_pipeline is not None, handed)
+                    self.assertEqual(ev.get_extra("quick_decision") is not None, handed)
+                    self.assertFalse(ev.is_stopped())
+                    if not handed:
+                        self.assertFalse(runtime.deciding)
+
+    async def test_llm_switches_also_cancel_the_request_path(self) -> None:
+        session_off = types.ModuleType("astrbot.core.star.session_llm_manager")
+        session_off.SessionServiceManager = SimpleNamespace(should_process_llm_request=AsyncMock(return_value=False))
+        cases = (
+            ("AI 能力关闭", {"provider_settings": {"enable": False}}, {}),
+            ("会话 LLM 关闭", {}, {"astrbot.core.star.session_llm_manager": session_off}),
+        )
+        for index, (label, config, modules) in enumerate(cases):
+            for at_or_wake in (False, True):
+                with self.subTest(label, at_or_wake=at_or_wake), patch.dict(sys.modules, modules):
+                    self.plugin.context.get_config = lambda umo, config=config: config
+                    ev = FakeEvent(umo=f"aiocqhttp:GroupMessage:llm-off-{index}-{at_or_wake}", text="插句话",
+                                   at_or_wake=at_or_wake)
+                    self.assertIsNone(await self.plugin.on_chat_message(ev))
+                    self.assertFalse(ev.call_llm)
+                    self.assertIsNone(ev.get_extra("quick_decision"))
+                    self.assertIsNone(self.plugin.sessions.get(ev.unified_msg_origin).pending_pipeline)
+
+    async def test_private_fallback_submits_what_the_default_agent_would_miss(self) -> None:
+        async def bad_ask(*_a, **k):
+            return DecisionResult(action="reply", scene=k["scene"], error="判断超时", degraded=True)
+
+        self.main_mod.ask_decision = bad_ask
+        woken = FakeEvent(umo="aiocqhttp:FriendMessage:fallback-woken", text="你好", is_private=True, at_or_wake=True)
+        self.assertIsNone(await self.plugin.on_chat_message(woken))
+        self.assertFalse(woken.call_llm)
+        self.assertFalse(woken.is_stopped())
+
+        # 私聊需要唤醒词时，未唤醒的消息官方默认 Agent 不会回复。
+        unwoken = FakeEvent(umo="aiocqhttp:FriendMessage:fallback-unwoken", text="你好", is_private=True)
+        req = await self.plugin.on_chat_message(unwoken)
+        self.assertIsInstance(req, ProviderRequest)
+        self.assertEqual(req.prompt, "你好")
+        self.assertTrue(unwoken.call_llm)
+        self.assertFalse(unwoken.is_stopped())
+
+        # 合并的多条消息全部提交；被并入的那条在排队处结束。
+        self.plugin.config["debounce_seconds"] = 0.05
+        umo = "aiocqhttp:FriendMessage:fallback-merged"
+        first = FakeEvent(umo=umo, text="第一句", is_private=True, at_or_wake=True, message_id="a")
+        second = FakeEvent(umo=umo, text="明天几点？", is_private=True, at_or_wake=True, message_id="b")
+        first_task = await self._queue(first)
+        second_task = await self._queue(second)
+        req = await first_task
+        self.assertIsNone(await second_task)
+        self.assertEqual(req.prompt, "Alice: 第一句\nAlice: 明天几点？")
+        self.assertTrue(first.call_llm)
+        self.assertFalse(first.is_stopped())
+        self.assertTrue(second.is_stopped())
+        for ev in (unwoken, first):
+            self.assertIsNone(ev.get_extra("quick_decision"))
+            self.assertIsNone(self.plugin.sessions.get(ev.unified_msg_origin).pending_pipeline)
+
     async def test_private_silence_never_enters_later_workflow(self) -> None:
         from astrbot.api.provider import DecisionChoiceAnswer
         from astrbot_plugin_quick_decision.decision_engine import ask_decision

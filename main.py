@@ -44,6 +44,7 @@ from .official_handoff import (
     end_proactive_round,
     is_official_pipeline_busy,
     make_official_llm_request,
+    official_skip_reason,
     release_official_pipeline,
     resolve_session_conversation,
     session_release_event,
@@ -378,12 +379,23 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         result.dry_run = settings.dry_run
         runtime.last_decision = result
 
+        merged = len(batch) > 1
+        use_default_official = should_use_default_official_agent(
+            official_would_run=official_would_run,
+            has_merged_messages=merged,
+        )
         if result.failed:
             # 先落盘再返回，此时尚未决定是否走官方流水线。
             await self._log_decision(profile, result)
             if scene == "private_passive" and result.action == "reply" and not settings.dry_run:
+                # 退回官方纯文字回复，不挂载失败的决策。事件未唤醒官方流水线（私聊需要唤醒词）或本轮合并了
+                # 多条消息时，官方默认 Agent 不回复或只回复这一条，改为提交本轮全部消息。
+                request, reason = await self._official_handoff(event, profile, batch, use_default_official)
+                if reason is not None:
+                    logger.warning("私聊判断失败，且%s，本轮不回复：%s", reason, profile.umo)
+                    return None
                 logger.warning("私聊判断失败，将退回官方纯文字回复：%s", result.error)
-                return
+                return request
             event.stop_event()
             return
 
@@ -406,11 +418,6 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             event.stop_event()
             return
 
-        merged = len(batch) > 1
-        use_default_official = should_use_default_official_agent(
-            official_would_run=official_would_run,
-            has_merged_messages=merged,
-        )
         if settings.dry_run:
             await self._log_decision(profile, result)
             event.stop_event()
@@ -419,34 +426,12 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             )
             return
 
-        request = None
-        if not use_default_official:
-            # 群聊未 @ 插话，或本轮合并了多条用户消息：yield 公开 request_llm。
-            # 主生成事件不 stop_event，以免跳过装饰/发送/after-send；用 should_call_llm(True)
-            # 阻止默认第二条 Agent。兄弟事件仍在 on_chat_message 里 stop_event。
-            suppress_default_official_agent(event)
-            conversation = await resolve_session_conversation(self.context, event)
-            if conversation is None:
-                logger.error("无法取得官方会话，取消本轮官方生成：%s", profile.umo)
-                skip_tools(result, "无法取得官方会话")
-                await self._log_decision(profile, result)
-                return None
-            prompt = build_inbound_user_prompt(
-                event_text=event.message_str or "", batch=batch, merged=merged
-            )
-            image_urls, audio_urls = collect_event_media_urls(event)
-            if not prompt and not image_urls and not audio_urls:
-                logger.warning("没有可提交给官方模型的用户内容，取消本轮生成：%s", profile.umo)
-                skip_tools(result, "没有可生成回复的正文或附件")
-                await self._log_decision(profile, result)
-                return None
-            request = make_official_llm_request(
-                event,
-                conversation=conversation,
-                prompt=prompt,
-                image_urls=image_urls,
-                audio_urls=audio_urls,
-            )
+        request, reason = await self._official_handoff(event, profile, batch, use_default_official)
+        if reason is not None:
+            logger.info("%s，本轮不回复：%s", reason, profile.umo)
+            skip_tools(result, reason)
+            await self._log_decision(profile, result)
+            return None
 
         # 仅已接纳的回复才能在后续发送钩子中使用工具。
         result.official_llm = True
@@ -456,6 +441,62 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                                   on_activity=lambda: touch_official_pipeline(runtime, result))
         begin_official_pipeline(runtime, result, event)
         return request
+
+    async def _official_request(self, event: AstrMessageEvent, profile: SessionProfile, batch: list[BufferedMessage]):
+        """群聊未 @ 插话、未唤醒的私聊，或本轮合并了多条用户消息：构造公开 request_llm。
+
+        主生成事件不 stop_event，以免跳过装饰/发送/after-send；用 should_call_llm(True)
+        阻止默认第二条 Agent。兄弟事件仍在 on_chat_message 里 stop_event。
+
+        Returns:
+            (request, None)；取消本轮生成时为 (None, 原因)。
+        """
+        suppress_default_official_agent(event)
+        conversation = await resolve_session_conversation(self.context, event)
+        if conversation is None:
+            logger.error("无法取得官方会话，取消本轮官方生成：%s", profile.umo)
+            return None, "无法取得官方会话"
+        prompt = build_inbound_user_prompt(
+            event_text=event.message_str or "", batch=batch, merged=len(batch) > 1
+        )
+        image_urls, audio_urls = collect_event_media_urls(event)
+        if not prompt and not image_urls and not audio_urls:
+            logger.warning("没有可提交给官方模型的用户内容，取消本轮生成：%s", profile.umo)
+            return None, "没有可生成回复的正文或附件"
+        request = make_official_llm_request(
+            event,
+            conversation=conversation,
+            prompt=prompt,
+            image_urls=image_urls,
+            audio_urls=audio_urls,
+        )
+        return request, None
+
+    async def _official_handoff(self, event, profile, batch, use_default_official):
+        """交给官方主 Agent：放行默认 Agent，或构造 request_llm。
+
+        官方不会处理时不能占用会话：发送回调不会来，要等超时才释放，期间本会话的消息都在排队。
+
+        Returns:
+            (request, None)，放行默认 Agent 时 request 为 None；官方不会处理或无法构造请求时为 (None, 原因)。
+        """
+        reason = await official_skip_reason(
+            event, self._astrbot_config(profile.umo), default_agent=use_default_official
+        )
+        if reason is not None or use_default_official:
+            return None, reason
+        return await self._official_request(event, profile, batch)
+
+    def _astrbot_config(self, umo: str):
+        """本会话生效的 AstrBot 配置；读不到时为 None。"""
+        getter = getattr(self.context, "get_config", None)
+        if not callable(getter):
+            return None
+        try:
+            config = getter(umo)
+        except Exception:  # noqa: BLE001
+            return None
+        return config if callable(getattr(config, "get", None)) else None
 
     def _resolve_passive_scene(
         self, event: AstrMessageEvent, profile: SessionProfile, batch: list[BufferedMessage]

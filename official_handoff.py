@@ -44,6 +44,91 @@ def should_use_default_official_agent(
     return bool(official_would_run) and not has_merged_messages
 
 
+# 官方默认 Agent 认作输入的消息段：没有正文时，至少要有其中之一。
+_DEFAULT_AGENT_INPUTS = frozenset({"Image", "File", "Record", "Video", "Reply"})
+
+
+def _platform_name(event) -> str:
+    getter = getattr(event, "get_platform_name", None)
+    try:
+        return str(getter() or "") if callable(getter) else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def has_default_agent_input(event) -> bool:
+    """官方默认 Agent 跳过没有正文、也没有图片、文件、语音、视频或引用的消息，例如只 @ 了机器人。"""
+    if (getattr(event, "message_str", "") or "").strip():
+        return True
+    comps = getattr(getattr(event, "message_obj", None), "message", None) or []
+    return any(type(comp).__name__ in _DEFAULT_AGENT_INPUTS for comp in comps)
+
+
+def provider_wake_prefix(config) -> str:
+    """官方默认 Agent 要求的 LLM 唤醒前缀，去掉与机器人唤醒词重叠的开头（同 AgentRequestSubStage）。"""
+    provider = config.get("provider_settings") or {}
+    prefix = str(provider.get("wake_prefix") or "")
+    for wake in config.get("wake_prefix") or []:
+        if wake and prefix.startswith(wake):
+            prefix = prefix[len(wake):]
+    return prefix
+
+
+def matches_provider_wake_prefix(event, prefix: str) -> bool:
+    """WebChat 不要求 LLM 唤醒前缀；飞书先去掉开头空白再比较。"""
+    platform = _platform_name(event)
+    if not prefix or platform == "webchat":
+        return True
+    text = getattr(event, "message_str", "") or ""
+    if platform == "lark":
+        text = text.lstrip()
+    return text.startswith(prefix)
+
+
+async def _session_llm_enabled(event) -> bool:
+    """AstrBot 4.29 的会话 LLM 开关；新版没有这个模块或读取失败时按开启处理。"""
+    try:
+        from astrbot.core.star.session_llm_manager import SessionServiceManager
+    except Exception:  # noqa: BLE001
+        return True
+    check = getattr(SessionServiceManager, "should_process_llm_request", None)
+    if not callable(check):
+        return True
+    try:
+        return bool(await check(event))
+    except Exception:  # noqa: BLE001
+        logger.debug("读取会话 LLM 开关失败，按开启处理：%s", getattr(event, "unified_msg_origin", ""), exc_info=True)
+        return True
+
+
+async def official_skip_reason(event, config, *, default_agent: bool) -> str | None:
+    """预判官方 Agent 不会处理本事件的原因；None 表示会处理。对应 AstrBot 4.29.4。
+
+    插件提交的 request_llm 只受 AI 能力总开关和会话 LLM 开关限制；默认 Agent 还要求事件已唤醒、
+    其他插件没有回复或接管、有正文或附件，并带上 LLM 唤醒前缀。官方不处理却占用会话时，
+    要等超时才释放，期间本会话的消息都在排队。config 读不到时只检查会话开关和事件本身。
+    """
+    if config is not None and not (config.get("provider_settings") or {}).get("enable", True):
+        return "AstrBot 未启用 AI 能力"
+    if not await _session_llm_enabled(event):
+        return "本会话已关闭 LLM"
+    if not default_agent:
+        return None
+    if not default_official_agent_would_run(
+        has_send_oper=bool(getattr(event, "_has_send_oper", False)),
+        is_at_or_wake_command=bool(getattr(event, "is_at_or_wake_command", False)),
+        call_llm=bool(getattr(event, "call_llm", False)),
+        has_result=event.get_result() is not None,
+        is_stopped=event.is_stopped(),
+    ):
+        return "其他插件已回复或接管本条消息"
+    if not has_default_agent_input(event):
+        return "消息没有正文或附件"
+    if config is not None and not matches_provider_wake_prefix(event, provider_wake_prefix(config)):
+        return "消息没有带 LLM 唤醒前缀"
+    return None
+
+
 def build_inbound_user_prompt(
     *,
     event_text: str,
