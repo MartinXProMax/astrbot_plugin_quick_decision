@@ -125,7 +125,7 @@ class LogStoreTests(unittest.IsolatedAsyncioTestCase):
         rows = self.reopen().recent_logs()
         self.assertEqual(rows, [{"round_id": "a"}])
 
-    async def test_write_failure_is_logged_and_retried_on_next_change(self) -> None:
+    async def test_write_failure_is_retried_on_unload_and_next_change(self) -> None:
         store = self.reopen()
         calls = []
         original = store._write_log_file
@@ -139,7 +139,9 @@ class LogStoreTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(store, "_write_log_file", side_effect=flaky):
             await store.append_log({"round_id": "a"})
             await store.flush_logs()
-            self.assertFalse((self.dir / "decision_logs.jsonl").exists())
+            # 首次写入失败；卸载时的 flush_logs 不等新变更，直接重试。
+            self.assertEqual(len(calls), 2)
+            self.assertEqual([row["round_id"] for row in self.reopen().recent_logs()], ["a"])
             await store.append_log({"round_id": "b"})
             await store.flush_logs()
         self.assertEqual([row["round_id"] for row in self.reopen().recent_logs()], ["b", "a"])

@@ -16,21 +16,11 @@ from astrbot.api import logger
 from astrbot.api.provider import DecisionBooleanAnswer, DecisionBooleanQuestion, DecisionProvider, ProviderType
 from astrbot.api.web import error_response, json_response, request
 
-from .candidate_sources import CATALOGS, example_catalogs, source_question
-from .config_util import (
-    EVENTS,
-    OPTION_EFFECTS,
-    PluginSettings,
-    default_decision_questions,
-    default_graph,
-    default_questions,
-    load_questions,
-    voice_questions,
-)
+from .candidate_sources import CATALOGS, example_catalogs
+from .config_util import PluginSettings, default_graph, load_questions
 from .decision_engine import ask_decision, evaluate_post_reply, preview_workflow
-from .decision_tools import TOOLS
 from .external_plugins import EXTERNAL_PLUGINS
-from .models import QUESTION_ROLES, BufferedMessage
+from .models import BufferedMessage
 from .workflow_actions import ACTIONS, SOURCES, WORKFLOW_EVENTS, migrate_actions, timer_voice_ready
 
 PLUGIN_NAME = "astrbot_plugin_quick_decision"
@@ -159,8 +149,13 @@ def validate_setting(field: dict, value):
     return value, None
 
 
-def _needs_candidate_editor(settings):
-    return settings.workflow_version == 6 or any(source_question(q.candidate_source) for q in settings.decision_questions)
+# 判断配置页的编辑器版本。随插件发布的页面只发这一版；升级前打开的旧页面请求会被拒绝，提示刷新。
+EDITOR_VERSION = 8
+
+
+def _current_editor(payload: dict) -> bool:
+    version = payload.get("version")
+    return type(version) is int and version == EDITOR_VERSION
 
 
 class WebApiMixin:
@@ -287,14 +282,10 @@ class WebApiMixin:
         if scene not in ("group_passive", "group_proactive", "private_passive", "private_proactive"):
             return error_response("日志场景无效，无法重放", status_code=400)
         mode = payload.get("decision_mode", self.settings.decision_mode)
-        version = payload.get("version", 8)
         edited = payload.get("decision_questions")
-        if mode not in ("model", "random") or type(version) is not int or version not in (6, 7, 8) or not isinstance(edited, list):
+        if mode not in ("model", "random") or not _current_editor(payload) or not isinstance(edited, list):
             return error_response("当前草稿格式无效，请刷新配置后重试", status_code=400)
-        questions, error = load_questions(
-            {"version": 6 if version == 8 else 5 if version == 7 else 4, "questions": edited},
-            strict=True,
-        )
+        questions, error = load_questions({"version": 6, "questions": edited}, strict=True)
         if error:
             return error_response(error, status_code=400)
         settings = PluginSettings(dict(self.config))
@@ -351,39 +342,27 @@ class WebApiMixin:
             "message_count": len(messages),
         })
 
-    def _decision_config_payload(self, warning: str | None = None, *, version=6) -> dict:
+    def _decision_config_payload(self, warning: str | None = None) -> dict:
+        """判断配置页读写的数据，固定为编辑器版本 8；旧格式的已存配置在这里转换为选项动作。"""
         settings = self.settings
-        questions = settings.decision_questions
-        referenced = version == 8 or _needs_candidate_editor(settings)
-        defaults = default_questions() if referenced else default_questions(default_decision_questions())
-        payload = {
+        questions, migration_warning = migrate_actions(settings.decision_questions)
+        if warning is None:
+            warning = settings.decision_questions_warning
+        return {
             "decision_mode": settings.decision_mode,
             "decision_custom_context": settings.decision_custom_context,
-            "version": 6,
-            "events": EVENTS,
-            "effects": OPTION_EFFECTS,
-            "default_questions": [q.to_dict() for q in defaults],
-            "roles": QUESTION_ROLES,
-            "tools": TOOLS,
-            "decision_questions": [item.to_dict() for item in questions],
-            "warning": warning
-            if warning is not None
-            else settings.decision_questions_warning,
+            "version": EDITOR_VERSION,
+            "workflow_version": 6,
+            "stored_version": settings.workflow_version,
+            "events": WORKFLOW_EVENTS,
+            "actions": ACTIONS,
+            "candidate_sources": SOURCES,
+            "candidate_catalogs": CATALOGS,
+            "candidate_examples": example_catalogs(),
+            "decision_questions": [q.to_dict() for q in questions],
+            "default_questions": v8_default_questions(),
+            "warning": "；".join(w for w in (warning, migration_warning) if w) or None,
         }
-        if version in (7, 8) or settings.workflow_version in (5, 6) or referenced:
-            questions, migration_warning = migrate_actions(questions)
-            defaults, _ = migrate_actions(defaults)
-            defaults = [*defaults, *voice_questions()]
-            for obsolete in ("roles", "effects", "tools"):
-                payload.pop(obsolete)
-            payload.update(version=8 if referenced else 7, workflow_version=6 if referenced else 5,
-                           stored_version=settings.workflow_version,
-                           events=WORKFLOW_EVENTS, actions=ACTIONS,
-                           candidate_sources=SOURCES, candidate_catalogs=CATALOGS,
-                           candidate_examples=example_catalogs(), decision_questions=[q.to_dict() for q in questions],
-                           default_questions=[q.to_dict() for q in defaults],
-                           warning="；".join(w for w in (payload["warning"], migration_warning) if w) or None)
-        return payload
 
     async def web_decision_preview(self):
         payload = await request.json(default={})
@@ -398,15 +377,14 @@ class WebApiMixin:
         if mode not in ("model", "random"):
             return error_response("决策模式无效", status_code=400)
         settings = PluginSettings({"decision_mode": mode})
-        version = payload.get("version", 6)
-        if version not in (6, 7, 8):
-            return error_response("预览配置版本无效", status_code=400)
+        if not _current_editor(payload):
+            return error_response("预览配置版本无效，请刷新页面", status_code=400)
         trigger_event = payload.get("trigger_event", "")
         allowed_events = ("silence_elapsed", "timer_elapsed") if payload["scene"].endswith("_proactive") else ("message_received",)
         if not isinstance(trigger_event, str) or (trigger_event and trigger_event not in allowed_events):
             return error_response("触发事件与预览场景不匹配", status_code=400)
         settings.decision_questions, error = load_questions(
-            {"version": 6 if version == 8 else 5 if version == 7 else 4, "questions": payload.get("decision_questions")}, strict=True)
+            {"version": 6, "questions": payload.get("decision_questions")}, strict=True)
         if error:
             return error_response(error, status_code=400)
         voice = await self._voice_for(payload["scene"])
@@ -415,8 +393,7 @@ class WebApiMixin:
 
     async def web_decision_config(self):
         if request.method == "GET":
-            version = getattr(request, "query", {}).get("version")
-            return json_response(self._decision_config_payload(version=8 if str(version) == "8" else 7 if str(version) == "7" else 6))
+            return json_response(self._decision_config_payload())
 
         payload = await request.json(default={})
         if not isinstance(payload, dict):
@@ -425,18 +402,12 @@ class WebApiMixin:
         mode = payload.get("decision_mode", settings.decision_mode)
         if mode not in ("model", "random"):
             return error_response("请选择模型判断或纯随机", status_code=400)
-        version = payload.get("version")
-        if type(version) is not int or version not in (2, 3, 4, 5, 6, 7, 8):
-            return error_response("无法识别的编辑器版本，请刷新页面", status_code=400)
-        if version < 6:
-            return error_response("当前判断使用生效条件，请刷新编辑页后再保存", status_code=409)
-        if version < 8 and _needs_candidate_editor(settings):
-            return error_response("当前配置使用候选来源引用，请刷新编辑页后再保存", status_code=409)
-        if version == 6 and settings.workflow_version == 5:
-            return error_response("当前配置使用选项动作，需要支持版本 7 的编辑器", status_code=409)
+        if not _current_editor(payload):
+            # 升级前打开的旧编辑页不认识现在的字段，保存会丢掉它们。
+            return error_response("编辑页版本已过期，请刷新页面后再保存", status_code=409)
         custom_context = str(payload.get("decision_custom_context") or "").strip()
         edited = payload.get("decision_questions")
-        if version in (7, 8) and isinstance(edited, list) and all(isinstance(q, dict) for q in edited):
+        if isinstance(edited, list) and all(isinstance(q, dict) for q in edited):
             old_ids = {q.id for q in settings.decision_questions}
             deleted = old_ids.difference(q["id"] for q in edited if isinstance(q.get("id"), str))
             if deleted:
@@ -444,13 +415,7 @@ class WebApiMixin:
                     if isinstance(q.get("triggers"), list):
                         q["triggers"] = [t for t in q["triggers"] if not (
                             isinstance(t, dict) and isinstance(t.get("question"), str) and t["question"] in deleted)]
-        questions, error = load_questions(
-            {
-                "version": 6 if version == 8 else 5 if version == 7 else 4,
-                "questions": edited,
-            },
-            strict=True,
-        )
+        questions, error = load_questions({"version": 6, "questions": edited}, strict=True)
         if error:
             return error_response(error, status_code=400)
 
@@ -461,15 +426,11 @@ class WebApiMixin:
             "decision_mode": mode,
             "decision_custom_context": custom_context,
             "decision_questions": json.dumps(
-                {"version": 6 if version == 8 else 5 if version == 7 else 4, "questions": [q.to_dict() for q in questions]},
+                {"version": 6, "questions": [q.to_dict() for q in questions]},
                 ensure_ascii=False, indent=2,
             ),
         }
         async with self._config_lock():
-            if version < 8 and _needs_candidate_editor(self.settings):
-                return error_response("当前配置使用候选来源引用，请刷新编辑页后再保存", status_code=409)
-            if version < 7 and self.settings.workflow_version == 5:
-                return error_response("当前配置使用选项动作，需要支持版本 7 的编辑器", status_code=409)
             try:
                 await self._write_config(config, changes)
             except Exception:

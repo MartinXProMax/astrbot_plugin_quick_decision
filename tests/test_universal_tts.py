@@ -423,7 +423,7 @@ class ProactiveVoiceTests(unittest.IsolatedAsyncioTestCase):
 
             async def run(**decision):
                 await plugin._self_generate_and_send(
-                    profile, DecisionResult(action="proactive", scene="group_proactive", **decision), None)
+                    profile, DecisionResult(action="proactive", scene="group_proactive", **decision))
                 return self.sent[-1][0]
 
             with patch.object(main, "generate_text", AsyncMock(return_value="有人在吗")):

@@ -183,6 +183,12 @@ class TimerTriggerTests(unittest.IsolatedAsyncioTestCase):
         with patch("time.time", return_value=100000):
             self.assertEqual(self.plugin.sessions.prune_idle(), 1)
 
+    async def test_idle_sessions_are_dropped_while_the_plugin_is_disabled(self):
+        self.plugin.config["enabled"] = False
+        with patch("time.time", return_value=100000):
+            await self.plugin._check_silence()
+        self.assertIsNone(self.plugin.sessions.get("group"))
+
     async def test_dry_run_cooldown_quota_and_global_disable(self):
         for limit in ("dry_run", "cooldown", "quota", "none"):
             with self.subTest(limit=limit):
@@ -249,7 +255,7 @@ class TimerTriggerTests(unittest.IsolatedAsyncioTestCase):
             save_config_async = save_config
         self.plugin.config = Config(self.plugin.config)
         graph = [timer_question(), timer_question("daily", daily_time="08:00")]
-        payload = dict(version=7, decision_questions=graph)
+        payload = dict(version=8, decision_questions=graph)
         request = SimpleNamespace(method="POST", json=AsyncMock(return_value=payload))
         with patch.object(web_api, "request", request), patch.object(web_api, "json_response", side_effect=lambda value: value):
             saved = await self.plugin.web_decision_config()
@@ -264,15 +270,16 @@ class TimerTriggerTests(unittest.IsolatedAsyncioTestCase):
                 error.assert_called_once_with("触发事件与预览场景不匹配", status_code=400)
 
     async def test_generation_uses_timer_prompt_and_preserves_history(self):
-        self.plugin.context.persona_manager = SimpleNamespace(
-            get_persona=AsyncMock(return_value=SimpleNamespace(system_prompt="人格提示")))
+        self.plugin.context.persona_manager = SimpleNamespace(resolve_selected_persona=AsyncMock(
+            return_value=("default", {"name": "default", "prompt": "人格提示"}, None, False)))
         self.plugin.context.get_current_chat_provider_id = AsyncMock(return_value="provider")
         self.plugin.context.llm_generate = AsyncMock(return_value=SimpleNamespace(completion_text="早上好"))
         result = DecisionResult(action="proactive", scene="group_proactive", trigger_event="timer_elapsed")
-        text = await generate_text(self.plugin.context, umo="group", decision=result, user_prompt="")
+        text = await generate_text(self.plugin.context, umo="group", decision=result)
         self.assertEqual(text, "早上好")
         prompt = self.plugin.context.llm_generate.await_args.kwargs["prompt"]
         self.assertIn("定时", prompt)
         self.assertNotIn("沉默", prompt)
+        self.assertEqual(self.plugin.context.llm_generate.await_args.kwargs["system_prompt"], "人格提示")
         self.assertEqual(self.plugin.context.conversation_manager.updated[0]["history"],
                          [{"role": "assistant", "content": "早上好"}])

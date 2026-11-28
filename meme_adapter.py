@@ -11,7 +11,7 @@
 
 判断模型只根据描述选图，适配器不会读取图片像素内容。
 缺依赖时只报告不可用，调用方应改发纯文字，不得回退到旧自制图库。
-按图库注册表、语义元数据和图片的修改时间与大小缓存候选；管理器改描述或图包后会自动失效。
+按图库注册表、语义元数据、分类目录（以及 ID 由内容算出的图片）的修改时间与大小缓存候选；管理器改描述或图包后会自动失效。
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -153,7 +154,7 @@ class MemeCandidate:
     relative_path: str
     description: str
     path: Path
-    # 图片内容的 SHA256。只有元数据缺少合法 entry_id 或调用方要求时才读文件计算，否则为空。
+    # 图片内容的 SHA256。只有元数据缺少合法 entry_id 时才读文件计算，否则为空。
     content_sha256: str = ""
     caption_status: str = ""
 
@@ -275,12 +276,11 @@ def _semantic_captions(pack_dir: Path) -> dict[str, dict[str, Any]]:
 
 
 def iter_pack_images(
-    pack_dir: Path, pack_id: str, *, include_undesc: bool = False, with_hashes: bool = False
+    pack_dir: Path, pack_id: str, *, include_undesc: bool = False
 ) -> list[MemeCandidate]:
     """列出图包里的图片候选。
 
     元数据给出合法 entry_id 时不读图片内容：图库可能有几百兆，每次缓存失效都整库读一遍会卡住事件循环。
-    with_hashes 为真时总是读取并计算内容哈希，供旧库迁移按内容去重。
     """
     memes_dir = pack_dir / "memes"
     if not memes_dir.is_dir():
@@ -306,16 +306,15 @@ def iter_pack_images(
             entry_id = str(rec.get("entry_id") or "").strip().lower()
             has_entry_id = bool(ENTRY_ID_RE.match(entry_id))
             file_sha = ""
-            if with_hashes or not has_entry_id:
+            if not has_entry_id:
                 try:
                     file_sha = content_sha256(safe.read_bytes())
                 except OSError:
                     continue
+                entry_id = semantic_entry_id(file_sha, category, relative_path)
             elif not os.access(safe, os.R_OK):
                 # 不读内容也要排除读不了的图片，免得被选中后发送失败。
                 continue
-            if not has_entry_id:
-                entry_id = semantic_entry_id(file_sha, category, relative_path)
             candidates.append(
                 MemeCandidate(
                     id=entry_id,
@@ -362,7 +361,7 @@ class MemeManagerAdapter:
         self._registry_cache_key: tuple[str, tuple[int, int] | None] | None = None
         self._registry_cache: list[dict[str, Any]] = []
         self._candidate_cache: dict[
-            bool, tuple[tuple[Any, ...], list[MemeCandidate]]
+            bool, tuple[tuple[Any, ...], tuple[Any, ...], list[MemeCandidate]]
         ] = {}
 
     @staticmethod
@@ -407,14 +406,20 @@ class MemeManagerAdapter:
             if pack_dir:
                 memes_dir = pack_dir / "memes"
                 if memes_dir.is_dir():
+                    # 每轮判断都要检查一次：平时不逐张列出或查看图片，大图库放在慢速挂载上会卡住事件循环。
                     for category_dir in sorted(memes_dir.iterdir()):
                         if category_dir.is_dir():
-                            key.extend((str(category_dir), self._mtime(category_dir)))
-                            for image in sorted(category_dir.iterdir()):
-                                if image.is_file() and image.suffix.lower() in IMAGE_EXTENSIONS:
-                                    # Image replacement can keep the directory mtime unchanged.
-                                    key.extend((str(image), self._mtime(image)))
+                            stamp = self._mtime(category_dir)
+                            key.extend((str(category_dir), stamp))
+                            # 修改时间按秒计的磁盘（FAT 为 2 秒）上，同一刻度内再删图，目录时间和大小都不变；
+                            # 目录刚改过时连文件名一起记，过了这段时间键里少了文件名，会再扫描一次。
+                            if stamp and time.time() - stamp[0] / 1e9 < 3:
+                                key.append(tuple(sorted(os.listdir(category_dir))))
         return tuple(key)
+
+    def _derived_stamps(self, candidates: list[MemeCandidate]) -> tuple[Any, ...]:
+        """ID 由图片内容算出的候选原地换图会改变 ID，目录时间却可能不变；只有它们逐张查看。"""
+        return tuple(self._mtime(item.path) for item in candidates if item.content_sha256)
 
     def get_registered_star(self) -> Any | None:
         if self.context is None or not hasattr(self.context, "get_registered_star"):
@@ -499,10 +504,10 @@ class MemeManagerAdapter:
         packs = self._registry(data_dir)
         cache_key = self._candidate_cache_key(data_dir, packs)
         cached = self._candidate_cache.get(include_undesc)
-        if cached and cached[0] == cache_key:
-            return cached[1]
+        if cached and cached[0] == cache_key and cached[1] == self._derived_stamps(cached[2]):
+            return cached[2]
         candidates = self._scan(data_dir, packs, include_undesc=include_undesc)
-        self._candidate_cache[include_undesc] = (cache_key, candidates)
+        self._candidate_cache[include_undesc] = (cache_key, self._derived_stamps(candidates), candidates)
         return candidates
 
     @staticmethod
@@ -511,7 +516,6 @@ class MemeManagerAdapter:
         packs: list[dict[str, Any]],
         *,
         include_undesc: bool,
-        with_hashes: bool = False,
     ) -> list[MemeCandidate]:
         packs_root = data_dir / "packs"
         candidates: list[MemeCandidate] = []
@@ -523,9 +527,7 @@ class MemeManagerAdapter:
             pack_dir = _safe_pack_dir(packs_root, pack_id)
             if pack_dir is None:
                 continue
-            for candidate in iter_pack_images(
-                pack_dir, pack_id, include_undesc=include_undesc, with_hashes=with_hashes
-            ):
+            for candidate in iter_pack_images(pack_dir, pack_id, include_undesc=include_undesc):
                 if candidate.id in seen_ids:
                     continue
                 seen_ids.add(candidate.id)
@@ -549,18 +551,3 @@ class MemeManagerAdapter:
             if item.id == meme_id:
                 return item.path if item.path.is_file() else None
         return None
-
-    def existing_content_hashes(self) -> dict[str, MemeCandidate]:
-        """按内容哈希索引全部图片（含无描述的），供旧库迁移去重。
-
-        会读取每一张图片且不缓存；只在迁移时调用，调用方应放到线程里执行。
-        """
-        if self.require_plugin and self.get_registered_star() is None:
-            return {}
-        data_dir = self.resolve_data_dir()
-        if data_dir is None:
-            return {}
-        candidates = self._scan(
-            data_dir, self._registry(data_dir), include_undesc=True, with_hashes=True
-        )
-        return {item.content_sha256: item for item in candidates}

@@ -94,7 +94,7 @@ class ExternalPluginsApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([c["id"] for c in meme["catalogs"]], ["meme_categories", "memes"])
         self.assertEqual(meme["catalogs"][0]["children_label"], "全部图库图片")
         # 自带的默认问题与判断配置页「恢复默认问题」里的同名题一致。
-        restore = {q["id"]: q for q in self.plugin._decision_config_payload(version=8)["default_questions"]}
+        restore = {q["id"]: q for q in self.plugin._decision_config_payload()["default_questions"]}
         self.assertEqual([q["id"] for q in meme["default_questions"]], ["use_meme", "meme_category", "meme_id"])
         for question in meme["default_questions"]:
             self.assertEqual(question, restore[question["id"]])

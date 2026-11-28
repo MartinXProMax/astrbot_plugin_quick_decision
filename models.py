@@ -18,7 +18,6 @@ SceneType = Literal[
     "group_proactive",
     "private_proactive",
 ]
-DescriptionSource = Literal["manual", "auto", "empty"]
 
 
 def normalize_action(action: str) -> str:
@@ -26,39 +25,6 @@ def normalize_action(action: str) -> str:
     if action == "join":
         return "reply"
     return action
-
-
-@dataclass
-class MemeItem:
-    """全局表情包元数据。"""
-
-    id: str
-    filename: str
-    original_name: str = ""
-    mime: str = "image/png"
-    description: str = ""
-    description_source: DescriptionSource = "empty"
-    created_at: str = ""
-    updated_at: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> MemeItem:
-        source = data.get("description_source") or "empty"
-        if source not in {"manual", "auto", "empty"}:
-            source = "empty"
-        return cls(
-            id=str(data.get("id", "")),
-            filename=str(data.get("filename", "")),
-            original_name=str(data.get("original_name", "")),
-            mime=str(data.get("mime") or "image/png"),
-            description=str(data.get("description", "")),
-            description_source=source,  # type: ignore[arg-type]
-            created_at=str(data.get("created_at", "")),
-            updated_at=str(data.get("updated_at", "")),
-        )
 
 
 @dataclass
@@ -81,6 +47,8 @@ class BufferedMessage:
     is_wake: bool = False
     # 会话内的到达序号，由 SessionStore.append_message 分配；只在运行时使用，不写入日志。
     seq: int = field(default=0, compare=False)
+    # AstrBot「群聊上下文感知」给这条消息的记录 id；没开或没记下时为空。只在运行时使用，不写入日志。
+    group_context_record_id: str = field(default="", compare=False)
 
     def to_state_dict(self) -> dict[str, Any]:
         item: dict[str, Any] = {
@@ -107,6 +75,7 @@ class BufferedMessage:
 def _log_message(message: BufferedMessage) -> dict[str, Any]:
     item = dict(asdict(message), text=message.text[:500], quote_text=message.quote_text[:80])
     item.pop("seq", None)
+    item.pop("group_context_record_id", None)
     return item
 
 

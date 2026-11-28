@@ -1,4 +1,4 @@
-"""表情包管理器适配、迁移与发图降级。使用隔离临时目录，不访问网络，不发 QQ。"""
+"""表情包管理器适配与发图降级。使用隔离临时目录，不访问网络，不发 QQ。"""
 
 # ruff: noqa: E402, I001
 
@@ -8,6 +8,7 @@ import importlib
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -55,16 +56,11 @@ importlib.reload(reply_generator)
 
 from astrbot_plugin_quick_decision.config_util import PluginSettings
 from engine_helpers import _build_questions, _parse_answers, build_meme_chain
-from astrbot_plugin_quick_decision.legacy_meme_index import LegacyMemeIndex
 from astrbot_plugin_quick_decision.meme_adapter import (
     MemeManagerAdapter,
     UNAVAILABLE_HINT,
     content_sha256,
     semantic_entry_id,
-)
-from astrbot_plugin_quick_decision.meme_migrate import (
-    migrate_legacy_library,
-    rollback_migration,
 )
 from astrbot_plugin_quick_decision.models import DecisionResult
 from astrbot_plugin_quick_decision.reply_generator import build_send_chain
@@ -153,27 +149,6 @@ def _make_pack(
     _write_json(registry_path, registry)
 
 
-def _write_legacy(plugin_dir: Path, items: list[tuple[str, bytes, str, str]]) -> None:
-    memes_dir = plugin_dir / "memes"
-    memes_dir.mkdir(parents=True, exist_ok=True)
-    records = []
-    for meme_id, data, filename, description in items:
-        (memes_dir / filename).write_bytes(data)
-        records.append(
-            {
-                "id": meme_id,
-                "filename": filename,
-                "original_name": filename,
-                "mime": "image/png" if filename.endswith(".png") else "image/jpeg",
-                "description": description,
-                "description_source": "manual",
-                "created_at": "2026-11-13T00:00:00+08:00",
-                "updated_at": "2026-11-13T00:00:00+08:00",
-            }
-        )
-    _write_json(plugin_dir / "memes.json", {"memes": records})
-
-
 class FakeStar:
     version = "5.3.8"
 
@@ -199,16 +174,10 @@ class MemeAdapterTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.manager_dir = self.root / "meme_manager"
-        self.plugin_dir = self.root / "quick_decision"
         self.manager_dir.mkdir()
-        self.plugin_dir.mkdir()
         _write_json(
             self.manager_dir / "registry.json",
             {"schema_version": 1, "installed_packs": []},
-        )
-        _write_json(
-            self.manager_dir / "selection_rules.json",
-            {"schema_version": 1, "rules": [{"id": "default", "scope": "default", "pack_id": "builtin-default"}]},
         )
 
     def tearDown(self) -> None:
@@ -229,14 +198,6 @@ class MemeAdapterTests(unittest.TestCase):
         self.assertTrue(any(getattr(item, "text", None) == "hello" for item in chain.chain))
         meme_chain = build_meme_chain(adapter, decision)
         self.assertFalse(meme_chain.chain)
-
-    def test_does_not_read_legacy_store_when_unavailable(self) -> None:
-        _write_legacy(self.plugin_dir, [("legacy000000001", PNG, "old.png", "旧库描述")])
-        adapter = MemeManagerAdapter(
-            context=FakeContext(None), data_dir=self.manager_dir, require_plugin=True
-        )
-        self.assertEqual(adapter.described_catalog(), [])
-        self.assertTrue(LegacyMemeIndex(self.plugin_dir).exists())
 
     def test_catalog_maps_description_to_exact_file(self) -> None:
         _make_pack(
@@ -281,13 +242,26 @@ class MemeAdapterTests(unittest.TestCase):
         (self.manager_dir / "packs/pack-a" / rel).write_bytes(JPEG)
         self.assertEqual(adapter.list_candidates()[0].id, semantic_entry_id(content_sha256(JPEG), "imported", rel))
 
-    def test_existing_content_hashes_read_current_images(self) -> None:
-        _make_pack(self.manager_dir, "pack-a", [("smile.png", PNG, "微笑点头"), ("blank.png", JPEG, "")])
+    def test_deleted_image_drops_out_when_folder_time_is_coarse(self) -> None:
+        # 修改时间按秒计时，同一秒内删图，目录的时间和大小都不变；这里把目录时间固定在当前这一秒。
+        _make_pack(self.manager_dir, "pack-a", [("smile.png", PNG, "微笑点头"), ("cry.jpg", JPEG, "大哭")])
         adapter = MemeManagerAdapter(data_dir=self.manager_dir, require_plugin=False)
-        self.assertEqual(set(adapter.existing_content_hashes()), {content_sha256(PNG), content_sha256(JPEG)})
-        (self.manager_dir / "packs/pack-a/memes/imported/smile.png").write_bytes(JPEG + b"\0")
-        self.assertEqual(set(adapter.existing_content_hashes()),
-                         {content_sha256(JPEG + b"\0"), content_sha256(JPEG)})
+        real, frozen = MemeManagerAdapter._mtime, int(time.time()) * 10**9
+        with patch.object(MemeManagerAdapter, "_mtime",
+                          side_effect=lambda path: (frozen, 0) if Path(path).is_dir() else real(path)):
+            self.assertEqual(len(adapter.described_catalog()), 2)
+            (self.manager_dir / "packs/pack-a/memes/imported/cry.jpg").unlink()
+            self.assertEqual([item["description"] for item in adapter.described_catalog()], ["微笑点头"])
+
+    def test_cache_check_does_not_stat_images_that_have_metadata_ids(self) -> None:
+        # 每轮判断都会检查缓存；ID 取自元数据时不能逐张查看图片，大图库在慢速挂载上会卡住事件循环。
+        _make_pack(self.manager_dir, "pack-a", [("smile.png", PNG, "微笑点头"), ("cry.jpg", JPEG, "大哭")])
+        adapter = MemeManagerAdapter(data_dir=self.manager_dir, require_plugin=False)
+        first = adapter.described_catalog()
+        with patch.object(MemeManagerAdapter, "_mtime", wraps=MemeManagerAdapter._mtime) as stat:
+            self.assertEqual(adapter.described_catalog(), first)
+        self.assertTrue(stat.called)
+        self.assertEqual([c.args[0] for c in stat.call_args_list if Path(c.args[0]).suffix in (".png", ".jpg")], [])
 
     def test_catalog_does_not_read_images_when_metadata_has_ids(self) -> None:
         # 图库可能有几百兆；选图和发图只靠元数据，不能每次缓存失效都整库读一遍。
@@ -301,8 +275,6 @@ class MemeAdapterTests(unittest.TestCase):
             self.assertIsNotNone(adapter.resolve_image(catalog[0]["id"]))
             self.assertEqual(adapter.status().candidate_count, 2)
             self.assertEqual(digest.call_count, 0)
-            adapter.existing_content_hashes()
-            self.assertEqual(digest.call_count, 2)
 
     def test_unreadable_images_are_not_offered(self) -> None:
         # 不读内容时也要排除读不了的图片，否则选中后发送失败。
@@ -458,59 +430,6 @@ class MemeAdapterTests(unittest.TestCase):
         )
         self.assertEqual(below.action, "none")
         self.assertFalse(below.should_speak())
-
-    def test_migrate_preserves_descriptions_dedups_and_can_rollback(self) -> None:
-        _make_pack(self.manager_dir, "builtin-default", [])
-        existing_hash_pack = [
-            ("exists.png", PNG, ""),
-        ]
-        _make_pack(self.manager_dir, "already-there", existing_hash_pack)
-        unique = JPEG
-        _write_legacy(
-            self.plugin_dir,
-            [
-                ("legacy000000001", PNG, "d32974bb59d74c89.png", "旧图一微笑"),
-                ("legacy000000002", unique, "second.jpg", "旧图二大哭"),
-            ],
-        )
-        before_rules = (self.manager_dir / "selection_rules.json").read_text(encoding="utf-8")
-        existing_ids = {"builtin-default", "already-there"}
-        result = migrate_legacy_library(self.plugin_dir, self.manager_dir)
-        self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["migrated"], 1)
-        self.assertEqual(result.get("filled_existing"), 1)
-        pack_id = result["pack_id"]
-        self.assertIsNotNone(pack_id)
-        self.assertNotIn(pack_id, existing_ids)
-        # 旧库仍在
-        self.assertTrue((self.plugin_dir / "memes/second.jpg").is_file())
-        self.assertTrue((self.plugin_dir / "memes.json").is_file())
-        # 未改选包规则、未覆盖已有图包
-        self.assertEqual(
-            (self.manager_dir / "selection_rules.json").read_text(encoding="utf-8"),
-            before_rules,
-        )
-        self.assertTrue((self.manager_dir / "packs/already-there").is_dir())
-        self.assertTrue((self.manager_dir / "packs/builtin-default").is_dir())
-        adapter = MemeManagerAdapter(data_dir=self.manager_dir, require_plugin=False)
-        catalog = {item["description"]: item for item in adapter.described_catalog()}
-        self.assertIn("旧图二大哭", catalog)
-        self.assertIn("旧图一微笑", catalog)
-        path = adapter.resolve_image(catalog["旧图二大哭"]["id"])
-        self.assertEqual(path.read_bytes(), JPEG)
-        # 重复图只补描述，不复制文件到新包
-        new_files = list((self.manager_dir / "packs" / pack_id / "memes").rglob("*"))
-        new_images = [p for p in new_files if p.is_file()]
-        self.assertEqual(len(new_images), 1)
-        # 回滚只移除新图包
-        rolled = rollback_migration(self.plugin_dir, self.manager_dir)
-        self.assertEqual(rolled["status"], "rolled_back")
-        self.assertFalse((self.manager_dir / "packs" / pack_id).exists())
-        self.assertTrue((self.manager_dir / "packs/already-there").is_dir())
-        self.assertTrue((self.plugin_dir / "memes/second.jpg").is_file())
-        # 回滚后已填到已有图包的描述仍可能保留；旧库描述始终还在
-        leftover = LegacyMemeIndex(self.plugin_dir).list_records()
-        self.assertEqual({rec.item.description for rec in leftover}, {"旧图一微笑", "旧图二大哭"})
 
 
 if __name__ == "__main__":

@@ -299,7 +299,9 @@ class SessionStore:
                 try:
                     await asyncio.to_thread(self._write_log_file, version, text)
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("决策日志写入失败，下次变更时重试：%s", exc)
+                    # 保留待写标记：没有新变更时，卸载前的 flush_logs 也要再写一次。
+                    self._log_dirty = True
+                    logger.warning("决策日志写入失败，下次变更或卸载时重试：%s", exc)
                     return
 
     def _write_log_file(self, version: int, text: str) -> None:

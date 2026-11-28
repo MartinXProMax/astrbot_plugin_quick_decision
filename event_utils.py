@@ -12,6 +12,10 @@ from astrbot.core.star.filter.command_group import CommandGroupFilter
 
 from .models import BufferedMessage, SessionProfile
 
+# AstrBot 内置「群聊上下文感知」写在事件上的记录 id。它的处理器先于本插件运行；请求时注入这条记录之前的群聊，
+# 并清掉到这条为止的记录。见 AstrBot 4.29.4 builtin_stars/astrbot/group_chat_context.py。
+GROUP_CONTEXT_RECORD_KEY = "_group_context_record_id"
+
 
 def sender_id(event: AstrMessageEvent) -> str:
     sid = event.get_sender_id()
@@ -110,6 +114,8 @@ def to_buffered_message(event: AstrMessageEvent) -> BufferedMessage:
     sent_at = raw.get("time") if isinstance(raw, Mapping) else None
     if type(sent_at) is not int or not 0 < sent_at <= time.time():
         sent_at = None
+    getter = getattr(event, "get_extra", None)
+    record_id = getter(GROUP_CONTEXT_RECORD_KEY) if callable(getter) else None
     return BufferedMessage(
         message_id=str(getattr(event.message_obj, "message_id", "") or ""),
         sender_id=sender_id(event),
@@ -124,6 +130,7 @@ def to_buffered_message(event: AstrMessageEvent) -> BufferedMessage:
         quote_text=quote_text[:80],
         timestamp=event_timestamp(event),
         sent_at=sent_at,
+        group_context_record_id=record_id if isinstance(record_id, str) else "",
     )
 
 

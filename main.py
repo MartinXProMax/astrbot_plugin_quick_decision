@@ -26,6 +26,7 @@ from .decision_engine import (
 )
 from .decision_tools import run_tools, skip_tools
 from .event_utils import (
+    GROUP_CONTEXT_RECORD_KEY,
     event_has_command_handler,
     event_profile,
     event_session_name,
@@ -34,7 +35,6 @@ from .event_utils import (
     to_buffered_message,
 )
 from .meme_adapter import UNAVAILABLE_HINT, MemeManagerAdapter
-from .meme_migrate import maybe_migrate_legacy_library
 from .models import BufferedMessage, DecisionResult, SceneType, SessionProfile, decision_log_context
 from .official_handoff import (
     begin_official_pipeline,
@@ -42,6 +42,7 @@ from .official_handoff import (
     build_inbound_user_prompt,
     collect_event_media_urls,
     end_proactive_round,
+    group_context_enabled,
     is_official_pipeline_busy,
     make_official_llm_request,
     official_skip_reason,
@@ -49,6 +50,7 @@ from .official_handoff import (
     resolve_session_conversation,
     session_release_event,
     should_use_default_official_agent,
+    split_batch_for_group_context,
     suppress_default_official_agent,
     touch_official_pipeline,
 )
@@ -143,14 +145,6 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         return settings
 
     async def initialize(self) -> None:
-        try:
-            # 迁移会读写整个旧图库，并逐张读取表情包管理器的图片做内容去重，放到线程里免得卡住事件循环。
-            # 迁移自建适配器实例，不与 self.meme_adapter 共用缓存。
-            await asyncio.to_thread(
-                maybe_migrate_legacy_library, self.data_dir, self.meme_adapter.resolve_data_dir()
-            )
-        except Exception:  # noqa: BLE001
-            logger.exception("旧自制图库迁移失败，旧库保持原样，本轮不回退旧库发图")
         self._silence_task = asyncio.create_task(self._silence_loop())
         logger.info("快速决策插件已启动。将在全部插件加载后再核对表情包管理器。请勿同时开启官方概率主动回复。")
 
@@ -314,21 +308,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         messages = self.sessions.recent_messages(
             profile.umo, settings.context_message_limit
         )
-        memes = None
-        immediate_actions = has_on_match_actions(settings.decision_questions, scene)
-        if skip_reason and immediate_actions:
-            memes = self._meme_candidates(settings)
-            immediate_actions = has_on_match_actions(
-                settings.decision_questions,
-                scene,
-                candidate_available={
-                    "memes": bool(memes),
-                    "meme_categories": bool(memes),
-                    "recent_messages": any(
-                        item.role == "user" and item.message_id for item in messages
-                    ),
-                },
-            )
+        immediate_actions, memes = self._immediate_actions(settings, scene, messages) if skip_reason else (False, None)
         if skip_reason and not immediate_actions:
             runtime.consumed_seq = max(runtime.consumed_seq, seen)
             result = DecisionResult(
@@ -406,12 +386,8 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             event.stop_event()
             return
 
-        if (
-            scene == "group_passive"
-            and not at_or_quoted
-            and not woken
-            and (not settings.group_enable_interrupt or self.sessions.in_cooldown(profile.umo, settings.cooldown_seconds))
-        ):
+        # 判断期间可能刚发过言进入冷却，或改了插话开关，按判断前的同一规则再看一次。
+        if self._passive_skip_reason(settings, profile, scene, at_or_quoted, woken):
             skip_tools(result, "群聊插话已关闭或会话冷却中")
             await self._log_decision(profile, result)
             logger.info("会话处于冷却中，跳过群聊插话：%s", profile.umo)
@@ -456,8 +432,14 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if conversation is None:
             logger.error("无法取得官方会话，取消本轮官方生成：%s", profile.umo)
             return None, "无法取得官方会话"
+        merged = len(batch) > 1
+        prompt_batch = batch
+        if merged and not profile.is_private and group_context_enabled(self._astrbot_config(profile.umo)):
+            prompt_batch, record_id = split_batch_for_group_context(batch)
+            if record_id:
+                event.set_extra(GROUP_CONTEXT_RECORD_KEY, record_id)
         prompt = build_inbound_user_prompt(
-            event_text=event.message_str or "", batch=batch, merged=len(batch) > 1
+            event_text=event.message_str or "", batch=prompt_batch, merged=merged
         )
         image_urls, audio_urls = collect_event_media_urls(event)
         if not prompt and not image_urls and not audio_urls:
@@ -510,40 +492,21 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             return at_or_quoted, "private_passive"
         return at_or_quoted, "group_passive"
 
-    async def _self_generate_and_send(
-        self,
-        profile: SessionProfile,
-        result: DecisionResult,
-        event: AstrMessageEvent | None,
-    ) -> None:
+    async def _self_generate_and_send(self, profile: SessionProfile, result: DecisionResult) -> None:
+        """冷场和定时发言没有入站事件，不经过官方 Agent，自行调用聊天模型生成并发送。"""
         settings = self.settings
         if settings.dry_run:
             return
-        prompt = ""
-        if event is not None:
-            prompt = (event.message_str or "").strip()
-        if not prompt:
-            recent = self.sessions.recent_messages(profile.umo, 5)
-            parts = [
-                f"{item.sender_name or item.sender_id}: {item.text}"
-                for item in recent
-                if item.role == "user" and item.text
-            ]
-            prompt = "\n".join(parts[-3:])
+        # 没有入站事件可取平台名，按空处理（与之前一致）。
+        platform_name = ""
         try:
-            text = await generate_text(
-                self.context,
-                umo=profile.umo,
-                decision=result,
-                user_prompt=prompt,
-            )
+            text = await generate_text(self.context, umo=profile.umo, decision=result, platform_name=platform_name)
         except Exception:  # noqa: BLE001
             logger.exception("自行调用聊天模型生成回复失败")
             return
         if not text:
             logger.warning("聊天模型没有返回文本，取消发送：%s", profile.umo)
             return
-        platform_name = platform_name_from_event(event)
         self._schedule_post_decision(result, text, profile.umo, platform_name)
 
         # 主动发言直接发给平台，不经过官方装饰阶段，通用 TTS 的钩子碰不到，这里替它转语音。
@@ -570,8 +533,22 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 reply_text = "\n".join(sent_texts)
                 self._record_bot_text(profile, reply_text)
                 await self._update_log_reply(result, reply_text, complete=result.text_sent is True)
-                if result.action == "proactive":
-                    self.sessions.mark_proactive(profile.umo)
+                self.sessions.mark_proactive(profile.umo)
+
+    def _immediate_actions(self, settings, scene, messages, **trigger):
+        """不能发言的回合是否仍有判断后立即发图的动作要跑；返回（是否有，读过的表情候选或 None）。
+
+        先只看判断图，可能有时才读表情候选并按候选是否存在再判断一次。
+        """
+        if not has_on_match_actions(settings.decision_questions, scene, **trigger):
+            return False, None
+        memes = self._meme_candidates(settings)
+        available = {
+            "memes": bool(memes),
+            "meme_categories": bool(memes),
+            "recent_messages": any(item.role == "user" and item.message_id for item in messages),
+        }
+        return has_on_match_actions(settings.decision_questions, scene, candidate_available=available, **trigger), memes
 
     def _meme_candidates(self, settings):
         # 在「外部插件」中停用后视同表情包管理器不可用，选表情的问题因没有候选而跳过。
@@ -760,10 +737,11 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             self._start_proactive(runtime, timer_roots={key[0] for key in due})
 
     async def _check_silence(self) -> None:
+        # 停用期间仍在缓冲消息，清理闲置会话也不能停。
+        self.sessions.prune_idle()
         settings = self.settings
         if not settings.enabled:
             return
-        self.sessions.prune_idle()
         now = time.time()
         for runtime in self.sessions.all_sessions():
             profile = runtime.profile
@@ -819,28 +797,10 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         messages = self.sessions.recent_messages(
             profile.umo, settings.context_message_limit
         )
-        memes = None
-        immediate_actions = has_on_match_actions(
-            settings.decision_questions,
-            scene,
-            trigger_event=trigger_event,
-            timer_roots=timer_roots,
+        immediate_actions, memes = (
+            self._immediate_actions(settings, scene, messages, trigger_event=trigger_event, timer_roots=timer_roots)
+            if limit_reason else (False, None)
         )
-        if limit_reason and immediate_actions:
-            memes = self._meme_candidates(settings)
-            immediate_actions = has_on_match_actions(
-                settings.decision_questions,
-                scene,
-                trigger_event=trigger_event,
-                timer_roots=timer_roots,
-                candidate_available={
-                    "memes": bool(memes),
-                    "meme_categories": bool(memes),
-                    "recent_messages": any(
-                        item.role == "user" and item.message_id for item in messages
-                    ),
-                },
-            )
         if limit_reason and not immediate_actions:
             result = DecisionResult(
                 scene=scene,
@@ -873,9 +833,8 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         runtime.last_decision = result
         if not settings.dry_run and not result.failed:
             await run_tools(self.context, umo=profile.umo, resolver=self.meme_adapter, decision=result, when="on_match")
-        limited = ((not scheduled and not settings.proactive_enabled(profile.is_private))
-                   or self.sessions.in_cooldown(profile.umo, settings.cooldown_seconds)
-                   or not self.sessions.can_proactive(profile.umo, settings.hourly_proactive_limit(profile.is_private)))
+        # 判断期间开关、冷却或次数可能已变，按判断前的同一规则再看一次。
+        limited = self._proactive_skip_reason(settings, profile, scheduled) is not None
         if limited:
             skip_tools(result, "主动发言已关闭、冷却中或已达次数上限", when="after_send")
         await self._log_decision(profile, result)
@@ -885,7 +844,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             logger.info("试运行：主动判断为可以开口，但不会发送：%s", profile.umo)
             return
         try:
-            await self._self_generate_and_send(profile, result, None)
+            await self._self_generate_and_send(profile, result)
         finally:
             await self._finish_tool_log(result)
 

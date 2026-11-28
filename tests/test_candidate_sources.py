@@ -184,7 +184,7 @@ class CandidateSourceTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             plugin, _ = _make_plugin(directory)
             plugin.config = Config(plugin.config)
-            payload = plugin._decision_config_payload(version=8)
+            payload = plugin._decision_config_payload()
             self.assertEqual(payload["version"], 8)
             self.assertEqual(next(q for q in payload["decision_questions"] if q["id"] == "meme_id")["candidate_source"],
                              {"question": "meme_category"})
@@ -226,7 +226,7 @@ class CandidateSourceTests(unittest.IsolatedAsyncioTestCase):
                                   actions={"*": [{"tool": "add_context"}]})
                     plugin.config["decision_questions"] = {"version": version, "questions": old}
                     original = deepcopy(plugin.config["decision_questions"])
-                    projected = plugin._decision_config_payload(version=7)
+                    projected = plugin._decision_config_payload()
                     self.assertEqual(projected["version"], 8)
                     self.assertEqual(projected["stored_version"], version)
                     projected["version"] = 7
@@ -237,26 +237,3 @@ class CandidateSourceTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(await plugin.web_decision_config(), 409)
                     self.assertEqual(plugin.config["decision_questions"], original)
             plugin.config.save_config.assert_not_awaited()
-
-    async def test_old_editors_can_restore_compatible_defaults_on_flat_graphs(self):
-        from astrbot_plugin_quick_decision import web_api
-
-        class Config(dict):
-            save_config = AsyncMock()
-            save_config_async = save_config
-
-        with tempfile.TemporaryDirectory() as directory:
-            plugin, _ = _make_plugin(directory)
-            plugin.config = Config(plugin.config)
-            for version in (6, 7):
-                with self.subTest(version=version):
-                    plugin.config["decision_questions"] = {"version": 5 if version == 7 else 4, "questions": []}
-                    payload = plugin._decision_config_payload(version=version)
-                    self.assertEqual(payload["version"], version)
-                    self.assertFalse(any(isinstance(q.get("candidate_source"), dict) for q in payload["default_questions"]))
-                    payload["decision_questions"] = payload["default_questions"]
-                    request = SimpleNamespace(method="POST", json=AsyncMock(return_value=payload))
-                    with (patch.object(web_api, "request", request),
-                          patch.object(web_api, "json_response", side_effect=lambda body: body)):
-                        self.assertEqual((await plugin.web_decision_config())["version"], version)
-                    self.assertIsNone(plugin.settings.decision_questions_warning)

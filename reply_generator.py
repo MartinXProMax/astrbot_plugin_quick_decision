@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from copy import copy
 from pathlib import Path
 from typing import Protocol
@@ -26,6 +27,12 @@ try:
     from astrbot.core.pipeline.process_stage.follow_up import _ACTIVE_AGENT_RUNNERS
 except ImportError:
     _ACTIVE_AGENT_RUNNERS = {}
+
+try:
+    # 官方主 Agent 在整轮请求（含写回历史）期间持有的会话锁。
+    from astrbot.core.utils.session_lock import session_lock_manager
+except ImportError:
+    session_lock_manager = None
 
 
 class ImageResolver(Protocol):
@@ -380,24 +387,53 @@ def _history_as_contexts(history_raw: str | list | None) -> list[dict]:
     return contexts
 
 
-async def resolve_persona_prompt(context, umo: str, conversation) -> str:
-    persona_mgr = context.persona_manager
-    persona_id = getattr(conversation, "persona_id", None) if conversation else None
-    if persona_id:
-        try:
-            persona = await persona_mgr.get_persona(persona_id)
-            prompt = getattr(persona, "system_prompt", "") or ""
-            if prompt:
-                return prompt
-        except Exception:  # noqa: BLE001
-            logger.debug("会话绑定人格不可用，回退到默认人格")
+async def resolve_persona(context, umo: str, conversation, platform_name: str = "") -> tuple[str, list[dict]]:
+    """按官方主 Agent 的规则取本会话生效的人格提示词和预设对话。
+
+    依次看会话管理里强制指定的人格、对话自己的人格（``[%None]`` 表示已取消人格）和配置的默认人格，
+    与 AstrBot 4.29.4 ``PersonaManager.resolve_selected_persona`` 一致。预设对话只取角色和正文，
+    不带框架的 ``_no_save`` 标记。
+    """
+    resolver = getattr(getattr(context, "persona_manager", None), "resolve_selected_persona", None)
+    if not callable(resolver):
+        return "", []
     try:
-        persona_v3 = await persona_mgr.get_default_persona_v3(umo)
+        _, persona, _, _ = await resolver(
+            umo=umo,
+            conversation_persona_id=getattr(conversation, "persona_id", None) if conversation else None,
+            platform_name=platform_name,
+        )
     except Exception:  # noqa: BLE001
-        return ""
-    if isinstance(persona_v3, dict):
-        return str(persona_v3.get("prompt") or "")
-    return str(getattr(persona_v3, "prompt", "") or "")
+        logger.warning("无法读取本会话人格，本轮主动发言不带人格：%s", umo, exc_info=True)
+        return "", []
+    if not persona:
+        return "", []
+    dialogs = [
+        {"role": item["role"], "content": item["content"]}
+        for item in persona.get("_begin_dialogs_processed") or []
+        if isinstance(item, dict) and item.get("role") in {"user", "assistant"} and "content" in item
+    ]
+    return str(persona.get("prompt") or ""), dialogs
+
+
+async def _append_history(conv_mgr, umo: str, cid: str, original: list, added: list[dict]) -> None:
+    """生成期间官方历史可能已被改动，重新读取后只在原历史之上追加。
+
+    对话已切换（``/new``、``/switch``），或历史不再以生成前读到的内容开头（``/reset`` 清空、压缩改写）时放弃写回，
+    不用旧副本盖掉别人的改动。持有官方主 Agent 的会话锁，不与同会话正在保存的官方回合交错。
+    """
+    lock = session_lock_manager.acquire_lock(umo) if session_lock_manager is not None else nullcontext()
+    async with lock:
+        current = await conv_mgr.get_curr_conversation_id(umo)
+        if current and current != cid:
+            logger.info("生成期间已切换对话，本轮发言不写入官方历史：%s", umo)
+            return
+        latest = await conv_mgr.get_conversation(umo, cid)
+        history = _history_records(getattr(latest, "history", None)) if latest is not None else None
+        if history is None or history[:len(original)] != original:
+            logger.info("生成期间官方历史已被清空或改写，本轮发言不写入官方历史：%s", umo)
+            return
+        await conv_mgr.update_conversation(umo, cid, history=[*history, *added])
 
 
 async def generate_text(
@@ -405,9 +441,9 @@ async def generate_text(
     *,
     umo: str,
     decision: DecisionResult,
-    user_prompt: str,
+    platform_name: str = "",
 ) -> str:
-    """尽量沿用官方会话历史和人格，但不把这些内容传给判断模型。"""
+    """生成冷场或定时发言：尽量沿用官方会话历史和人格，但不把这些内容传给判断模型。"""
     provider_id = await context.get_current_chat_provider_id(umo)
     conv_mgr = context.conversation_manager
     curr_cid = await conv_mgr.get_curr_conversation_id(umo)
@@ -422,14 +458,13 @@ async def generate_text(
             curr_cid = getattr(conversation, "cid", None) if conversation else None
         except Exception:  # noqa: BLE001
             conversation = None
-    system_prompt = await resolve_persona_prompt(context, umo, conversation)
+    system_prompt, begin_dialogs = await resolve_persona(context, umo, conversation, platform_name)
     history_raw = getattr(conversation, "history", None) if conversation else None
-    contexts = _history_as_contexts(history_raw)
-    prompt = user_prompt.strip() or "请根据当前对话自然地回复。"
-    if decision.scene in {"group_proactive", "private_proactive"}:
-        prompt = ("本轮由定时任务触发，请结合当前时间、会话上下文和判断提示自然地发言。"
-                  if decision.trigger_event == "timer_elapsed" else
-                  "会话已经沉默一段时间，请结合上下文主动开一个自然的话题或打个招呼。")
+    # 官方主 Agent 把人格预设对话放在历史之前。
+    contexts = [*begin_dialogs, *_history_as_contexts(history_raw)]
+    prompt = ("本轮由定时任务触发，请结合当前时间、会话上下文和判断提示自然地发言。"
+              if decision.trigger_event == "timer_elapsed" else
+              "会话已经沉默一段时间，请结合上下文主动开一个自然的话题或打个招呼。")
     response = await context.llm_generate(
         chat_provider_id=provider_id,
         prompt=prompt,
@@ -441,14 +476,9 @@ async def generate_text(
     if text and curr_cid:
         try:
             # 以原始历史为底追加，保留官方的工具调用轮次；用过滤后的 contexts 写回会把
-            # tool 消息永久删掉，之后官方流水线也会因 tool_calls 缺少结果而报 400。
-            history = _history_records(history_raw)
-            if decision.scene in {"group_proactive", "private_proactive"}:
-                history.append({"role": "assistant", "content": text})
-            else:
-                history.append({"role": "user", "content": prompt})
-                history.append({"role": "assistant", "content": text})
-            await conv_mgr.update_conversation(umo, curr_cid, history=history)
+            # tool 消息永久删掉，之后官方流水线也会因 tool_calls 缺少结果而报 400。主动发言没有用户消息，只追加回复。
+            added = [{"role": "assistant", "content": text}]
+            await _append_history(conv_mgr, umo, curr_cid, _history_records(history_raw), added)
         except Exception:  # noqa: BLE001
             logger.exception("写入官方会话历史失败")
     return text

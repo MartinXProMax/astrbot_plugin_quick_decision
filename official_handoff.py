@@ -153,6 +153,29 @@ def build_inbound_user_prompt(
     return (event_text or "").strip()
 
 
+def group_context_enabled(config) -> bool:
+    """AstrBot 内置「群聊上下文感知」是否开启；读不到配置时按未开启处理。"""
+    if config is None:
+        return False
+    return bool((config.get("provider_ltm_settings") or {}).get("group_icl_enable"))
+
+
+def split_batch_for_group_context(
+    batch: list[BufferedMessage],
+) -> tuple[list[BufferedMessage], str]:
+    """合并回合交给「群聊上下文感知」时，返回仍写进提示词的消息和请求应指向的记录 id。
+
+    群聊上下文感知在请求时注入本事件记录之前的群聊，只清掉到这条记录为止。合并回合的请求挂在第一条事件上，
+    后面几条若也写进提示词，会留在记录里，下一次请求又被当作「上次回复之后」的群聊注入。改为指向本轮最后一条
+    有记录、有正文的消息：更早的几条由它注入，提示词只写这条及之后的消息。没有这样的消息时原样返回整批、id 为空。
+    """
+    for index in range(len(batch) - 1, -1, -1):
+        item = batch[index]
+        if item.group_context_record_id and (item.text or "").strip():
+            return list(batch[index:]), item.group_context_record_id
+    return list(batch), ""
+
+
 def collect_event_media_urls(event) -> tuple[list[str], list[str]]:
     """收集当前入站事件上已有的图片/音频引用；不做网络下载。"""
     images: list[str] = []

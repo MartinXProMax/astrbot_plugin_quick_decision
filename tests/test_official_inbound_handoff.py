@@ -146,11 +146,13 @@ from astrbot_plugin_quick_decision.official_handoff import (
     begin_official_pipeline,
     build_inbound_user_prompt,
     default_official_agent_would_run,
+    group_context_enabled,
     is_official_pipeline_busy,
     make_official_llm_request,
     release_official_pipeline,
     resolve_session_conversation,
     should_use_default_official_agent,
+    split_batch_for_group_context,
     suppress_default_official_agent,
 )
 from astrbot_plugin_quick_decision.reply_generator import (
@@ -417,6 +419,40 @@ class MergePromptTests(unittest.TestCase):
         prompt = build_inbound_user_prompt(event_text="第一句", batch=batch, merged=True)
         self.assertEqual(prompt, "甲: 第一句\n乙: 第二句\n甲: 第三句")
 
+    def test_group_context_split_starts_at_last_recorded_message(self) -> None:
+        def recorded(mid, text, record_id):
+            item = _user(mid, text, 1)
+            item.group_context_record_id = record_id
+            return item
+
+        # 最后一条没被群聊上下文感知记下（如只 @ 了别人），仍跟在提示词里。
+        batch = [recorded("m1", "第一句", "r1"), recorded("m2", "第二句", "r2"), recorded("m3", "@丙", "")]
+        self.assertEqual(split_batch_for_group_context(batch), (batch[1:], "r2"))
+        # 有记录却没有正文（如只发卡片）的不作为分界，免得提示词为空。
+        batch = [recorded("m1", "第一句", "r1"), recorded("m2", "", "r2")]
+        self.assertEqual(split_batch_for_group_context(batch), (batch, "r1"))
+        # 都没有记录时原样返回整批。
+        batch = [_user("m1", "第一句", 1), _user("m2", "第二句", 2)]
+        self.assertEqual(split_batch_for_group_context(batch), (batch, ""))
+
+    def test_group_context_switch_reads_astrbot_config(self) -> None:
+        self.assertFalse(group_context_enabled(None))
+        self.assertFalse(group_context_enabled({}))
+        self.assertFalse(group_context_enabled({"provider_ltm_settings": {"group_icl_enable": False}}))
+        self.assertTrue(group_context_enabled({"provider_ltm_settings": {"group_icl_enable": True}}))
+
+    def test_group_context_record_id_is_buffered_but_not_logged(self) -> None:
+        from astrbot_plugin_quick_decision.event_utils import to_buffered_message
+        from astrbot_plugin_quick_decision.models import decision_log_context
+
+        event = FakeEvent(text="你好")
+        self.assertEqual(to_buffered_message(event).group_context_record_id, "")
+        event.set_extra("_group_context_record_id", "rec-1")
+        buffered = to_buffered_message(event)
+        self.assertEqual(buffered.group_context_record_id, "rec-1")
+        logged = decision_log_context([buffered], evaluated_at=1)["messages"][0]
+        self.assertNotIn("group_context_record_id", logged)
+
     def test_unmerged_prompt_is_current_event_only(self) -> None:
         prompt = build_inbound_user_prompt(
             event_text="  当前  ", batch=[_user("m1", "当前", 1), _user("m2", "其它", 2)], merged=False
@@ -499,7 +535,7 @@ class DirectSendGuardTests(unittest.IsolatedAsyncioTestCase):
         )
         decision = DecisionResult(action="proactive", scene="group_proactive", length="short",
                                   use_meme=True, meme_id="internal-meme-42", meme_description="企鹅点头")
-        await generate_text(context, umo="room", decision=decision, user_prompt="")
+        await generate_text(context, umo="room", decision=decision)
         context.llm_generate.assert_awaited_once()
         parts = context.llm_generate.await_args.kwargs["extra_user_content_parts"]
         self.assertEqual(len(parts), 1)
@@ -533,7 +569,7 @@ class DirectSendGuardTests(unittest.IsolatedAsyncioTestCase):
             llm_generate=AsyncMock(return_value=SimpleNamespace(completion_text="出门记得防晒")),
         )
         decision = DecisionResult(action="proactive", scene="group_proactive")
-        await generate_text(context, umo="room", decision=decision, user_prompt="")
+        await generate_text(context, umo="room", decision=decision)
         # 请求里不能出现没有 tool 结果的 tool_calls，否则 Anthropic 等接口返回 400。
         self.assertEqual(context.llm_generate.await_args.kwargs["contexts"], [
             {"role": "user", "content": "查下天气"},
@@ -543,6 +579,93 @@ class DirectSendGuardTests(unittest.IsolatedAsyncioTestCase):
         # 写回官方历史时原样保留工具调用轮次，只追加本轮发言。
         self.assertEqual(context.conversation_manager.updated[0]["history"],
                          [*history, {"role": "assistant", "content": "出门记得防晒"}])
+
+    async def test_proactive_persona_follows_official_selection(self) -> None:
+        import json
+
+        from astrbot_plugin_quick_decision.reply_generator import generate_text
+
+        history = [{"role": "user", "content": "在吗"}, {"role": "assistant", "content": "在"}]
+        persona = {
+            "name": "cat", "prompt": "你是一只猫",
+            "_begin_dialogs_processed": [
+                {"role": "user", "content": "你是谁", "_no_save": True},
+                {"role": "assistant", "content": "喵", "_no_save": True},
+            ],
+        }
+        cases = (
+            # (说明, 官方选出的人格, 期望的 system_prompt, 期望在历史前插入的预设对话)
+            ("对话或会话规则选中的人格", persona, "你是一只猫",
+             [{"role": "user", "content": "你是谁"}, {"role": "assistant", "content": "喵"}]),
+            ("已用 [%None] 取消人格", None, None, []),
+        )
+        for label, selected, system_prompt, dialogs in cases:
+            with self.subTest(label):
+                conversation = FakeConversation(history=json.dumps(history))
+                conversation.persona_id = "[%None]" if selected is None else "cat"
+                resolver = AsyncMock(return_value=(conversation.persona_id, selected, None, False))
+                context = SimpleNamespace(
+                    conversation_manager=FakeConvMgr(conversation),
+                    persona_manager=SimpleNamespace(
+                        resolve_selected_persona=resolver,
+                        # 旧实现会读到这里并退回默认人格；新实现不能再用它。
+                        get_default_persona_v3=AsyncMock(return_value={"prompt": "默认人格"}),
+                    ),
+                    get_current_chat_provider_id=AsyncMock(return_value="chat"),
+                    llm_generate=AsyncMock(return_value=SimpleNamespace(completion_text="喵呜")),
+                )
+                decision = DecisionResult(action="proactive", scene="group_proactive")
+                await generate_text(context, umo="room", decision=decision, platform_name="aiocqhttp")
+                resolver.assert_awaited_once_with(
+                    umo="room", conversation_persona_id=conversation.persona_id, platform_name="aiocqhttp")
+                kwargs = context.llm_generate.await_args.kwargs
+                self.assertEqual(kwargs["system_prompt"], system_prompt)
+                self.assertEqual(kwargs["contexts"], [*dialogs, *history])
+                # 预设对话不写进官方历史。
+                self.assertEqual(context.conversation_manager.updated[0]["history"],
+                                 [*history, {"role": "assistant", "content": "喵呜"}])
+
+    async def test_proactive_write_back_never_overwrites_changes_made_during_generation(self) -> None:
+        import json
+
+        from astrbot_plugin_quick_decision.reply_generator import generate_text
+
+        before = [{"role": "user", "content": "在吗"}, {"role": "assistant", "content": "在"}]
+        extra_turn = [{"role": "user", "content": "/help"}, {"role": "assistant", "content": "帮助"}]
+        cases = (
+            # (说明, 生成期间对会话的改动, 期望写回的历史；None 表示不写回)
+            ("/reset 清空了历史", lambda mgr: setattr(mgr.conversation, "history", "[]"), None),
+            ("/new 切换了对话", lambda mgr: setattr(mgr, "current", "cid-2"), None),
+            ("其他回合追加了消息", lambda mgr: setattr(mgr.conversation, "history", json.dumps([*before, *extra_turn])),
+             [*before, *extra_turn, {"role": "assistant", "content": "好久不见"}]),
+            ("没有改动", lambda mgr: None, [*before, {"role": "assistant", "content": "好久不见"}]),
+        )
+        for label, change, expected in cases:
+            with self.subTest(label):
+                class ConvMgr(FakeConvMgr):
+                    current = "cid-1"
+
+                    async def get_curr_conversation_id(self, umo):  # noqa: ARG002
+                        return self.current
+
+                mgr = ConvMgr(FakeConversation(history=json.dumps(before)))
+
+                async def generate(**_kwargs):
+                    change(mgr)
+                    return SimpleNamespace(completion_text="好久不见")
+
+                context = SimpleNamespace(
+                    conversation_manager=mgr,
+                    persona_manager=SimpleNamespace(resolve_selected_persona=AsyncMock(return_value=(None, None, None, False))),
+                    get_current_chat_provider_id=AsyncMock(return_value="chat"),
+                    llm_generate=generate,
+                )
+                decision = DecisionResult(action="proactive", scene="group_proactive")
+                self.assertEqual(await generate_text(context, umo="room", decision=decision), "好久不见")
+                if expected is None:
+                    self.assertEqual(mgr.updated, [])
+                else:
+                    self.assertEqual([(u["cid"], u["history"]) for u in mgr.updated], [("cid-1", expected)])
 
     async def test_send_guard_strips_reply_inserted_after_decorate_hook(self) -> None:
         event = FakeEvent(is_private=False)
@@ -873,67 +996,6 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runtime.deciding)
         self.assertEqual(self.decision_calls, 1)
 
-    async def test_old_editor_cannot_erase_post_reply_stage(self):
-        from astrbot_plugin_quick_decision import web_api
-        from test_decision_engine import flat_gallery
-
-        class Config(dict):
-            save_config = AsyncMock()
-            save_config_async = save_config
-
-        self.plugin.config = Config(self.plugin.config)
-        legacy = flat_gallery(self.plugin.settings)
-        self.plugin.config["decision_questions"] = {"version": 4, "questions": [q.to_dict() for q in legacy.decision_questions]}
-        payload = self.plugin._decision_config_payload()
-        payload["version"] = 6
-        length = next(q for q in payload["decision_questions"] if q["id"] == "length")
-        length["stage"] = "post_reply"
-        for t in length["triggers"]:
-            t.pop("ask_with_parent", None)
-        request = SimpleNamespace(method="POST", json=AsyncMock(return_value=payload))
-        with (
-            patch.object(web_api, "request", request),
-            patch.object(web_api, "json_response", side_effect=lambda value: value),
-            patch.object(web_api, "error_response", side_effect=lambda msg, status_code: status_code),
-        ):
-            self.assertEqual((await self.plugin.web_decision_config())["version"], 6)
-            del length["stage"]
-            for version in (2, 3):
-                payload["version"] = version
-                self.assertEqual(await self.plugin.web_decision_config(), 409)
-            self.plugin.config.save_config_async.assert_awaited_once()
-            reloaded = self.plugin.settings.decision_questions
-            self.assertEqual(next(q.stage for q in reloaded if q.id == "length"), "post_reply")
-
-    async def test_question_mode_override_requires_new_editor(self):
-        from astrbot_plugin_quick_decision import web_api
-        from test_decision_engine import flat_gallery
-
-        class Config(dict):
-            save_config = AsyncMock()
-            save_config_async = save_config
-
-        self.plugin.config = Config(self.plugin.config)
-        legacy = flat_gallery(self.plugin.settings)
-        self.plugin.config["decision_questions"] = {"version": 4, "questions": [q.to_dict() for q in legacy.decision_questions]}
-        payload = self.plugin._decision_config_payload()
-        payload["version"] = 6
-        question = next(q for q in payload["decision_questions"] if q["id"] == "length")
-        question["decision_mode"] = "random"
-        request = SimpleNamespace(method="POST", json=AsyncMock(return_value=payload))
-        with (
-            patch.object(web_api, "request", request),
-            patch.object(web_api, "json_response", side_effect=lambda value: value),
-            patch.object(web_api, "error_response", side_effect=lambda msg, status_code: status_code),
-        ):
-            saved = await self.plugin.web_decision_config()
-            self.assertEqual(saved["version"], 6)
-            for q in payload["decision_questions"]:
-                q.pop("decision_mode", None)
-            payload["version"] = 3
-            self.assertEqual(await self.plugin.web_decision_config(), 409)
-            self.assertEqual(self.plugin.config.save_config_async.await_count, 1)
-
     async def test_official_final_text_schedules_one_post_workflow_for_original_round(self):
         from astrbot.api.provider import DecisionBooleanAnswer
         from astrbot_plugin_quick_decision.config_util import legacy_questions
@@ -1261,6 +1323,32 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(third.is_stopped())
         self.assertEqual(self.decision_calls, 2)
 
+    async def test_merged_group_round_hands_earlier_messages_to_group_context(self) -> None:
+        self.plugin.config["debounce_seconds"] = 0.05
+        for enabled in (True, False):
+            with self.subTest(group_icl_enable=enabled):
+                config = {"provider_ltm_settings": {"group_icl_enable": enabled}}
+                self.plugin.context.get_config = lambda umo, config=config: config
+                umo = f"aiocqhttp:GroupMessage:icl-{enabled}"
+                first = FakeEvent(umo=umo, text="第一句", message_id="a", sender="u1", sender_name="甲")
+                second = FakeEvent(umo=umo, text="第二句", message_id="b", sender="u2", sender_name="乙")
+                # AstrBot 的群聊上下文感知先于本插件记下每条群消息。
+                first.set_extra("_group_context_record_id", "rec-a")
+                second.set_extra("_group_context_record_id", "rec-b")
+                first_task = asyncio.create_task(self.plugin.on_chat_message(first))
+                await asyncio.sleep(0)
+                self.assertIsNone(await self.plugin.on_chat_message(second))
+                req = await first_task
+                self.assertTrue(second.is_stopped())
+                if enabled:
+                    # 第一句由群聊上下文感知注入并清掉，提示词只写第二句，不会留到下一轮重复注入。
+                    self.assertEqual(req.prompt, "乙: 第二句")
+                    self.assertEqual(first.get_extra("_group_context_record_id"), "rec-b")
+                else:
+                    self.assertEqual(req.prompt, "甲: 第一句\n乙: 第二句")
+                    self.assertEqual(first.get_extra("_group_context_record_id"), "rec-a")
+                release_official_pipeline(self.plugin.sessions.get(umo))
+
     async def test_message_during_official_reply_is_rejudged_after_release(self) -> None:
         first = FakeEvent(
             umo="aiocqhttp:GroupMessage:follow-up",
@@ -1368,25 +1456,6 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.on_using_llm_tool(event, None, {})
         await self.plugin._release_stale_pipelines()
         self.assertIsNone(runtime.pending_pipeline)
-
-    async def test_initialize_runs_legacy_migration_off_the_event_loop(self) -> None:
-        import threading
-
-        calls = []
-        self.plugin.data_dir = Path(self.tmp.name)
-        self.plugin.meme_adapter.resolve_data_dir = lambda: Path(self.tmp.name) / "meme_manager"
-
-        def fake_migrate(data_dir, meme_dir):
-            calls.append((data_dir, meme_dir, threading.current_thread()))
-
-        with patch.object(self.main_mod, "maybe_migrate_legacy_library", fake_migrate):
-            await self.plugin.initialize()
-        self.plugin._silence_task.cancel()
-        await asyncio.gather(self.plugin._silence_task, return_exceptions=True)
-        self.assertEqual(len(calls), 1)
-        data_dir, meme_dir, thread = calls[0]
-        self.assertEqual((data_dir, meme_dir), (Path(self.tmp.name), Path(self.tmp.name) / "meme_manager"))
-        self.assertIsNot(thread, threading.main_thread())
 
     async def test_release_ignores_other_rounds(self) -> None:
         from astrbot_plugin_quick_decision.session_store import SessionRuntime
