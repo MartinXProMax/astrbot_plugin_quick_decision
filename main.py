@@ -41,6 +41,7 @@ from .official_handoff import (
     begin_proactive_round,
     build_inbound_user_prompt,
     collect_event_media_urls,
+    collect_official_inputs,
     end_proactive_round,
     group_context_enabled,
     is_official_pipeline_busy,
@@ -48,6 +49,7 @@ from .official_handoff import (
     official_skip_reason,
     release_official_pipeline,
     resolve_session_conversation,
+    retarget_identifier,
     session_release_event,
     should_use_default_official_agent,
     split_batch_for_group_context,
@@ -235,6 +237,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         )
         runtime.display_name = event_session_name(event) or runtime.display_name
         runtime.handlers += 1
+        runtime.events[buffered.seq] = event
         try:
             if not self.settings.enabled:
                 return
@@ -246,6 +249,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
                 task.add_done_callback(self._post_tasks.discard)
             return await self._judge_in_turn(event, profile, runtime, buffered.seq)
         finally:
+            runtime.events.pop(buffered.seq, None)
             runtime.handlers -= 1
             if runtime.handlers == 0:
                 # 本会话没有处理器还在排队：停用期间到达、或等待中被取消而没轮到判断的消息，不再并入以后的回合。
@@ -432,17 +436,24 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         if conversation is None:
             logger.error("无法取得官方会话，取消本轮官方生成：%s", profile.umo)
             return None, "无法取得官方会话"
+        config = self._astrbot_config(profile.umo)
         merged = len(batch) > 1
         prompt_batch = batch
-        if merged and not profile.is_private and group_context_enabled(self._astrbot_config(profile.umo)):
+        if merged and not profile.is_private and group_context_enabled(config):
             prompt_batch, record_id = split_batch_for_group_context(batch)
             if record_id:
                 event.set_extra(GROUP_CONTEXT_RECORD_KEY, record_id)
         prompt = build_inbound_user_prompt(
             event_text=event.message_str or "", batch=prompt_batch, merged=merged
         )
-        image_urls, audio_urls = collect_event_media_urls(event)
-        if not prompt and not image_urls and not audio_urls:
+        # 附件跟着正文走：合并时收提示词里每条消息的附件，不只是请求挂载的这条。
+        pending = getattr(self.sessions.get(profile.umo), "events", {})
+        events = [pending[item.seq] for item in prompt_batch if item.seq in pending] if merged else []
+        inputs = await collect_official_inputs(self.context, config, events or [event])
+        image_urls, audio_urls, extra = inputs if inputs is not None else (*collect_event_media_urls(event), [])
+        # 只有引用时官方会补上引用原文，照常回复。
+        quoted = any(type(comp).__name__ == "Reply" for comp in getattr(event.message_obj, "message", None) or [])
+        if not prompt and not image_urls and not audio_urls and not extra and not quoted:
             logger.warning("没有可提交给官方模型的用户内容，取消本轮生成：%s", profile.umo)
             return None, "没有可生成回复的正文或附件"
         request = make_official_llm_request(
@@ -452,6 +463,11 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             image_urls=image_urls,
             audio_urls=audio_urls,
         )
+        request.extra_user_content_parts.extend(extra)
+        if merged:
+            # 官方用户标识只写挂载事件的发送者，请求钩子里换成提示词里的各位发送者。
+            senders = dict.fromkeys((item.sender_id, item.sender_name) for item in prompt_batch if (item.text or "").strip())
+            event.set_extra("_qd_prompt_senders", list(senders))
         return request, None
 
     async def _official_handoff(self, event, profile, batch, use_default_official):
@@ -864,6 +880,8 @@ class QuickDecisionPlugin(Star, WebApiMixin):
             return
         if event.get_extra("_qd_hints_applied"):
             return
+        if senders := event.get_extra("_qd_prompt_senders"):
+            retarget_identifier(req, event, senders)
         apply_session_hints(req, decision)
         event.set_extra("_qd_hints_applied", True)
 

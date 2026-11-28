@@ -141,6 +141,7 @@ def build_inbound_user_prompt(
     """构造交给官方 request_llm 的本轮用户文本。
 
     合并时按到达顺序带上本轮判断看过的全部用户消息（上一轮判断之后到达的），不带更早已回复过的消息。
+    官方只按请求挂载的那条事件处理 @ 和引用，合并时每条的 @ 机器人和引用原文写进正文。
     """
     if not merged:
         return (event_text or "").strip()
@@ -149,6 +150,10 @@ def build_inbound_user_prompt(
         text = (item.text or "").strip()
         if not text:
             continue
+        if item.is_at_bot:
+            text = f"[@你] {text}"
+        if item.quote_text:
+            text += f" [引用{'你' if item.is_quote_bot else ''}: {item.quote_text}]"
         name = (item.sender_name or item.sender_id or "").strip()
         parts.append(f"{name}: {text}" if name else text)
     if parts:
@@ -177,6 +182,62 @@ def split_batch_for_group_context(
         if item.group_context_record_id and (item.text or "").strip():
             return list(batch[index:]), item.group_context_record_id
     return list(batch), ""
+
+
+async def collect_official_inputs(context, config, events) -> tuple[list[str], list[str], list] | None:
+    """按官方默认 Agent 的规则收集这些消息的附件，返回（图片，语音，附加文本块）。
+
+    AstrBot 4.29.4 只给默认请求收附件（collect_initial_request）：文件、视频和语音的标注，引用消息里的图片、
+    语音、文件、视频，以及取不到时的「不可用」标注；插件提交的 request_llm 直接跳过这一步。这里借它逐条收集，
+    它顺手挂到事件上的请求收完即清掉。内部接口不可用时返回 None。
+    """
+    try:
+        from astrbot.core.astr_main_agent import MainAgentBuildConfig, collect_initial_request
+    except ImportError:
+        return None
+    settings = (config.get("provider_settings") or {}) if config is not None else {}
+    # LLM 唤醒前缀留空：插件已决定回复，不再要求它（缺前缀时官方会整条放弃）。
+    build_cfg = MainAgentBuildConfig(
+        tool_call_timeout=0,
+        provider_settings=settings,
+        max_quoted_fallback_images=settings.get("max_quoted_fallback_images", 20),
+    )
+    images: list[str] = []
+    audios: list[str] = []
+    parts: list = []
+    for event in events:
+        try:
+            req, _ = await collect_initial_request(event, context, build_cfg)
+        except Exception:  # noqa: BLE001
+            logger.warning("无法按官方规则收集附件，这条消息只带图片和语音：%s",
+                           getattr(event, "unified_msg_origin", ""), exc_info=True)
+            req = None
+            fallback = collect_event_media_urls(event)
+            images.extend(fallback[0])
+            audios.extend(fallback[1])
+        finally:
+            event.set_extra("provider_request", None)
+        if req is not None:
+            images.extend(req.image_urls or [])
+            audios.extend(req.audio_urls or [])
+            parts.extend(req.extra_user_content_parts or [])
+    return images, audios, parts
+
+
+def retarget_identifier(req, event, senders: list[tuple[str, str]]) -> None:
+    """合并回合的请求挂在第一条事件上，官方用户标识只写它的发送者；换成本轮提示词里的各位发送者。
+
+    只改 AstrBot 4.29.4 ``_append_system_reminders`` 写的那一行；没开用户标识或格式不同时不动。
+    """
+    sender = getattr(getattr(event, "message_obj", None), "sender", None)
+    # 用户标识总是提醒块的第一行，后面接换行或块尾。
+    head = f"<system_reminder>User ID: {getattr(sender, 'user_id', '')}, Nickname: {getattr(sender, 'nickname', '')}"
+    new = "\n".join(f"User ID: {sid}, Nickname: {name}" for sid, name in senders)
+    for part in req.extra_user_content_parts:
+        text = getattr(part, "text", None)
+        if isinstance(text, str) and text.startswith(head) and text[len(head):len(head) + 1] in ("\n", "<"):
+            part.text = f"<system_reminder>{new}{text[len(head):]}"
+            return
 
 
 def collect_event_media_urls(event) -> tuple[list[str], list[str]]:

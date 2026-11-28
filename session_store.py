@@ -56,6 +56,8 @@ class SessionRuntime:
     display_name: str = ""
     name_checked_at: float = 0.0
     known: bool = True
+    # 处理器仍在运行的入站事件，按消息序号；合并回合要从各条消息的事件上收附件，处理器结束时移除。
+    events: dict[int, Any] = field(default_factory=dict)
 
     @property
     def last_activity(self) -> float:

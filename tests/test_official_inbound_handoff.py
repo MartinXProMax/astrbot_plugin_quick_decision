@@ -151,6 +151,7 @@ from astrbot_plugin_quick_decision.official_handoff import (
     make_official_llm_request,
     release_official_pipeline,
     resolve_session_conversation,
+    retarget_identifier,
     should_use_default_official_agent,
     split_batch_for_group_context,
     suppress_default_official_agent,
@@ -418,6 +419,42 @@ class MergePromptTests(unittest.TestCase):
         ]
         prompt = build_inbound_user_prompt(event_text="第一句", batch=batch, merged=True)
         self.assertEqual(prompt, "甲: 第一句\n乙: 第二句\n甲: 第三句")
+
+    def test_merge_prompt_marks_each_mention_and_quote(self) -> None:
+        # 官方只处理请求挂载那条的 @ 和引用，并进来的几条要写在正文里。
+        at = _user("m1", "你看呢", 1, sender="a", name="甲")
+        at.is_at_bot = True
+        quote = _user("m2", "同意", 2, sender="b", name="乙")
+        quote.quote_text = "明天去爬山"
+        quote_bot = _user("m3", "真的吗", 3, sender="b", name="乙")
+        quote_bot.is_quote_bot, quote_bot.quote_text = True, "我会下雨"
+        self.assertEqual(
+            build_inbound_user_prompt(event_text="", batch=[at, quote, quote_bot], merged=True),
+            "甲: [@你] 你看呢\n乙: 同意 [引用: 明天去爬山]\n乙: 真的吗 [引用你: 我会下雨]",
+        )
+        # 单条消息由官方自己处理 @ 和引用，正文不加标记。
+        self.assertEqual(build_inbound_user_prompt(event_text="你看呢", batch=[at], merged=False), "你看呢")
+
+    def test_identifier_names_the_senders_in_the_prompt(self) -> None:
+        def request(reminder):
+            return SimpleNamespace(extra_user_content_parts=[TextPart(text="<attachment>"), TextPart(text=reminder)])
+
+        event = FakeEvent(sender="u1", sender_name="Alice")
+        senders = [("u2", "Bob"), ("u3", "Carol")]
+        req = request("<system_reminder>User ID: u1, Nickname: Alice\nCurrent datetime: 12:00</system_reminder>")
+        retarget_identifier(req, event, senders)
+        self.assertEqual(req.extra_user_content_parts[1].text,
+                         "<system_reminder>User ID: u2, Nickname: Bob\nUser ID: u3, Nickname: Carol\n"
+                         "Current datetime: 12:00</system_reminder>")
+        # 只有用户标识一行，或者昵称只是前缀相同，都按整行比较。
+        req = request("<system_reminder>User ID: u1, Nickname: Alice</system_reminder>")
+        retarget_identifier(req, event, senders[:1])
+        self.assertEqual(req.extra_user_content_parts[1].text, "<system_reminder>User ID: u2, Nickname: Bob</system_reminder>")
+        for other in ("<system_reminder>User ID: u1, Nickname: Alice2</system_reminder>",
+                      "<system_reminder>Current datetime: 12:00</system_reminder>"):
+            req = request(other)
+            retarget_identifier(req, event, senders)
+            self.assertEqual(req.extra_user_content_parts[1].text, other)
 
     def test_group_context_split_starts_at_last_recorded_message(self) -> None:
         def recorded(mid, text, record_id):
@@ -1371,6 +1408,79 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(third.is_stopped())
         self.assertEqual(self.decision_calls, 2)
 
+    def _fake_collector(self, collected, failing=()):
+        """按官方规则收附件的内部函数：记下收了哪几条，每条给一张图和一条文件标注。"""
+        async def collect(event, _context, cfg, **_kwargs):
+            mid = event.message_obj.message_id
+            collected.append((mid, cfg.provider_settings, cfg.provider_wake_prefix))
+            event.set_extra("provider_request", "collected")
+            if mid in failing:
+                raise OSError("附件下载失败")
+            return SimpleNamespace(image_urls=[f"/tmp/{mid}.jpg"], audio_urls=[],
+                                   extra_user_content_parts=[TextPart(text=f"[File Attachment: {mid}]")]), None
+
+        module = types.ModuleType("astrbot.core.astr_main_agent")
+        module.collect_initial_request = collect
+        module.MainAgentBuildConfig = lambda **kw: SimpleNamespace(provider_wake_prefix="", **kw)
+        return patch.dict(sys.modules, {"astrbot.core.astr_main_agent": module})
+
+    async def test_request_path_collects_attachments_of_every_prompt_message(self) -> None:
+        # 插件提交的请求官方不收附件；按官方规则逐条收，合并时连同并进来的消息，用户标识也换成提示词里的发送者。
+        self.plugin.config["debounce_seconds"] = 0.05
+        config = {"provider_settings": {"identifier": True}}
+        self.plugin.context.get_config = lambda umo: config
+        collected: list = []
+        umo = "aiocqhttp:GroupMessage:attachments"
+        first = FakeEvent(umo=umo, text="看这个", message_id="a", sender="u1", sender_name="甲")
+        second = FakeEvent(umo=umo, text="图在这", message_id="b", sender="u2", sender_name="乙")
+        with self._fake_collector(collected):
+            first_task = asyncio.create_task(self.plugin.on_chat_message(first))
+            await asyncio.sleep(0)
+            self.assertIsNone(await self.plugin.on_chat_message(second))
+            req = await first_task
+        self.assertEqual(req.prompt, "甲: 看这个\n乙: 图在这")
+        self.assertEqual(collected, [("a", config["provider_settings"], ""), ("b", config["provider_settings"], "")])
+        self.assertEqual(req.image_urls, ["/tmp/a.jpg", "/tmp/b.jpg"])
+        self.assertEqual([p.text for p in req.extra_user_content_parts], ["[File Attachment: a]", "[File Attachment: b]"])
+        # 收附件时挂上的请求要清掉，不能让 AstrBot 当作别的处理器已请求过模型。
+        self.assertIsNone(first.get_extra("provider_request"))
+        self.assertIsNone(second.get_extra("provider_request"))
+        self.assertEqual(self.plugin.sessions.get(umo).events, {})
+
+        reminder = TextPart(text="<system_reminder>User ID: u1, Nickname: 甲</system_reminder>")
+        await self.plugin.on_llm_request(first, ProviderRequest(extra_user_content_parts=[reminder]))
+        self.assertEqual(reminder.text, "<system_reminder>User ID: u1, Nickname: 甲\nUser ID: u2, Nickname: 乙</system_reminder>")
+        release_official_pipeline(self.plugin.sessions.get(umo))
+
+    async def test_attachment_only_message_is_not_cancelled(self) -> None:
+        # 只发了文件、视频或引用：官方能处理，不能因为没有正文就取消；内部函数缺失时仍只认图片和语音。
+        self.plugin.context.get_config = lambda umo: {}
+        for available in (True, False):
+            with self.subTest(internals=available):
+                umo = f"aiocqhttp:FriendMessage:file-only-{available}"
+                ev = FakeEvent(umo=umo, text="", message_id="f", is_private=True)
+                if available:
+                    with self._fake_collector([]):
+                        req = await self.plugin.on_chat_message(ev)
+                    self.assertEqual([p.text for p in req.extra_user_content_parts], ["[File Attachment: f]"])
+                    release_official_pipeline(self.plugin.sessions.get(umo))
+                else:
+                    self.assertIsNone(await self.plugin.on_chat_message(ev))
+                    self.assertIsNone(self.plugin.sessions.get(umo).pending_pipeline)
+
+    async def test_failed_collection_keeps_the_images_and_voice(self) -> None:
+        from astrbot_plugin_quick_decision.official_handoff import collect_official_inputs
+
+        events = [FakeEvent(message_id="ok"), FakeEvent(message_id="bad")]
+        with self._fake_collector([], failing={"bad"}), \
+                patch("astrbot_plugin_quick_decision.official_handoff.collect_event_media_urls",
+                      return_value=(["http://img/bad.png"], [])):
+            images, audios, parts = await collect_official_inputs(None, None, events)
+        self.assertEqual(images, ["/tmp/ok.jpg", "http://img/bad.png"])
+        self.assertEqual([p.text for p in parts], ["[File Attachment: ok]"])
+        self.assertEqual([e.get_extra("provider_request") for e in events], [None, None])
+        self.assertIsNone(await collect_official_inputs(None, None, events))
+
     async def test_merged_group_round_hands_earlier_messages_to_group_context(self) -> None:
         self.plugin.config["debounce_seconds"] = 0.05
         for enabled in (True, False):
@@ -1606,7 +1716,8 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
                 req = await chatter_task
                 self.assertIsNone(await mention_task)
                 self.assertIsInstance(req, ProviderRequest)
-                self.assertEqual(req.prompt, "Alice: 哈哈\nAlice: 机器人你好")
+                # 请求挂在「哈哈」上，@ 消息是并进来的，要在正文里标出它 @ 了机器人。
+                self.assertEqual(req.prompt, "Alice: 哈哈\nAlice: " + ("" if wake_only else "[@你] ") + "机器人你好")
                 self.assertTrue(mention.is_stopped())
                 self.assertEqual(self.decision_calls - calls_before, 2)
                 self.plugin.config["cooldown_seconds"] = 0
@@ -1685,7 +1796,7 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await mention_task)
 
         self.assertEqual(flags, [False, True])
-        self.assertEqual(req.prompt, "Alice: 随便聊聊\nAlice: 你怎么看")
+        self.assertEqual(req.prompt, "Alice: 随便聊聊\nAlice: [@你] 你怎么看")
         self.assertTrue(mention.is_stopped())
 
     async def test_messages_while_disabled_are_not_merged_after_reenabling(self) -> None:
