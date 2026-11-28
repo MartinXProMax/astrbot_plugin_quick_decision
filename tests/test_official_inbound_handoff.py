@@ -1408,15 +1408,15 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(third.is_stopped())
         self.assertEqual(self.decision_calls, 2)
 
-    def _fake_collector(self, collected, failing=()):
-        """按官方规则收附件的内部函数：记下收了哪几条，每条给一张图和一条文件标注。"""
+    def _fake_collector(self, collected, failing=(), audio=None):
+        """按官方规则收附件的内部函数：记下收了哪几条，每条给一张图、一条文件标注和 audio 里给它的语音。"""
         async def collect(event, _context, cfg, **_kwargs):
             mid = event.message_obj.message_id
             collected.append((mid, cfg.provider_settings, cfg.provider_wake_prefix))
             event.set_extra("provider_request", "collected")
             if mid in failing:
                 raise OSError("附件下载失败")
-            return SimpleNamespace(image_urls=[f"/tmp/{mid}.jpg"], audio_urls=[],
+            return SimpleNamespace(image_urls=[f"/tmp/{mid}.jpg"], audio_urls=list((audio or {}).get(mid, [])),
                                    extra_user_content_parts=[TextPart(text=f"[File Attachment: {mid}]")]), None
 
         module = types.ModuleType("astrbot.core.astr_main_agent")
@@ -1472,14 +1472,43 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         from astrbot_plugin_quick_decision.official_handoff import collect_official_inputs
 
         events = [FakeEvent(message_id="ok"), FakeEvent(message_id="bad")]
-        with self._fake_collector([], failing={"bad"}), \
-                patch("astrbot_plugin_quick_decision.official_handoff.collect_event_media_urls",
-                      return_value=(["http://img/bad.png"], [])):
-            images, audios, parts = await collect_official_inputs(None, None, events)
-        self.assertEqual(images, ["/tmp/ok.jpg", "http://img/bad.png"])
-        self.assertEqual([p.text for p in parts], ["[File Attachment: ok]"])
-        self.assertEqual([e.get_extra("provider_request") for e in events], [None, None])
-        self.assertIsNone(await collect_official_inputs(None, None, events))
+        with patch("astrbot_plugin_quick_decision.official_handoff.collect_event_media_urls",
+                   return_value=(["http://img/x.png"], [])):
+            with self._fake_collector([], failing={"bad"}):
+                images, audios, parts = await collect_official_inputs(None, None, events, owner=events[0])
+            self.assertEqual(images, ["/tmp/ok.jpg", "http://img/x.png"])
+            self.assertEqual([p.text for p in parts], ["[File Attachment: ok]"])
+            self.assertEqual([e.get_extra("provider_request") for e in events], [None, None])
+            # 取不到内部函数时，每一条都按原方式带图片和语音，不只是请求挂载的那条。
+            self.assertEqual(await collect_official_inputs(None, None, events, owner=events[0]),
+                             (["http://img/x.png", "http://img/x.png"], [], []))
+
+    async def test_merged_messages_hand_their_temp_files_to_the_request_event(self) -> None:
+        # 被并进来的消息先结束，名下的临时语音会随之删掉；请求要用的转给挂载事件，其余的不动。
+        from astrbot_plugin_quick_decision.official_handoff import collect_official_inputs
+
+        def tracked(mid, files):
+            ev = FakeEvent(message_id=mid)
+            ev._temporary_local_files = list(files)
+            ev.track_temporary_local_file = ev._temporary_local_files.append
+            ev.untrack_temporary_local_file = ev._temporary_local_files.remove
+            return ev
+
+        voices = {"own": ["/tmp/own.wav"], "other": ["/tmp/other.wav"]}
+        for internals in (True, False):
+            with self.subTest(internals=internals), patch(
+                    "astrbot_plugin_quick_decision.official_handoff.collect_event_media_urls",
+                    side_effect=lambda ev: (["/home/u/pic.png"], voices[ev.message_obj.message_id])):
+                owner = tracked("own", ["/tmp/own.wav"])
+                other = tracked("other", ["/tmp/other.wav", "/tmp/unused.wav"])
+                if internals:
+                    with self._fake_collector([], audio=voices):
+                        _, audios, _ = await collect_official_inputs(None, None, [owner, other], owner=owner)
+                else:
+                    _, audios, _ = await collect_official_inputs(None, None, [owner, other], owner=owner)
+                self.assertEqual(audios, ["/tmp/own.wav", "/tmp/other.wav"])
+                self.assertEqual(owner._temporary_local_files, ["/tmp/own.wav", "/tmp/other.wav"])
+                self.assertEqual(other._temporary_local_files, ["/tmp/unused.wav"])
 
     async def test_merged_group_round_hands_earlier_messages_to_group_context(self) -> None:
         self.plugin.config["debounce_seconds"] = 0.05

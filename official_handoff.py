@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Any, Iterable
 
 from astrbot.api import logger
@@ -184,44 +185,69 @@ def split_batch_for_group_context(
     return list(batch), ""
 
 
-async def collect_official_inputs(context, config, events) -> tuple[list[str], list[str], list] | None:
+async def collect_official_inputs(context, config, events, *, owner) -> tuple[list[str], list[str], list]:
     """按官方默认 Agent 的规则收集这些消息的附件，返回（图片，语音，附加文本块）。
 
     AstrBot 4.29.4 只给默认请求收附件（collect_initial_request）：文件、视频和语音的标注，引用消息里的图片、
     语音、文件、视频，以及取不到时的「不可用」标注；插件提交的 request_llm 直接跳过这一步。这里借它逐条收集，
-    它顺手挂到事件上的请求收完即清掉。内部接口不可用时返回 None。
+    它顺手挂到事件上的请求收完即清掉。内部接口不可用或某条收集失败时，那条只带图片和语音。
+    owner 是请求挂载的事件：其余几条先于它结束，名下的临时文件会被删掉，请求要用的转到 owner 名下。
     """
     try:
         from astrbot.core.astr_main_agent import MainAgentBuildConfig, collect_initial_request
     except ImportError:
-        return None
-    settings = (config.get("provider_settings") or {}) if config is not None else {}
-    # LLM 唤醒前缀留空：插件已决定回复，不再要求它（缺前缀时官方会整条放弃）。
-    build_cfg = MainAgentBuildConfig(
-        tool_call_timeout=0,
-        provider_settings=settings,
-        max_quoted_fallback_images=settings.get("max_quoted_fallback_images", 20),
-    )
+        collect_initial_request = None
+    if collect_initial_request is not None:
+        settings = (config.get("provider_settings") or {}) if config is not None else {}
+        # LLM 唤醒前缀留空：插件已决定回复，不再要求它（缺前缀时官方会整条放弃）。
+        build_cfg = MainAgentBuildConfig(
+            tool_call_timeout=0,
+            provider_settings=settings,
+            max_quoted_fallback_images=settings.get("max_quoted_fallback_images", 20),
+        )
     images: list[str] = []
     audios: list[str] = []
     parts: list = []
     for event in events:
-        try:
-            req, _ = await collect_initial_request(event, context, build_cfg)
-        except Exception:  # noqa: BLE001
-            logger.warning("无法按官方规则收集附件，这条消息只带图片和语音：%s",
-                           getattr(event, "unified_msg_origin", ""), exc_info=True)
-            req = None
-            fallback = collect_event_media_urls(event)
-            images.extend(fallback[0])
-            audios.extend(fallback[1])
-        finally:
-            event.set_extra("provider_request", None)
-        if req is not None:
-            images.extend(req.image_urls or [])
-            audios.extend(req.audio_urls or [])
+        req = None
+        if collect_initial_request is not None:
+            try:
+                req, _ = await collect_initial_request(event, context, build_cfg)
+            except Exception:  # noqa: BLE001
+                logger.warning("无法按官方规则收集附件，这条消息只带图片和语音：%s",
+                               getattr(event, "unified_msg_origin", ""), exc_info=True)
+            finally:
+                event.set_extra("provider_request", None)
+        if req is None:
+            event_images, event_audios = collect_event_media_urls(event)
+        else:
+            event_images, event_audios = list(req.image_urls or []), list(req.audio_urls or [])
             parts.extend(req.extra_user_content_parts or [])
+        if event is not owner:
+            _adopt_temp_files(event, owner, [*event_images, *event_audios])
+        images.extend(event_images)
+        audios.extend(event_audios)
     return images, audios, parts
+
+
+def _adopt_temp_files(source, owner, paths: list[str]) -> None:
+    """把请求要用、记在 source 名下的临时文件转给 owner，等 owner 结束再删。
+
+    AstrBot 4.29.4 预处理把语音转成 wav 后记在原消息事件名下（按解析后的路径），事件一结束就删；
+    collect_initial_request 只把图片移出，语音不管。``_temporary_local_files`` 是内部属性，没有时不动。
+    """
+    owned = getattr(source, "_temporary_local_files", None)
+    if not owned:
+        return
+    wanted = set(paths)
+    for path in paths:
+        try:
+            wanted.add(str(Path(path).resolve()))
+        except (OSError, ValueError):
+            pass
+    for tracked in [item for item in owned if item in wanted]:
+        source.untrack_temporary_local_file(tracked)
+        owner.track_temporary_local_file(tracked)
 
 
 def retarget_identifier(req, event, senders: list[tuple[str, str]]) -> None:

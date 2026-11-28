@@ -40,7 +40,6 @@ from .official_handoff import (
     begin_official_pipeline,
     begin_proactive_round,
     build_inbound_user_prompt,
-    collect_event_media_urls,
     collect_official_inputs,
     end_proactive_round,
     group_context_enabled,
@@ -449,8 +448,7 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         # 附件跟着正文走：合并时收提示词里每条消息的附件，不只是请求挂载的这条。
         pending = getattr(self.sessions.get(profile.umo), "events", {})
         events = [pending[item.seq] for item in prompt_batch if item.seq in pending] if merged else []
-        inputs = await collect_official_inputs(self.context, config, events or [event])
-        image_urls, audio_urls, extra = inputs if inputs is not None else (*collect_event_media_urls(event), [])
+        image_urls, audio_urls, extra = await collect_official_inputs(self.context, config, events or [event], owner=event)
         # 只有引用时官方会补上引用原文，照常回复。
         quoted = any(type(comp).__name__ == "Reply" for comp in getattr(event.message_obj, "message", None) or [])
         if not prompt and not image_urls and not audio_urls and not extra and not quoted:
