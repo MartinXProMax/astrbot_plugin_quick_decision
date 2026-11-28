@@ -104,7 +104,7 @@ async def _session_llm_enabled(event) -> bool:
 async def official_skip_reason(event, config, *, default_agent: bool) -> str | None:
     """预判官方 Agent 不会处理本事件的原因；None 表示会处理。对应 AstrBot 4.29.4。
 
-    插件提交的 request_llm 只受 AI 能力总开关和会话 LLM 开关限制；默认 Agent 还要求事件已唤醒、
+    插件提交的 request_llm 受 AI 能力总开关和会话 LLM 开关限制，本事件上已有别的模型请求时也不再提交；默认 Agent 还要求事件已唤醒、
     其他插件没有回复或接管、有正文或附件，并带上 LLM 唤醒前缀。官方不处理却占用会话时，
     要等超时才释放，期间本会话的消息都在排队。config 读不到时只检查会话开关和事件本身。
     """
@@ -113,6 +113,9 @@ async def official_skip_reason(event, config, *, default_agent: bool) -> str | N
     if not await _session_llm_enabled(event):
         return "本会话已关闭 LLM"
     if not default_agent:
+        # 优先级更高的处理器（如 AstrBot 概率主动回复）已在本事件上请求过模型，再提交一次会回复两遍。
+        if event.get_extra("provider_request") is not None:
+            return "其他插件已请求模型回复本条消息"
         return None
     if not default_official_agent_would_run(
         has_send_oper=bool(getattr(event, "_has_send_oper", False)),

@@ -14,6 +14,7 @@ from astrbot.api.message_components import Plain, Reply
 from astrbot.api.provider import ProviderRequest
 from astrbot.core.agent.message import TextPart
 
+from .decision_engine import _TIME_TOKEN, _question_info
 from .decision_tools import run_tools, send_chain, skip_tools
 from .models import DecisionResult
 from .tts_adapter import has_record
@@ -33,6 +34,12 @@ try:
     from astrbot.core.utils.session_lock import session_lock_manager
 except ImportError:
     session_lock_manager = None
+
+try:
+    # 内置「群聊上下文感知」注入暂存群聊时用的格式（AstrBot 4.29.4）。
+    from astrbot.builtin_stars.astrbot.group_chat_context import _format_group_history_block
+except ImportError:
+    _format_group_history_block = None
 
 
 class ImageResolver(Protocol):
@@ -416,8 +423,39 @@ async def resolve_persona(context, umo: str, conversation, platform_name: str = 
     return str(persona.get("prompt") or ""), dialogs
 
 
-async def _append_history(conv_mgr, umo: str, cid: str, original: list, added: list[dict]) -> None:
-    """生成期间官方历史可能已被改动，重新读取后只在原历史之上追加。
+def _group_chat_context(context):
+    """内置「群聊上下文感知」的实例。依赖 4.29.4 内部属性，找不到时为 None。"""
+    if _format_group_history_block is None:
+        return None
+    for star in getattr(context, "get_all_stars", list)() or []:
+        gcc = getattr(getattr(star, "star_cls", None), "group_chat_context", None)
+        if all(hasattr(gcc, name) for name in ("raw_records", "_record_ids", "_get_lock")):
+            return gcc
+    return None
+
+
+async def _peek_group_context(gcc, umo: str) -> tuple[list[str], list[str]]:
+    """读取官方暂存、尚未注入的群聊（上次回复之后的消息）及其记录 id，不清除。"""
+    async with gcc._get_lock(umo):
+        return list(gcc.raw_records.get(umo, ())), list(gcc._record_ids.get(umo, ()))
+
+
+async def _drop_group_context(gcc, umo: str, record_ids: list[str]) -> None:
+    """清掉已随本轮发言写进历史的群聊记录；生成期间新到的记录留给下一次请求注入。"""
+    taken = set(record_ids)
+    async with gcc._get_lock(umo):
+        records, ids = gcc.raw_records.get(umo), gcc._record_ids.get(umo)
+        if not records or ids is None or len(records) != len(ids):
+            return
+        kept = [(record, rid) for record, rid in zip(records, ids) if rid not in taken]
+        records.clear()
+        ids.clear()
+        records.extend(record for record, _ in kept)
+        ids.extend(rid for _, rid in kept)
+
+
+async def _append_history(conv_mgr, umo: str, cid: str, original: list, added: list[dict]) -> bool:
+    """生成期间官方历史可能已被改动，重新读取后只在原历史之上追加；返回是否已写入。
 
     对话已切换（``/new``、``/switch``），或历史不再以生成前读到的内容开头（``/reset`` 清空、压缩改写）时放弃写回，
     不用旧副本盖掉别人的改动。持有官方主 Agent 的会话锁，不与同会话正在保存的官方回合交错。
@@ -427,13 +465,14 @@ async def _append_history(conv_mgr, umo: str, cid: str, original: list, added: l
         current = await conv_mgr.get_curr_conversation_id(umo)
         if current and current != cid:
             logger.info("生成期间已切换对话，本轮发言不写入官方历史：%s", umo)
-            return
+            return False
         latest = await conv_mgr.get_conversation(umo, cid)
         history = _history_records(getattr(latest, "history", None)) if latest is not None else None
         if history is None or history[:len(original)] != original:
             logger.info("生成期间官方历史已被清空或改写，本轮发言不写入官方历史：%s", umo)
-            return
+            return False
         await conv_mgr.update_conversation(umo, cid, history=[*history, *added])
+        return True
 
 
 async def generate_text(
@@ -442,8 +481,13 @@ async def generate_text(
     umo: str,
     decision: DecisionResult,
     platform_name: str = "",
+    group_context: bool = False,
 ) -> str:
-    """生成冷场或定时发言：尽量沿用官方会话历史和人格，但不把这些内容传给判断模型。"""
+    """生成冷场或定时发言：尽量沿用官方会话历史和人格，但不把这些内容传给判断模型。
+
+    group_context 为 True（群聊且开启了「群聊上下文感知」）时，像官方请求一样带上上次回复之后暂存的群聊，
+    并随发言写进历史、从暂存中清掉；否则下一次官方请求会把发言之前的群聊当作发言之后的注入。
+    """
     provider_id = await context.get_current_chat_provider_id(umo)
     conv_mgr = context.conversation_manager
     curr_cid = await conv_mgr.get_curr_conversation_id(umo)
@@ -462,23 +506,35 @@ async def generate_text(
     history_raw = getattr(conversation, "history", None) if conversation else None
     # 官方主 Agent 把人格预设对话放在历史之前。
     contexts = [*begin_dialogs, *_history_as_contexts(history_raw)]
-    prompt = ("本轮由定时任务触发，请结合当前时间、会话上下文和判断提示自然地发言。"
-              if decision.trigger_event == "timer_elapsed" else
-              "会话已经沉默一段时间，请结合上下文主动开一个自然的话题或打个招呼。")
+    gcc = _group_chat_context(context) if group_context else None
+    records, record_ids = await _peek_group_context(gcc, umo) if gcc is not None else ([], [])
+    group_block = _format_group_history_block(records) if records else ""
+    # 不经过官方主 Agent，拿不到它注入的时间，这里自己给。
+    now = _question_info(context, umo, decision.scene, None)[_TIME_TOKEN]
+    prompt = f"当前时间：{now}。" + ("本轮由定时任务触发，请结合当前时间、会话上下文和判断提示自然地发言。"
+                                    if decision.trigger_event == "timer_elapsed" else
+                                    "会话已经沉默一段时间，请结合上下文主动开一个自然的话题或打个招呼。")
+    parts = _session_hint_parts(decision)
+    if group_block:
+        parts.insert(0, TextPart(text=group_block))
     response = await context.llm_generate(
         chat_provider_id=provider_id,
         prompt=prompt,
         contexts=contexts or None,
         system_prompt=system_prompt or None,
-        extra_user_content_parts=_session_hint_parts(decision),
+        extra_user_content_parts=parts,
     )
     text = (getattr(response, "completion_text", None) or "").strip()
     if text and curr_cid:
         try:
             # 以原始历史为底追加，保留官方的工具调用轮次；用过滤后的 contexts 写回会把
-            # tool 消息永久删掉，之后官方流水线也会因 tool_calls 缺少结果而报 400。主动发言没有用户消息，只追加回复。
-            added = [{"role": "assistant", "content": text}]
-            await _append_history(conv_mgr, umo, curr_cid, _history_records(history_raw), added)
+            # tool 消息永久删掉，之后官方流水线也会因 tool_calls 缺少结果而报 400。
+            # 生成提示不写进历史；暂存群聊和官方一样随用户消息保存，排在这句发言之前。
+            added = [{"role": "user", "content": group_block}] if group_block else []
+            added.append({"role": "assistant", "content": text})
+            written = await _append_history(conv_mgr, umo, curr_cid, _history_records(history_raw), added)
+            if written and record_ids:
+                await _drop_group_context(gcc, umo, record_ids)
         except Exception:  # noqa: BLE001
             logger.exception("写入官方会话历史失败")
     return text

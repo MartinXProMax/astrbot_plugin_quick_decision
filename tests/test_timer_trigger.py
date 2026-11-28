@@ -280,6 +280,8 @@ class TimerTriggerTests(unittest.IsolatedAsyncioTestCase):
         prompt = self.plugin.context.llm_generate.await_args.kwargs["prompt"]
         self.assertIn("定时", prompt)
         self.assertNotIn("沉默", prompt)
+        # 提示要求结合当前时间，自生成不经过官方注入时间的步骤，要自己带上。
+        self.assertRegex(prompt, r"当前时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
         self.assertEqual(self.plugin.context.llm_generate.await_args.kwargs["system_prompt"], "人格提示")
         self.assertEqual(self.plugin.context.conversation_manager.updated[0]["history"],
                          [{"role": "assistant", "content": "早上好"}])

@@ -580,6 +580,54 @@ class DirectSendGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.conversation_manager.updated[0]["history"],
                          [*history, {"role": "assistant", "content": "出门记得防晒"}])
 
+    async def test_proactive_generation_takes_over_the_official_group_context(self) -> None:
+        from collections import deque
+
+        from astrbot_plugin_quick_decision import reply_generator
+
+        def block(records):
+            return "<ctx>" + "\n".join(records) + "</ctx>"
+
+        pending = [("[Alice/12:00:01]: 午饭吃啥", "r1"), ("[Bob/12:00:02]: 随便", "r2")]
+        for enabled in (True, False):
+            with self.subTest(group_context=enabled), patch.object(reply_generator, "_format_group_history_block", block):
+                gcc = SimpleNamespace(raw_records={"room": deque(r for r, _ in pending)},
+                                      _record_ids={"room": deque(i for _, i in pending)},
+                                      _get_lock=lambda umo: asyncio.Lock())
+
+                async def generate(**_kwargs):
+                    # 生成期间又到了一条群聊，它在发言之后，要留给下一次官方请求注入。
+                    gcc.raw_records["room"].append("[Carol/12:00:03]: 吃面")
+                    gcc._record_ids["room"].append("r3")
+                    return SimpleNamespace(completion_text="大家在聊什么")
+
+                context = SimpleNamespace(
+                    conversation_manager=FakeConvMgr(),
+                    persona_manager=SimpleNamespace(resolve_selected_persona=AsyncMock(return_value=(None, None, None, False))),
+                    get_current_chat_provider_id=AsyncMock(return_value="chat"),
+                    get_all_stars=lambda: [SimpleNamespace(star_cls=None),
+                                           SimpleNamespace(star_cls=SimpleNamespace(group_chat_context=gcc))],
+                    llm_generate=AsyncMock(side_effect=generate),
+                )
+                decision = DecisionResult(action="proactive", scene="group_proactive")
+                await reply_generator.generate_text(context, umo="room", decision=decision, group_context=enabled)
+                kwargs = context.llm_generate.await_args.kwargs
+                self.assertIn("当前时间：", kwargs["prompt"])
+                texts = [part.text for part in kwargs["extra_user_content_parts"]]
+                history = context.conversation_manager.updated[0]["history"]
+                if enabled:
+                    expected = block([r for r, _ in pending])
+                    self.assertEqual(texts[0], expected)
+                    # 和官方一样把暂存群聊随用户消息存进历史，排在发言之前；只清掉已写入的两条。
+                    self.assertEqual(history, [{"role": "user", "content": expected},
+                                               {"role": "assistant", "content": "大家在聊什么"}])
+                    self.assertEqual(list(gcc.raw_records["room"]), ["[Carol/12:00:03]: 吃面"])
+                    self.assertEqual(list(gcc._record_ids["room"]), ["r3"])
+                else:
+                    self.assertFalse(any(text.startswith("<ctx>") for text in texts))
+                    self.assertEqual(history, [{"role": "assistant", "content": "大家在聊什么"}])
+                    self.assertEqual(list(gcc._record_ids["room"]), ["r1", "r2", "r3"])
+
     async def test_proactive_persona_follows_official_selection(self) -> None:
         import json
 
@@ -1848,6 +1896,19 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(ev.call_llm)
                     self.assertIsNone(ev.get_extra("quick_decision"))
                     self.assertIsNone(self.plugin.sessions.get(ev.unified_msg_origin).pending_pipeline)
+
+    async def test_request_path_skips_events_another_handler_sent_to_the_model(self) -> None:
+        # AstrBot 概率主动回复优先级更高，它已在本事件上请求过模型并回复，插件不能再提交一次。
+        for requested in (False, True):
+            with self.subTest(requested=requested):
+                ev = FakeEvent(umo=f"aiocqhttp:GroupMessage:requested-{requested}", text="插句话")
+                if requested:
+                    ev.set_extra("provider_request", ProviderRequest(prompt="插句话"))
+                returned = await self.plugin.on_chat_message(ev)
+                self.assertEqual(returned is not None, not requested)
+                self.assertEqual(ev.get_extra("quick_decision") is not None, not requested)
+                self.assertEqual(self.plugin.sessions.get(ev.unified_msg_origin).pending_pipeline is not None,
+                                 not requested)
 
     async def test_private_fallback_submits_what_the_default_agent_would_miss(self) -> None:
         async def bad_ask(*_a, **k):

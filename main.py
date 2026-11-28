@@ -500,7 +500,9 @@ class QuickDecisionPlugin(Star, WebApiMixin):
         # 没有入站事件可取平台名，按空处理（与之前一致）。
         platform_name = ""
         try:
-            text = await generate_text(self.context, umo=profile.umo, decision=result, platform_name=platform_name)
+            group_context = not profile.is_private and group_context_enabled(self._astrbot_config(profile.umo))
+            text = await generate_text(self.context, umo=profile.umo, decision=result, platform_name=platform_name,
+                                       group_context=group_context)
         except Exception:  # noqa: BLE001
             logger.exception("自行调用聊天模型生成回复失败")
             return
