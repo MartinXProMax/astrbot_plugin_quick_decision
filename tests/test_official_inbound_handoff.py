@@ -626,8 +626,10 @@ class DirectSendGuardTests(unittest.IsolatedAsyncioTestCase):
             return "<ctx>" + "\n".join(records) + "</ctx>"
 
         pending = [("[Alice/12:00:01]: 午饭吃啥", "r1"), ("[Bob/12:00:02]: 随便", "r2")]
-        for enabled in (True, False):
-            with self.subTest(group_context=enabled), patch.object(reply_generator, "_format_group_history_block", block):
+        for enabled, switched in ((True, False), (False, False), (True, True)):
+            with self.subTest(group_context=enabled, switched=switched), \
+                    patch.object(reply_generator, "_format_group_history_block", block):
+                mgr = FakeConvMgr()
                 gcc = SimpleNamespace(raw_records={"room": deque(r for r, _ in pending)},
                                       _record_ids={"room": deque(i for _, i in pending)},
                                       _get_lock=lambda umo: asyncio.Lock())
@@ -636,10 +638,12 @@ class DirectSendGuardTests(unittest.IsolatedAsyncioTestCase):
                     # 生成期间又到了一条群聊，它在发言之后，要留给下一次官方请求注入。
                     gcc.raw_records["room"].append("[Carol/12:00:03]: 吃面")
                     gcc._record_ids["room"].append("r3")
+                    if switched:
+                        mgr.conversation.cid = "cid-2"
                     return SimpleNamespace(completion_text="大家在聊什么")
 
                 context = SimpleNamespace(
-                    conversation_manager=FakeConvMgr(),
+                    conversation_manager=mgr,
                     persona_manager=SimpleNamespace(resolve_selected_persona=AsyncMock(return_value=(None, None, None, False))),
                     get_current_chat_provider_id=AsyncMock(return_value="chat"),
                     get_all_stars=lambda: [SimpleNamespace(star_cls=None),
@@ -651,7 +655,12 @@ class DirectSendGuardTests(unittest.IsolatedAsyncioTestCase):
                 kwargs = context.llm_generate.await_args.kwargs
                 self.assertIn("当前时间：", kwargs["prompt"])
                 texts = [part.text for part in kwargs["extra_user_content_parts"]]
-                history = context.conversation_manager.updated[0]["history"]
+                if switched:
+                    # 生成期间切换了对话，发言没写进历史，暂存群聊也不能清掉，否则之后谁都看不到它们。
+                    self.assertEqual(mgr.updated, [])
+                    self.assertEqual(list(gcc._record_ids["room"]), ["r1", "r2", "r3"])
+                    continue
+                history = mgr.updated[0]["history"]
                 if enabled:
                     expected = block([r for r, _ in pending])
                     self.assertEqual(texts[0], expected)
@@ -2420,6 +2429,18 @@ class PluginHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(send_calls), 1)
         self.assertIsNone(send_calls[0].get("event"))
         self.main_mod.send_decision_message = self._orig_send
+
+    async def test_proactive_uses_group_context_only_in_groups_that_enable_it(self):
+        # 只有群聊并开了「群聊上下文感知」时，冷场发言才接管它暂存的群聊。
+        for private, icl, expected in ((False, True, True), (False, False, False), (True, True, False)):
+            with self.subTest(private=private, group_icl_enable=icl):
+                config = {"provider_ltm_settings": {"group_icl_enable": icl}}
+                self.plugin.context.get_config = lambda umo, config=config: config
+                result = DecisionResult(action="proactive", scene="private_proactive" if private else "group_proactive")
+                # 返回空文本，生成后直接结束，不发送。
+                with patch.object(self.main_mod, "generate_text", AsyncMock(return_value="")) as generate:
+                    await self.plugin._self_generate_and_send(SessionProfile(f"room-{private}-{icl}", private), result)
+                self.assertIs(generate.await_args.kwargs["group_context"], expected)
 
     async def test_proactive_sends_before_post_decision_finishes(self):
         from astrbot.api.provider import DecisionChoiceAnswer
